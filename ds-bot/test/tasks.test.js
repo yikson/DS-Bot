@@ -74,8 +74,7 @@ test('task records and indexes round-trip, including shared trunks across two ta
   assert.equal(rt.taskBySession.has('c'), false)
   assert.equal(rt.taskOwners.has('b'), false)
   assert.equal(rt.chatOwners.get('c'), 'c')
-  // S2a does not bind task Sessions into live identity/compaction/memory hooks yet.
-  assert.equal(rt.selfOf('t1-a'), undefined)
+  assert.equal(rt.selfOf('t1-a'), 'a')
   assert.match(await tool('t1-a'), /t1.*Check the pack/)
   assert.equal(rt.openTasksOf('c').length, 2)
   await rt.save({ required: true })

@@ -2,6 +2,7 @@
 // record, so the prefix stays byte-stable across turns and roster changes.
 
 import { asyncScope } from './async.js'
+import { taskBrief } from './task-routing.js'
 const TEAM_RULES = [
   '## How your Bot team works',
   '- Every Bot is its own long-lived conversation with the user, with its own memory and computer.',
@@ -47,13 +48,20 @@ export function install(rt) {
     const self = rt.selfOf(id)
     const bot = rt.botOf(self)
     if (bot !== undefined) {
-      const choices = rt.workBranchChoices?.(self) ?? []
+      const taskId = rt.taskContext?.(id)
+      const task = taskId && rt.taskOf(taskId)
+      const choices = taskId ? [] : rt.workBranchChoices?.(self) ?? []
       return [
         '# Your identity',
         `You are ${bot.name}, a Bot on the user's team in DS Bot.${bot.role ? ` Your role: ${bot.role}.` : ''}`,
         bot.instructions ? `\n${bot.instructions}` : '',
         '',
         rt.isMain(self) ? `${MAIN_RULES}\n\n${TEAM_RULES}` : TEAM_RULES,
+        ...(task ? [
+          '\n## Task Session',
+          taskBrief(task),
+          'Every message_bot call stays in this task. Omit task or use this id; do not start another task or use a legacy work selector. Replies return to the actual calling Session.',
+        ] : []),
         ...(rt.branchOf?.(id) ? [
           '\n## Work branch',
           `Branch: ${rt.branchOwners.get(id).branchId}\nTask: ${rt.branchOf(id).brief}`,
@@ -62,7 +70,7 @@ export function install(rt) {
         ...(choices.length > 0 ? [
           '\n## Open work branches',
           ...choices,
-          'Use message_bot work with a branch id for a related follow-up, or "new" for a separate task. One open branch is reused by default; multiple branches require a choice. Pull list_bots for current choices; use read_own_chat to review your task context.',
+          'Use message_bot work with a branch id for a related legacy follow-up, or "new" for an explicit legacy operation. Pull list_bots for current choices; use read_own_chat to review your task context.',
         ] : []),
       ].join('\n')
     }

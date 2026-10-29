@@ -78,6 +78,7 @@ export function answeredIn(events, exchangeId, branch = false) {
 // The trigger fields a resumed turn needs to answer the same sender.
 const triggerOf = info => ({
   role: info.role,
+  ...(info.taskId ? { taskId: info.taskId } : {}),
   ...(info.exchangeId ? { exchangeId: info.exchangeId } : {}),
   ...(info.senderSessionId ? { senderSessionId: info.senderSessionId } : {}),
   ...(info.replySessionId ? { replySessionId: info.replySessionId } : {}),
@@ -210,7 +211,10 @@ export function install(rt) {
 
   const deliver = rt.deliver
   rt.deliver = async (args, receipt) => {
-    if (stopped) return args.exchangeId
+    if (stopped || safe.stopped) {
+      if (receipt) receipt.skipped = true
+      return args.exchangeId
+    }
     const noted = args.exchangeId === undefined ? { ...args, exchangeId: randomUUID() } : args
     const sessionId = rt.deliverySession?.(noted) ?? noted.sessionId ?? rt.chatOf(noted.toId)
     const pending = pendingResumes[noted.exchangeId]
@@ -314,16 +318,17 @@ export function install(rt) {
     }
     if (record.resumed) return
     const trigger = record.trigger
+    const taskId = trigger?.taskId ?? rt.taskForSession?.(sessionId)?.id
     const work = rt.workOf(trigger)
     if (work !== undefined && (hasFailureResume(work)
       || [...rt.live.values()].some(entry => entry.turn !== undefined && rt.workOf(entry.info) === work))) return
     if ((trigger?.role === 'request' || trigger?.role === 'stopped') && trigger.senderSessionId && trigger.audience !== 'user' && rt.botOf(trigger.senderSessionId)) {
       // The sender still waits for this turn's answer, so it goes on under the same exchange.
-      await rt.deliver({ fromId: trigger.senderSessionId, toId: bot.id, ...(rt.branchOwners?.has(sessionId) ? { sessionId } : {}), role: trigger.role, ...(trigger.replySessionId ? { replySessionId: trigger.replySessionId } : {}), ...(trigger.exchangeId ? { exchangeId: trigger.exchangeId } : {}), ...(trigger.senderRoomId ? { fromRoomId: trigger.senderRoomId } : {}), ...(trigger.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}), resumed: true, text })
+      await rt.deliver({ fromId: trigger.senderSessionId, toId: bot.id, ...(rt.branchOwners?.has(sessionId) || taskId ? { sessionId } : {}), ...(taskId ? { taskId } : {}), role: trigger.role, ...(trigger.replySessionId ? { replySessionId: trigger.replySessionId } : {}), ...(trigger.exchangeId ? { exchangeId: trigger.exchangeId } : {}), ...(trigger.senderRoomId ? { fromRoomId: trigger.senderRoomId } : {}), ...(trigger.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}), resumed: true, text })
       return
     }
     // A turn that went on with work another Bot asked for still owes that Bot its answer.
-    await rt.deliver({ toId: bot.id, ...(rt.branchOwners?.has(sessionId) ? { sessionId } : {}), role: 'resume', resumed: true, text, ...(trigger?.work ? { work: trigger.work } : {}), ...(trigger?.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}) })
+    await rt.deliver({ toId: bot.id, ...(rt.branchOwners?.has(sessionId) || taskId ? { sessionId } : {}), ...(taskId ? { taskId } : {}), role: 'resume', resumed: true, text, ...(trigger?.work ? { work: trigger.work } : {}), ...(trigger?.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}) })
   }
 
   // A hard stop keeps the inbox, which the Session runs once it wakes; only what DSH
@@ -342,7 +347,7 @@ export function install(rt) {
     const waiting = new Set([...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])].map(message => message.source?.exchangeId))
     for (const { args } of fresh) {
       if (waiting.has(args.exchangeId) || taken?.has(args.exchangeId) === true) continue
-      if ((rt.branchOf?.(current(args)) || rt.branchOf?.(args.replySessionId))
+      if ((args.taskId || rt.branchOf?.(current(args)) || rt.branchOf?.(args.replySessionId))
         && await rt.branchDelivered(current(args), args.exchangeId, undefined, args.failureResumes)) continue
       await rt.deliver({ ...args, sessionId: current(args), steer: false, resent: true })
     }
@@ -446,6 +451,8 @@ export function install(rt) {
   async function resumeAll() {
     await rt.load()
     if (stopped || rt.readOnly() !== undefined) return
+    await rt.recoverTasks()
+    if (stopped) return
     for (const bot of Object.values(rt.state?.bots ?? {})) {
       for (const branch of Object.values(bot.workBranches ?? {})) {
         try {

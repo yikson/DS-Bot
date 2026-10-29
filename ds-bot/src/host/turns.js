@@ -49,6 +49,9 @@ export const failureLine = failure => `${failure.code}${failure.status ? ` ${fai
 // for closes, and the answer goes up to the Bot that asked. `id` is the Session the
 // answer comes from; `source` is the trigger the turn answered.
 export function answerSender(rt, id, source, text, long) {
+  if (source.taskId || rt.state.works?.[source.exchangeId]?.taskId) {
+    return rt.sendTaskAnswer(id, source, text, long).catch(error => rt.warn('ds-bot: task reply delivery failed: %s', error))
+  }
   if (rt.branchOf?.(id) || rt.branchForWork?.(source.exchangeId) || rt.branchOf?.(source.replySessionId)) {
     return rt.sendAnswer(id, source, text, long).catch(error => rt.warn('ds-bot: reply delivery failed: %s', error))
   }
@@ -101,6 +104,7 @@ export function install(rt) {
   // Bot's request keeps its exchange; anything else is a nudge in the Bot's own chat.
   const retryWrittenCall = (id, info) => {
     const keeps = info !== undefined && (info.role === 'room' || expectsReply(info))
+    const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
     return rt.deliver({
       ...(keeps && info.senderSessionId ? { fromId: info.senderSessionId } : {}),
       toId: rt.selfOf(id),
@@ -109,6 +113,7 @@ export function install(rt) {
       ...(keeps && info.roomId ? { roomId: info.roomId } : {}),
       ...(keeps && info.exchangeId ? { exchangeId: info.exchangeId } : {}),
       ...(info?.work ? { work: info.work } : {}),
+      ...(taskId ? { taskId } : {}),
       ...(keeps && info.audience ? { audience: info.audience } : {}),
       ...(keeps && info.askedBy ? { askedBy: info.askedBy } : {}),
       ...(keeps && info.senderRoomId ? { fromRoomId: info.senderRoomId } : {}),
@@ -123,6 +128,7 @@ export function install(rt) {
   // exchange, and a turn of the Bot's own chat starts a plain one there.
   const resumeFailedTurn = (id, info, failure) => {
     const keeps = info !== undefined && expectsReply(info)
+    const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
     const args = {
       ...(keeps && info.senderSessionId ? { fromId: info.senderSessionId } : {}),
       toId: rt.selfOf(id),
@@ -130,6 +136,7 @@ export function install(rt) {
       role: keeps ? info.role : 'retry',
       ...(keeps && info.exchangeId ? { exchangeId: info.exchangeId } : {}),
       ...(info?.work ? { work: info.work } : {}),
+      ...(taskId ? { taskId } : {}),
       ...(keeps && info.audience ? { audience: info.audience } : {}),
       ...(keeps && info.askedBy ? { askedBy: info.askedBy } : {}),
       ...(keeps && info.senderRoomId ? { fromRoomId: info.senderRoomId } : {}),
@@ -636,6 +643,7 @@ export function install(rt) {
             exchangeId: result.info.exchangeId,
             replyTo: result.info.replyTo,
             work: result.info.work,
+            ...(result.info.taskId ? { taskId: result.info.taskId } : {}),
             ...(result.info.replySessionId ? { replySessionId: result.info.replySessionId } : {}),
             ...(result.info.roomId ? { roomId: result.info.roomId } : {}),
             deferred: true,
@@ -738,6 +746,7 @@ export function install(rt) {
             text: request.text,
             role: request.info.role,
             exchangeId: request.info.exchangeId,
+            ...(request.info.taskId ? { taskId: request.info.taskId } : {}),
             ...(request.info.role === 'room' ? { roomId: request.info.roomId, askedBy: request.info.askedBy, note: 'you read this call during your last task; answer it now' } : {}),
             ...(request.info.senderRoomId ? { fromRoomId: request.info.senderRoomId } : {}),
             ...(request.info.replySessionId ? { replySessionId: request.info.replySessionId } : {}),

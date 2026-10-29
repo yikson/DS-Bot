@@ -129,18 +129,23 @@ export function install(rt) {
       if (related.state !== 'open') throw new Error('This work branch is not open')
       return { branch: related, sessionId: related.sessionId }
     }
-    const owner = pairOwner(sender, target)
-    if (!owner || sessionId !== rt.chatOf(sender.id)) return {}
+    if (work === undefined) return {}
     if (work !== 'new') {
-      // Both directions pick from the same list. Without a work id the owner starts a new branch
-      // and the peer joins its sole open one.
-      const outbound = owner.id === sender.id
-      const branches = openBranches(owner, outbound ? target.id : sender.id)
-      const selected = work === undefined ? (!outbound && branches.length === 1 ? branches[0] : undefined)
-        : branches.find(branch => branch.id === work)
-      if (selected) return outbound ? { branch: selected, replySessionId: selected.sessionId } : { branch: selected, sessionId: selected.sessionId }
-      if (work !== undefined && branches.length === 0) throw new Error(`No open work branch "${work}" with this Bot; leave work out or use "new"`)
-      if (work !== undefined || (!outbound && branches.length > 0)) throw new Error(`Specify message_bot work as one of these open branches (or "new"):\n${branches.map(branch => `${branch.id} — ${branch.title}`).join('\n')}`)
+      const saved = Object.values(state.bots).flatMap(bot => Object.values(bot.workBranches ?? {})
+        .map(branch => ({ bot, branch }))).find(({ bot, branch }) => branch.id === work
+          && ((bot.id === sender.id && branch.targetBotId === target.id) || (bot.id === target.id && branch.targetBotId === sender.id)))
+      if (saved) {
+        if (saved.branch.state !== 'open') throw new Error('This work branch is not open')
+        return saved.bot.id === sender.id ? { branch: saved.branch, replySessionId: saved.branch.sessionId }
+          : { branch: saved.branch, sessionId: saved.branch.sessionId }
+      }
+    }
+    const owner = pairOwner(sender, target)
+    if (!owner || sessionId !== rt.chatOf(sender.id)) throw new Error('No configured legacy work branch pair for this call')
+    if (work !== 'new') {
+      const branches = openBranches(owner, owner.id === sender.id ? target.id : sender.id)
+      if (branches.length === 0) throw new Error(`No open work branch "${work}" with this Bot; leave work out or use "new"`)
+      throw new Error(`Specify message_bot work as one of these open branches (or "new"):\n${branches.map(branch => `${branch.id} — ${branch.title}`).join('\n')}`)
     }
     const id = randomUUID()
     const branch = await createBranch(owner, owner.id === sender.id ? target : sender, text, id)
@@ -231,6 +236,7 @@ export function install(rt) {
   const resumeBranchAnswer = workId => serial(`reply:${workId}`, async () => {
     const pending = state.works?.[workId]?.pendingAnswer
     if (!pending) return
+    if (pending.args.taskId) return rt.resumeTaskAnswer(workId)
     const { args, name, text } = pending
     if (!await delivered(args.sessionId, args.exchangeId, workId)) await rt.deliver({ ...args, resent: true })
     else await ctx.sessions.flush((await rt.resolveAgent(args.sessionId)).session)

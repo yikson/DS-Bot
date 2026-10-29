@@ -404,7 +404,7 @@ export function install(rt) {
     safe.run('capabilities background job', () => run.then(() => stalled.delete(agent)))
     rt.warn('ds-bot: capability mount for %s did not finish within %dms; continuing', sessionId, timeoutMs)
   }
-  async function ensureCapabilities(sessionId) {
+  async function ensureCapabilities(sessionId, { required = false } = {}) {
     await rt.load()
     const bot = botOfSession(sessionId)
     if (!bot) return
@@ -413,11 +413,18 @@ export function install(rt) {
     try {
       agent = await rt.resolveAgent(sessionId)
     } catch (error) {
+      if (required) throw error
       rt.warn('ds-bot: capability Agent for %s could not be resolved: %s', sessionId, rt.redactSecrets(String(error)))
       return
     }
     trackAgent(agent)
     await prepare(agent, sessionId)
+    if (required) {
+      if (safe.stopped) throw new Error('Task capability setup stopped')
+      const missing = [...expandCapabilityNames(bot.capabilities, library())]
+        .filter(name => sessionStatuses.get(bot.id)?.get(name)?.get(sessionId)?.state !== 'ready')
+      if (missing.length) throw new Error(`Task capabilities are not ready: ${missing.join(', ')}`)
+    }
   }
   const trackAgent = agent => {
     const sessionId = agent?.session?.id

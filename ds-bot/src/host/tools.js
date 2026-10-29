@@ -9,6 +9,7 @@ import { within } from './folders.js'
 import { absoluteLinks } from './links.js'
 import { NAME_MAX } from './requests.js'
 import { unquote } from './text.js'
+import { taskBrief } from './task-routing.js'
 import { SELF_UPDATE_REFUSAL } from './update.js'
 import { mentionSpans } from '../shared/mentions.js'
 import { checkShownView } from '../shared/views.js'
@@ -182,7 +183,11 @@ export function install(rt) {
   const bodyOf = (message) => {
     const content = Array.isArray(message.content) ? message.content : []
     const first = content.find(block => block?.type === 'text')?.text ?? ''
-    return { text: first.slice(first.indexOf('\n') + 1), files: content.filter(block => block?.type === 'file' && block.attachment !== undefined).map(block => block.attachment) }
+    let text = first.slice(first.indexOf('\n') + 1)
+    const task = message.source?.taskId && rt.taskOf(message.source.taskId)
+    const prefix = task && `${taskBrief(task)}\n`
+    if (prefix && text.startsWith(prefix)) text = text.slice(prefix.length)
+    return { text, files: content.filter(block => block?.type === 'file' && block.attachment !== undefined).map(block => block.attachment) }
   }
 
   // A tool that throws shows as failed in the chat, instead of as sent or stopped.
@@ -237,7 +242,11 @@ export function install(rt) {
       },
       work: {
         type: 'string',
-        description: 'For a configured work-branch pair, use an open branch id from list_bots or the work-branch prompt, or "new" for a separate task. Outside that branch\'s turn, one open branch is reused by default; multiple open branches require a choice. Ignored for unconfigured pairs.',
+        description: 'Explicit legacy work-branch id, or "new" for a configured legacy pair. Root calls never implicitly reuse a legacy branch. Ignored when task is supplied.',
+      },
+      task: {
+        type: 'string',
+        description: 'An open task id from list_tasks, or "new" from an eligible root trunk. Inside a task, omit this or use its current id; new or different tasks are refused. Takes precedence over work.',
       },
     },
     output,
@@ -254,13 +263,12 @@ export function install(rt) {
       const text = absoluteLinks(String(args.message), rt.sessionFolder?.(exec.agent?.session ?? exec.agent))
       const room = rt.roomOf(rt.groupOwners.get(exec.agent?.id)?.roomId)
       const branchContext = rt.branchOf?.(exec.agent?.id) ?? rt.relatedBranch?.(exec.agent?.id, target.id)
-      const workChoice = room === undefined && args.reply_to !== 'user' && !branchContext
-        && exec.agent?.id === rt.chatOf(sender.id) && rt.workBranchPair?.(sender, target) !== undefined
-        ? args.work : undefined
+      const choice = rt.selectTaskRoute(sender, target, exec.agent?.id, args, room)
+      const workChoice = choice.kind === 'legacy' ? choice.work : undefined
       // The request the caller named: it is admitted once, and a repeat of it is not sent again.
       const request = name === '' ? undefined : rt.requestIdentity({
         caller: sender.id,
-        context: room === undefined ? (branchContext ? `branch:${branchContext.sessionId}` : 'chat') : `room:${room.id}`,
+        context: choice.id ? `task:${choice.id}` : room === undefined ? (branchContext ? `branch:${branchContext.sessionId}` : 'chat') : `room:${room.id}`,
         name,
         payload: {
           to: target.id,
@@ -268,6 +276,7 @@ export function install(rt) {
           reply_to: args.reply_to === 'user' ? 'user' : 'me',
           when: args.when === 'queue' ? 'queue' : 'now',
           ...(workChoice === undefined ? {} : { work: workChoice }),
+          ...(args.task === undefined ? {} : { task: args.task }),
         },
       })
       // What the caller gets for a request that was admitted before.
@@ -303,8 +312,10 @@ export function install(rt) {
       const send = async () => {
         const toUser = args.reply_to === 'user'
         const work = toUser ? undefined : works[0]
-        const taskId = toUser ? undefined : rt.live.get(exec.agent?.id)?.info?.taskId
-        const route = await rt.routeBranch?.(sender, target, exec.agent?.id, text, toUser, workChoice) ?? {}
+        const route = choice.kind === 'legacy'
+          ? await rt.routeBranch(sender, target, exec.agent?.id, text, toUser, choice.inherited ? undefined : workChoice)
+          : await rt.routeTask(choice, sender, target, exec.agent?.id, text, args)
+        const taskId = route.task?.id
         const chat = route.sessionId ?? rt.chatOf(target.id)
         const agent = await rt.resolveAgent(chat)
         const status = rt.statusOf(target.id)
@@ -330,17 +341,18 @@ export function install(rt) {
           route.branch.workIds.push(exchangeId)
           rt.indexSessions()
         }
-        if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work })
-        if (route.branch && state.works[exchangeId]) {
+        if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work, taskId })
+        if ((route.branch || route.task) && state.works[exchangeId]) {
           Object.assign(state.works[exchangeId], { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) })
         }
         const receipt = {}
         try {
-          const delivery = { fromId: sender.id, toId: target.id, text: long.text, files: long.files, ...(long.length === undefined ? {} : { length: long.length }), role: 'request', steer, exchangeId, ...(taskId ? { taskId } : {}), ...(route.branch ? { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) } : {}), ...(merge ? { merge } : {}), ...(toUser ? { audience: 'user' } : {}) }
-          if (route.branch) await rt.sendBranchTask(route.branch, delivery, receipt)
+          const delivery = { fromId: sender.id, toId: target.id, text: long.text, files: long.files, ...(long.length === undefined ? {} : { length: long.length }), role: 'request', steer, exchangeId, ...(taskId ? { taskId } : {}), ...((route.branch || route.task) ? { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) } : {}), ...(merge ? { merge } : {}), ...(toUser ? { audience: 'user' } : {}) }
+          if (route.task) await rt.sendTask(taskId, delivery, receipt)
+          else if (route.branch) await rt.sendBranchTask(route.branch, delivery, receipt)
           else await rt.deliver(delivery, receipt)
         } catch (error) {
-          if (!route.branch) rt.dropWork(exchangeId)
+          if (!route.branch && !route.task) rt.dropWork(exchangeId)
           throw error
         }
         const sent = toUser
@@ -356,7 +368,8 @@ export function install(rt) {
           status === 'idle' ? '' : `${target.name} now: ${status}.`,
           asker ? `When you have handed on everything, end your turn: each reply brings you back to this work, and your answer goes to ${asker} once all of it is back.` : '',
         ].filter(Boolean)
-        const out = [sent, ...notes, ...(route.branch ? [`Work branch: ${route.branch.id} (${route.branch.sessionId}). Follow up there; its conclusion returns to the main chat.`] : [])].join(' ')
+        if (receipt.skipped) refuse('Not delivered: this host stopped; the task send remains pending.')
+        const out = [sent, ...notes, ...(route.task ? [`Task: ${taskId}. Caller Session: ${route.replySessionId}.`] : []), ...(route.branch ? [`Work branch: ${route.branch.id} (${route.branch.sessionId}). Follow up there; its conclusion returns to the main chat.`] : [])].join(' ')
         // Messages reach a Bot's own chat only; work in a group goes on without them.
         const groups = activeSessions(target.id).running.filter(sessionId => sessionId !== chat)
         if (groups.length === 0) return out
