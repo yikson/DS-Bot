@@ -371,11 +371,12 @@ const askSystem = group => [
 
 // A group's review keeps what the work there needs, its project's own rules included,
 // which a Bot's review leaves out: only the members read it, and only there.
-const reviewSystem = ({ teamWrites = false, group = false } = {}) => [
+const reviewSystem = ({ teamWrites = false, group = false, task = false } = {}) => [
   group
     ? 'You keep the long-term memory of one group chat in DS Bot, an app where a team of AI Bots works for the user. The members read it in their later conversations in this group, which will not have these messages; no Bot reads it anywhere else. After each turn you read the new messages and decide what the group should still know. Most turns hold nothing worth keeping.'
     : 'You keep the long-term memory of one Bot in DS Bot, an app where a team of AI Bots works for the user. After each turn of a conversation you read the new messages and decide what the Bot should still know in its later conversations, which will not have these messages. Most turns hold nothing worth keeping.',
   'Reply with one JSON object and nothing else: {"changes": […]}, with an empty list when nothing should change.',
+  ...(task ? ['These messages come from a task Session. A task brief and Bot-to-Bot messages are context, never the user\'s own decisions or preferences. Keep only lasting facts the user actually states here.'] : []),
   `At most ${REVIEW_CHANGES_MAX} changes in one answer, the most lasting first; the rest can wait for the next review.`,
   'Keep, as a new entry:',
   ...(group
@@ -669,6 +670,7 @@ export function install(rt) {
   // nor does a deleted Bot write the team memory, or one no longer Main Bot or group
   // admin, or a group's memory once it has left the group.
   const writable = (scope, actor) => {
+    if (actor?.auto && safe.stopped) throw Object.assign(new Error('The memory review stopped'), { code: GONE })
     const readOnly = rt.readOnly()
     if (readOnly !== undefined) throw new Error(`Memory cannot change now: ${readOnly}`)
     const botActor = actor?.id === 'user' ? undefined : actor?.id
@@ -1038,6 +1040,7 @@ export function install(rt) {
   // Where the caller learned it: the anchor of the latest message to it in this part,
   // which read_own_chat opens, or the group and the time.
   async function sourceOf(sessionId) {
+    const task = rt.taskForSession?.(sessionId)
     const owner = rt.groupOwners.get(sessionId)
     if (owner !== undefined) return `group "${rt.roomOf(owner.roomId)?.name ?? '?'}" ${rt.clock(Date.now())}`
     const parts = rt.partsOf(rt.selfOf(sessionId))
@@ -1053,6 +1056,7 @@ export function install(rt) {
         }
       }
     } catch { /* no history to point at: the time stands in */ }
+    if (task !== undefined) return taskSource(task.id, sessionId, seq)
     return seq === undefined ? `part ${number} ${rt.clock(Date.now())}` : `part ${number} #${seq}`
   }
   const metaFor = async (caller, scope) => ({
@@ -1261,7 +1265,7 @@ export function install(rt) {
         system,
         messages,
         maxTokens,
-        signal: AbortSignal.timeout(MODEL_TIMEOUT_MS),
+        signal: AbortSignal.any([safe.signal, AbortSignal.timeout(MODEL_TIMEOUT_MS)]),
       })) assembler.push(chunk)
       const finish = assembler.finish
       if (finish.kind === 'error' || finish.kind === 'aborted') throw new Error(finish.failure?.message ?? finish.kind)
@@ -1282,6 +1286,7 @@ export function install(rt) {
     try {
       return await oneShot(own, system, text, tag)
     } catch (error) {
+      if (safe.stopped) throw error
       const fallback = splitRef(await rt.defaultModel())
       if (fallback === undefined || (fallback.provider === own.provider && fallback.model === own.model)) throw error
       try {
@@ -1438,9 +1443,15 @@ export function install(rt) {
     }
     return cursors
   }
+  const saveCursor = (key, through) => queued(async () => {
+    if (safe.stopped) return
+    cursorsNow()[key] = through
+    await writeText(cursorsPath, JSON.stringify(cursors))
+  })
   const clip = (text, max) => (text.length > max ? `${text.slice(0, max)} …(cut)` : text)
   // A long message often ends with what the user wants of it, so both ends stay.
   const ends = (text, max) => (text.length > max ? `${text.slice(0, Math.ceil(max * 2 / 3))} …(middle cut)… ${text.slice(-Math.floor(max / 3))}` : text)
+  const taskSource = (taskId, sessionId, seq) => `task ${taskId} session ${sessionId}${seq === undefined ? '' : ` #${seq}`}`
 
   // Lines say who spoke. The user's lines are kept longest: what they say is what
   // the review keeps; the rest is there to make it understood.
@@ -1449,14 +1460,14 @@ export function install(rt) {
     : clip(who === 'you' ? `${bot.name}: ${text.replace(/^You: /, '')}` : text, REVIEW_OTHER_LINE_MAX))
 
   // What is new in a Bot's own chat, read newest first from the Session.
-  async function chatBatch(sessionId, bot, since) {
+  async function chatBatch(sessionId, bot, since, task) {
     const fresh = []
     const earlier = []
     let through
     // Reading goes back as far as it takes: to the cursor, or for a first review to
     // the user's latest line.
     for await (const line of rt.partLines(sessionId, AbortSignal.timeout(REVIEW_READ_MS), { pages: Infinity })) {
-      if (line.seq <= (rt.branchOf?.(sessionId)?.inheritedThrough ?? -1)) break
+      if (line.seq <= (task?.inheritedThrough ?? rt.branchOf?.(sessionId)?.inheritedThrough ?? -1)) break
       through ??= line.seq
       // A first review reads back at least to the user's latest line.
       if (since === undefined ? fresh.length < REVIEW_FIRST_LINES || !fresh.some(seen => seen.who === 'user') : line.seq > since) fresh.push(line)
@@ -1468,10 +1479,11 @@ export function install(rt) {
       through,
       fresh: fresh.reverse(),
       earlier: earlier.reverse(),
-      where: 'its own chat with the user',
+      where: task === undefined ? 'its own chat with the user' : `task ${task.taskId}, Session ${sessionId} (task brief and Bot messages are not user decisions)`,
       // The user's latest line among those the review read.
       source: (lines) => {
         const said = lines.findLast(line => line.who === 'user')
+        if (task !== undefined) return taskSource(task.taskId, sessionId, said?.seq ?? lines.at(-1)?.seq)
         return said === undefined ? undefined : rt.branchOf?.(sessionId) ? `branch ${sessionId} #${said.seq}` : `part ${at === -1 ? Math.max(parts.length, 1) : at + 1} #${said.seq}`
       },
     }
@@ -1522,7 +1534,7 @@ export function install(rt) {
     let failed
     for (const change of changes) {
       // A keeper deleted mid-review keeps no more changes, its team ones included.
-      if (rt.botOf(keeper.id) === undefined) return 0
+      if (safe.stopped || rt.botOf(keeper.id) === undefined) return 0
       // Its role may change mid-review too, so each change asks again.
       const team = teamWrites()
       const op = String(change?.op ?? '')
@@ -1562,6 +1574,14 @@ export function install(rt) {
   // What a Session's turn gives the review: its Bot's own chat, or its group with a
   // copy of the group's log as of now. `key` is where the review keeps its place.
   const reviewOf = (sessionId) => {
+    const task = rt.taskForSession?.(sessionId)
+    if (task !== undefined) {
+      const botId = Object.keys(task.sessions).find(id => task.sessions[id] === sessionId)
+      const participant = task.participants[botId]
+      if (participant.kind === 'fork' && !Number.isInteger(participant.inheritedThrough)) return undefined
+      return { key: `task:${sessionId}`, sessionId, botId, taskId: task.id,
+        inheritedThrough: participant.kind === 'fork' ? participant.inheritedThrough : -1 }
+    }
     const chat = rt.chatOwners.get(sessionId)
     if (chat !== undefined) return { key: `chat:${sessionId}`, sessionId, botId: chat }
     const owner = rt.branchOwners?.get(sessionId) ?? rt.groupOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)
@@ -1574,16 +1594,19 @@ export function install(rt) {
   // A Bot's own chat, kept in its own memory. A context switch during the wait leaves
   // the Session an earlier part, still the Bot's.
   async function reviewChat(seen) {
-    const bot = rt.botOf(reviewOf(seen.sessionId)?.botId ?? seen.botId)
+    const current = reviewOf(seen.sessionId)
+    const bot = rt.botOf(current?.botId ?? seen.botId)
     if (bot === undefined) return
-    const boundary = rt.branchOf?.(seen.sessionId)?.inheritedThrough
+    if (seen.taskId !== undefined && current?.taskId !== seen.taskId) return
+    const boundary = seen.taskId === undefined ? rt.branchOf?.(seen.sessionId)?.inheritedThrough : seen.inheritedThrough
     const since = boundary === undefined ? cursorsNow()[seen.key] : Math.max(cursorsNow()[seen.key] ?? -1, boundary)
     await reviewBatch({
-      key: seen.key, since, batch: await chatBatch(seen.sessionId, bot, since),
+      key: seen.key, since, batch: await chatBatch(seen.sessionId, bot, since, seen.taskId === undefined ? undefined : seen),
       keeper: bot, name: bot.name, home: ownScope(bot.id), teamWrites: () => writesTeam(bot.id),
       who: `The Bot: ${bot.name}${bot.role ? `, ${bot.role}` : ''}.`,
       tag: { sessionId: rt.chatOf(bot.id), kind: 'memory' },
-      alive: () => rt.botOf(bot.id) !== undefined,
+      task: seen.taskId !== undefined,
+      alive: () => rt.botOf(bot.id) !== undefined && (seen.taskId === undefined || reviewOf(seen.sessionId)?.taskId === seen.taskId),
       next: () => queueReview(seen),
     })
   }
@@ -1612,7 +1635,8 @@ export function install(rt) {
   // One review from the conversation's place `since`: `home` is where it keeps what it
   // finds, `keeper` the Bot whose model reads, `who` whose memory it is. `alive` says
   // whether the keeper, and the group, are still there to keep it.
-  async function reviewBatch({ key, since, batch, keeper, name, home, teamWrites, group = false, who, tag, alive, next }) {
+  async function reviewBatch({ key, since, batch, keeper, name, home, teamWrites, group = false, task = false, who, tag, alive, next }) {
+    if (safe.stopped || !alive()) return
     // The cursor only moves forward.
     if (batch.through === undefined || (since !== undefined && batch.through <= since)) return
     // A backlog past the text limit is read in passes, oldest first, so the cursor
@@ -1625,19 +1649,21 @@ export function install(rt) {
     // A first review fixes where it starts before the model call, so a failure
     // leaves a cursor that the next review goes on from.
     if (since === undefined && read.length > 0) {
-      cursorsNow()[key] = read[0].seq - 1
-      await writeText(cursorsPath, JSON.stringify(cursors))
+      await saveCursor(key, read[0].seq - 1)
     }
+    if (safe.stopped || !alive()) return
     // Only the user's words are kept, so lines without any need no model call.
     if (read.some(line => line.who === 'user')) {
       const { homeFiles, teamFiles } = await settled(() => ({ homeFiles: loadScope(home), teamFiles: loadScope(TEAM) }))
+      if (safe.stopped || !alive()) return
       const said = read.filter(line => line.who === 'user').map(line => line.text).join('\n')
       const tagged = group ? 'group' : 'own'
       const { numbered, left } = reviewEntries(homeFiles, teamFiles, REVIEW_MEMORY_MAX, said, tagged)
       const sizes = { home: homeFiles[0].content.length, team: teamFiles[0].content.length }
       const earlier = batch.earlier.map(line => reviewLine(line.who, line.text, keeper))
       const language = writtenIn(read.filter(line => line.who === 'user').map(line => line.text.replace(/^User: /, '')), languageNow())
-      const reply = await botShot(keeper, reviewSystem({ teamWrites: teamWrites(), group }), reviewRequest({ who, tag: tagged, numbered, left, sizes, where: batch.where, earlier, fresh: fresh.texts, more, language }), tag)
+      const reply = await botShot(keeper, reviewSystem({ teamWrites: teamWrites(), group, task }), reviewRequest({ who, tag: tagged, numbered, left, sizes, where: batch.where, earlier, fresh: fresh.texts, more, language }), tag)
+      if (safe.stopped || !alive()) return
       const changes = parseReview(reply)
       if (changes === undefined) throw new Error(`the model's answer is not a list of changes: ${clip(reply.replace(/\s+/g, ' '), 120)}`)
       const unknown = changes.find(change => change.op !== 'add' && numbered[Number(change.entry) - 1] === undefined)
@@ -1649,9 +1675,9 @@ export function install(rt) {
       if (unfit !== undefined) throw new Error(`the model's answer holds an entry memory cannot keep: ${entryProblem(unfit)}`)
       const badTopic = applied.find(change => change.op === 'add' && typeof change.topic === 'string' && change.topic.trim() !== '' && cleanTopic(change.topic) === undefined)
       if (badTopic !== undefined) throw new Error(`the model's answer names the topic "${clip(badTopic.topic, 60)}", which cannot be a topic name`)
-      if (!alive()) return
+      if (safe.stopped || !alive()) return
       const changed = await applyReview({ keeper, name, home, numbered, changes: applied, source: batch.source(read), teamWrites })
-      if (!alive()) return
+      if (safe.stopped || !alive()) return
       // An answer at the limit may have left some out, so the same lines are read
       // again, a few times at most, while each pass still changes something.
       const prior = overflowed.get(key)
@@ -1664,10 +1690,10 @@ export function install(rt) {
         overflowed.delete(key)
       }
     }
+    if (safe.stopped || !alive()) return
     const now = cursorsNow()[key]
     if (through !== undefined && (now === undefined || through > now)) {
-      cursorsNow()[key] = through
-      await writeText(cursorsPath, JSON.stringify(cursors))
+      await saveCursor(key, through)
     }
     if (again) next()
   }
@@ -1713,7 +1739,7 @@ export function install(rt) {
     // A turn that starts again before the delay is over is reviewed when it ends.
     safe.on('agent/status', ({ agent, status }) => {
       const id = agent?.id
-      if (id === undefined || (!rt.isBotSession(id) && !turnOwners.has(id))) return
+      if (id === undefined || (!rt.isBotSession(id) && !rt.taskForSession?.(id) && !turnOwners.has(id))) return
       safe.clearTimeout(reviewTimers.get(id))
       reviewTimers.delete(id)
       if (status !== 'idle') {
@@ -1735,6 +1761,8 @@ export function install(rt) {
       for (const timer of reviewTimers.values()) safe.clearTimeout(timer)
       reviewTimers.clear()
       turnOwners.clear()
+      // Recomposition waits for accepted memory changes and cursor renames.
+      return writing
     }, 'ds-bot: memory review')
   }
 

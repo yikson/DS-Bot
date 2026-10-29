@@ -6,6 +6,7 @@ import { mkdir, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { unquote } from './text.js'
+import { asyncScope } from './async.js'
 
 const PICK_TIMEOUT_MS = 10 * 60_000
 
@@ -162,6 +163,32 @@ export function install(rt) {
         : `Working in ${path} needs the user's approval, and no one could answer, so nothing changed. The user can make this change in the settings.`)
   }
 
+  // Called after the endpoint is saved/indexed, before its first prompt.
+  async function applyTaskWorkdir(sessionId, exec) {
+    const safe = asyncScope(rt)
+    await rt.load()
+    const task = rt.taskForSession(sessionId)
+    if (task?.workdir === undefined) return undefined
+    const botId = Object.keys(task.sessions).find(id => task.sessions[id] === sessionId)
+    const bot = rt.botOf(botId)
+    if (bot === undefined) throw new Error('The task participant no longer exists')
+    const signal = AbortSignal.any([safe.signal, exec?.signal].filter(Boolean))
+    const check = () => {
+      signal.throwIfAborted()
+      if (rt.readOnly() !== undefined) throw new Error(rt.readOnly())
+      const current = rt.taskForSession(sessionId)
+      if (current?.id !== task.id || current.workdir !== task.workdir || current.state !== 'open'
+        || current.sessions[botId] !== sessionId || rt.botOf(botId) === undefined) throw new Error('The task endpoint changed during folder setup')
+    }
+    check()
+    const path = await cleanWorkDir(task.workdir) ?? teamFolder()
+    const agent = await rt.resolveAgent(sessionId)
+    check()
+    await approveFolder({ ...exec, agent, signal }, { path, sessions: [sessionId], who: { en: bot.name, zh: ` ${bot.name} ` } })
+    check()
+    return ctx.workingDirectory.set(agent, path, signal)
+  }
+
   const picker = () => {
     try {
       return ctx.get?.('directoryPicker')?.capability()
@@ -206,5 +233,5 @@ export function install(rt) {
     }
   }
 
-  Object.assign(rt, { teamFolder, defaultTeamFolder, workDirOf, sessionFolder, isFolder, real, folderAt, cleanWorkDir, workFolder, inData, setTeamWorkspace, sessionsOfBot, approveFolder, folderEndpoint })
+  Object.assign(rt, { teamFolder, defaultTeamFolder, workDirOf, sessionFolder, isFolder, real, folderAt, cleanWorkDir, workFolder, inData, setTeamWorkspace, sessionsOfBot, approveFolder, applyTaskWorkdir, folderEndpoint })
 }

@@ -192,14 +192,15 @@ export function install(rt) {
       checkGeneration()
       await rt.applyPermission(bot, sessionId)
       checkGeneration()
-      await rt.approveFolder({ agent, name: 'message_bot', signal: safe.signal }, {
-        path: initialWorkdir ?? rt.sessionFolder(agent.session), sessions: [sessionId], who: { en: bot.name, zh: bot.name },
-      })
-      checkGeneration()
-      if (operation === 'fork' && task.workdir) {
-        await rt.ctx.workingDirectory.set(agent, initialWorkdir)
-        checkGeneration()
+      const exec = { agent, name: 'message_bot', signal: safe.signal }
+      if (task.workdir !== undefined) {
+        await rt.applyTaskWorkdir(sessionId, exec)
+      } else {
+        await rt.approveFolder(exec, {
+          path: initialWorkdir ?? rt.sessionFolder(agent.session), sessions: [sessionId], who: { en: bot.name, zh: bot.name },
+        })
       }
+      checkGeneration()
       const ref = await rt.desiredModel(bot)
       checkGeneration()
       const selection = ref ? { ...splitRef(ref), reasoningEffort: await rt.desiredEffort(bot, ref) }

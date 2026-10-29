@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import { answerSender } from '../src/host/turns.js'
 import { asyncScope } from '../src/host/async.js'
@@ -52,6 +55,63 @@ test('requester fork records actual boundary and explicit brief; assignee uses s
   assert.ok(message.content[0].text.includes(task.id))
   assert.equal(f.saved().tasks[task.id].phase, 'ready')
 })
+
+for (const fallback of [false, true]) {
+  test(`task workdir is applied to both saved, permissioned endpoints before delivery; fresh requester=${fallback}`, async t => {
+    const f = await setup(t)
+    const workdir = realpathSync.native(mkdtempSync(join(tmpdir(), 'ds-bot-task-folder-')))
+    t.after(() => rmSync(workdir, { recursive: true, force: true, maxRetries: 5 }))
+    f.rt.dshHome = join(f.home, 'dsh')
+    // Seed the optional persisted workdir without adding a routing/tool argument.
+    const commit = f.rt.commitTask
+    f.rt.commitTask = (id, update) => commit(id, previous => {
+      const next = update(previous)
+      if (previous === undefined) next.workdir = workdir
+      return next
+    })
+    if (fallback) f.ctx.sessionController.fork = async () => {
+      throw Object.assign(new Error('session "a" has no completed turn to fork from'), { code: 'session/fork-unavailable' })
+    }
+    const directories = new Map()
+    const applied = [], approvals = []
+    f.ctx.workingDirectory = {
+      get: session => directories.get(session.id),
+      async set(agent, path, signal) {
+        signal.throwIfAborted()
+        const task = f.rt.taskForSession(agent.id)
+        assert.ok(task)
+        assert.equal(f.saved().tasks[task.id].sessions[f.rt.selfOf(agent.id)], agent.id)
+        assert.ok(f.permissions.some(([id, preset]) => id === agent.id && preset === 'full'))
+        assert.equal(agent.calls.length, 0)
+        directories.set(agent.id, path)
+        applied.push(agent.id)
+        return path
+      },
+    }
+    const get = f.ctx.get
+    f.ctx.get = name => name === 'sandboxPolicy' ? { resolve: () => ({ mode: 'workspace-write' }) }
+      : name === 'approval' ? { request: async ({ agent }) => { approvals.push(agent.id); return 'allowed-once' } }
+        : name === 'workingDirectory' ? f.ctx.workingDirectory : get(name)
+    const capabilities = f.rt.ensureCapabilities
+    f.rt.ensureCapabilities = async (id, options) => {
+      assert.equal(f.ctx.workingDirectory.get(f.agentOf(id).session), workdir)
+      return capabilities(id, options)
+    }
+    await f.send()
+    const task = f.tasks()[0]
+    const endpoints = [task.sessions.a, task.sessions.b]
+    assert.deepEqual(applied, endpoints)
+    assert.deepEqual(approvals, endpoints)
+    assert.deepEqual(endpoints.map(id => directories.get(id)), [workdir, workdir])
+    assert.equal(task.participants.a.kind, fallback ? 'fresh' : 'fork')
+    assert.equal(task.participants.b.kind, 'fresh')
+    assert.equal(task.phase, 'ready')
+    assert.equal(f.agentOf(task.sessions.b).calls.length, 1)
+    assert.ok(f.fresh.every(options => options.cwd === workdir))
+    assert.equal(f.agentOf('a').calls.length + f.agentOf('b').calls.length, 0)
+    assert.deepEqual([f.rt.botOf('a').workDir, f.rt.botOf('b').workDir], [undefined, undefined])
+  })
+}
 
 test('no-completed-turn is the only fresh requester fallback', async t => {
   const f = await setup(t)
