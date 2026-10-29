@@ -121,6 +121,12 @@ export function ComposerPlus({ sessionId, inputActions, useRoster, actions }) {
     window.addEventListener('keydown', onKey, true)
     return () => { window.removeEventListener('mousedown', onDown, true); window.removeEventListener('keydown', onKey, true) }
   }, [open])
+  // Keep hooks stable while the roster loads or the open Session changes.
+  const place = useMemo(() => {
+    if (!shown || !button.current) return null
+    const rect = button.current.getBoundingClientRect()
+    return { left: rect.left, bottom: viewBottom() - rect.top + 8 }
+  }, [shown, open, tick])
   const target = roster.byId?.[sessionId]?.id ?? roster.roomsById?.[sessionId]?.id
   if (sessionId === undefined || target === undefined) return null
   const fileInput = () => button.current?.closest('[data-composer-card]')?.querySelector('input[type=file]')
@@ -144,13 +150,6 @@ export function ComposerPlus({ sessionId, inputActions, useRoster, actions }) {
     actions.referenceChat(sessionId, inputActions?.captureInsertion?.())
   }
   const canReference = typeof inputActions?.captureInsertion === 'function' && actions.canReferenceChat()
-  // Anchored to the "+" each render: the visible viewport can move (on-screen
-  // keyboard) while the menu is open.
-  const place = useMemo(() => {
-    if (!shown || !button.current) return null
-    const rect = button.current.getBoundingClientRect()
-    return { left: rect.left, bottom: viewBottom() - rect.top + 8 }
-  }, [shown, open, tick])
   return h(Fragment, null,
     h('button', {
       ref: button, type: 'button', className: 'bt-plus', 'aria-label': t('Add'), title: t('Add'),

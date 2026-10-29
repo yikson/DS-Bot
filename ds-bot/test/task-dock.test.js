@@ -7,15 +7,20 @@ import { fileURLToPath } from 'node:url'
 import { isHiddenTurn } from '../src/client/text.js'
 
 const { outputFiles } = await build({
-  stdin: { contents: "export { BranchDock } from './src/client/branch-dock.js'", resolveDir: fileURLToPath(new URL('..', import.meta.url)) },
+  stdin: { contents: "export { BranchDock } from './src/client/branch-dock.js'\nexport { ComposerPlus } from './src/client/composer.js'", resolveDir: fileURLToPath(new URL('..', import.meta.url)) },
   bundle: true, format: 'cjs', platform: 'browser', write: false, logLevel: 'silent',
   external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
 })
 const module = { exports: {} }
+const hooks = []
 runInNewContext(outputFiles[0].text, { module, exports: module.exports, require: name => name === 'react' ? {
   createElement: (type, props, ...children) => ({ type, props: { ...props, children } }),
+  useState: value => { hooks.push('state'); return [value, () => {}] },
+  useRef: current => { hooks.push('ref'); return { current } },
+  useEffect: () => { hooks.push('effect') },
+  useMemo: make => { hooks.push('memo'); return make() },
 } : {} })
-const { BranchDock } = module.exports
+const { BranchDock, ComposerPlus } = module.exports
 const record = (id, state = 'open') => ({
   id, title: `Task ${id}`, requester: 'a', assignee: 'b', state, phase: 'ready', openedAt: 1,
   sessions: { a: `${id}-a`, b: `${id}-b`, c: 'c' },
@@ -59,4 +64,12 @@ test('creating task endpoints are not opened before setup is ready', () => {
   const roster = indexRoster({ bots: [{ id: 'a', name: 'A' }], rooms: [], tasks: [task] })
   const tree = BranchDock({ sessionId: 'a', useRoster: pick => pick(roster), useWork: pick => pick({}), actions: {} })
   assert.equal(tree.props.children.flat().find(child => child?.type === 'button').props.disabled, true)
+})
+test('composer hook order stays stable when a Task Session appears in the roster', () => {
+  const render = byId => {
+    hooks.length = 0
+    ComposerPlus({ sessionId: 'task-a', useRoster: pick => pick({ byId, roomsById: {} }), actions: {}, inputActions: {} })
+    return [...hooks]
+  }
+  assert.deepEqual(render({}), render({ 'task-a': { id: 'a' } }))
 })
