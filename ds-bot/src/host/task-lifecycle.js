@@ -4,7 +4,6 @@ import { HISTORY_TIMEOUT_MS, SOURCE_KIND } from './constants.js'
 
 export const TASK_CONCLUSION_HEADER = '[Task closed]'
 const MAX_CONCLUSION_ATTEMPTS = 5
-const MAX_DELIVERY_TARGETS = 64
 const CONCLUSION_ATTEMPT = Symbol('task conclusion attempt')
 const TIMED_OUT = Symbol('task conclusion timeout')
 export const conclusionText = task => [
@@ -86,10 +85,15 @@ export function install(rt) {
   async function prepare(args) {
     check(args)
     const task = taskOf(args.taskId)
+    if (args.role === 'task-conclusion' && (task.state === 'open'
+      || task.delivery?.summaryId !== args.exchangeId || args.toId !== task.requester)) throw new Error('Invalid task conclusion')
     if (args.role !== 'task-conclusion' && task.state !== 'open'
       && !(args.deferred || args.resent)) throw new Error('This task is not open')
     const current = destination(task, args)
     if (!current) throw new Error('Task participant has no endpoint')
+    if (ledgerOf(task, args)?.targets.some(target => target.sessionId === current && target.state === 'cleared')) {
+      throw new Error('Task delivery cannot return to a cleared part')
+    }
     const attempt = args[CONCLUSION_ATTEMPT]
     if (attempt?.target && attempt.target !== current) throw new Error('Task conclusion endpoint changed; delivery remains pending')
     if (attempt) attempt.target = current
@@ -106,7 +110,6 @@ export function install(rt) {
     await commit(task.id, task => {
       const ledger = ledgerOf(task, args)
       if (!ledger.targets.some(target => target.sessionId === current)) {
-        if (ledger.targets.length >= MAX_DELIVERY_TARGETS) throw new Error('Task delivery target limit reached; inspect the recorded targets')
         ledger.targets.push({ sessionId: current, state: 'pending' })
       }
       ledger.targetSessionId = current
@@ -130,6 +133,9 @@ export function install(rt) {
     const ledger = ledgerOf(task, args)
     if (!ledger || ledger.targetSessionId !== args.sessionId || destination(task, args) !== args.sessionId) {
       throw new Error('Task delivery endpoint changed')
+    }
+    if (ledger.targets.some(target => target.sessionId === args.sessionId && target.state === 'cleared')) {
+      throw new Error('Task delivery cannot return to a cleared part')
     }
     return task
   }
@@ -188,11 +194,22 @@ export function install(rt) {
   }
   async function alreadyPresent(args, moving) {
     const ledger = ledgerOf(taskOf(args.taskId), args)
-    if (ledger.targets.length > MAX_DELIVERY_TARGETS) throw new Error('Task delivery target limit reached; inspect the recorded targets')
     const observations = []
-    for (const target of ledger.targets.slice()) {
+    for (const target of ledger.targets.filter(target => target.state !== 'cleared')) {
       const seen = await observe(target.sessionId, args)
       check(args)
+      if (args.role === 'task-conclusion' && !seen.consumed && !seen.admitted.length && !seen.pending
+        && target.sessionId !== destination(taskOf(args.taskId), args)) {
+        // Archived parts cannot receive another copy. Save each absence proof so a
+        // deadline or restart resumes with only the targets still needing inspection.
+        await updateLedger(args, ledger => {
+          seen.pending = [...(seen.agent.inbox?.nextTurn ?? []), ...(seen.agent.inbox?.nextStep ?? [])]
+            .find(message => matches(message.source, args))
+          if (!seen.pending && target.sessionId !== destination(taskOf(args.taskId), args)) {
+            ledger.targets.find(saved => saved.sessionId === target.sessionId).state = 'cleared'
+          }
+        })
+      }
       observations.push({ ...seen, sessionId: target.sessionId })
     }
     // Old splice records survive migrations. Consumption anywhere wins over a stale

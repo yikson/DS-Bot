@@ -637,6 +637,17 @@ verified target histories permits enqueue at the now-current part; unreadable
 or uncertain history leaves delivery pending with a diagnostic. Neither a
 stale S0 address nor an unrecorded fresh S2 send is an acceptable shortcut.
 
+For conclusion recovery, a recorded target that is no longer the requester's
+current part may be marked `cleared` only after its readable log and inbox
+both prove the summary id absent. Persist each proof as it is obtained; retain
+the target id and never scan that target again, including after restart.
+Archived targets cannot receive another copy of that conclusion, including
+through forwarding, and delivery cannot return to a cleared target. Cleared
+proofs cannot be reverted.
+This prunes the active scan set without a capacity limit on recorded targets.
+The 20-second attempt deadline and bounded retries with backoff still apply;
+incomplete scans resume from their persisted proofs on a later attempt/startup.
+
 Delivery dedupe means one logical conclusion, with forwarded copies sharing
 the same id and no repeated admission at a destination. It does not mean
 arbitrary external side effects of a task are exactly-once. The task's

@@ -13,7 +13,7 @@ async function opened(t) {
   return { ...f, task, close: (args = closeArgs, sessionId = task.sessions.a) => f.rt.closeTask(sessionId, { task: task.id, ...args }),
     settle: async () => answerSender(f.rt, task.sessions.b, f.incoming(task.sessions.b), 'Result with evidence') }
 }
-async function pendingConclusion(t) {
+async function pendingConclusion(t, oldTargets = 0) {
   const f = await opened(t)
   await f.settle()
   const deliver = f.rt.deliver
@@ -23,6 +23,11 @@ async function pendingConclusion(t) {
   }
   await assert.rejects(f.close(), /before conclusion attempt/)
   f.rt.deliver = deliver
+  if (oldTargets) await f.rt.commitTask(f.task.id, task => {
+    task.delivery.targets = Array.from({ length: oldTargets }, (_, index) => ({ sessionId: `old-${index}`, state: 'pending' }))
+    task.delivery.targetSessionId = 'old-0'
+    return task
+  })
   return f
 }
 function retryClock(rt) {
@@ -487,14 +492,14 @@ test('continuous conclusion rotation stops after five attempts and releases its 
   }
   assert.equal(laneTurns, 4)
   assert.equal(rotations, 5)
-  assert.equal(inspected.length, 15, 'at most one recorded-target scan per attempt')
+  assert.equal(inspected.length, 9, 'cleared old targets are never scanned again')
   assert.equal(clock.timers.length, 4, 'no sixth automatic attempt')
   assert.equal([...f.logs.values()].flat().filter(event => event.data?.source?.role === 'task-conclusion').length, 0)
   assert.equal(f.saved().tasks[f.task.id].delivery.state, 'pending')
   await f.rt.recoverTasks()
   await f.rt.recoverTasks()
   assert.equal(rotations, 5, 'manual recovery shares the generation budget')
-  assert.equal(inspected.length, 15)
+  assert.equal(inspected.length, 9)
   assert.equal(warnings.filter(warning => warning.includes('pending until next startup: retry limit')).length, 1)
   const g = await setup(t, {}, f.saved())
   await g.rt.recoverTasks()
@@ -525,13 +530,13 @@ test('forwarded conclusions share the same attempt cap and never keep scanning a
   await assert.rejects(g.rt.forwardTaskMessage({ botId: 'a' }, message), /endpoint changed/)
   for (let attempt = 0; attempt < 4; attempt += 1) await clock.fire(clock.timers[attempt])
   assert.equal(rotations, 5)
-  assert.equal(inspected.length, 20)
+  assert.equal(inspected.length, 10)
   assert.equal(clock.timers.length, 4)
   assert.equal(g.saved().tasks[f.task.id].delivery.state, 'pending')
   assert.equal(g.agentOf('a').inbox.nextTurn[0].id, message.id, 'the durable source is kept')
   for (let part = 0; part <= 5; part += 1) assert.equal(g.agentOf(`forward-${part}`).calls.length, 0)
   await assert.rejects(g.rt.forwardTaskMessage({ botId: 'a' }, message), /retry limit/)
-  assert.equal(inspected.length, 20)
+  assert.equal(inspected.length, 10)
 })
 test('a stable eighteen-target conclusion scan checks each recorded target once and recognizes consumption', async t => {
   const f = await pendingConclusion(t)
@@ -551,26 +556,175 @@ test('a stable eighteen-target conclusion scan checks each recorded target once 
   assert.equal(g.agentOf('a').calls.length, 0)
   assert.equal(g.rt.taskOf(f.task.id).delivery.state, 'delivered')
 })
-for (const count of [64, 65]) {
-  test(`${count} recorded targets cannot bypass the scan limit or lose unverified history`, async t => {
-    const f = await pendingConclusion(t)
-    await f.rt.commitTask(f.task.id, task => {
-      task.delivery.targets = Array.from({ length: count }, (_, index) => ({ sessionId: count === 65 && index === 0 ? 'a' : `old-${index}`, state: 'pending' }))
-      task.delivery.targetSessionId = task.delivery.targets[0].sessionId
-      return task
-    })
-    const clock = retryClock(f.rt)
-    let reads = 0
-    f.ctx.sessionController.inspect = async () => { reads += 1; return { events: [] } }
+for (const count of [64, 100]) {
+  test(`${count} absent old targets are durably cleared before one delivery to the new current part`, async t => {
+    const f = await pendingConclusion(t, count)
+    const inspected = [], inspect = f.ctx.sessionController.inspect
+    f.ctx.sessionController.inspect = async id => { inspected.push(id); return inspect(id) }
+    const agent = f.agentOf('a'), followup = agent.followup.bind(agent)
+    agent.followup = message => {
+      const targets = f.saved().tasks[f.task.id].delivery.targets
+      assert.equal(targets.filter(target => target.state === 'cleared').length, count)
+      assert.equal(targets.find(target => target.sessionId === 'a').state, 'pending', 'the current part is not cleared')
+      followup(message)
+    }
     await f.rt.recoverTasks()
-    for (let attempt = 0; attempt < 4; attempt += 1) await clock.fire(clock.timers[attempt])
-    assert.equal(reads, 0)
-    assert.equal(f.agentOf('a').calls.length, 0)
-    assert.equal(f.saved().tasks[f.task.id].delivery.targets.length, count)
-    assert.equal(f.saved().tasks[f.task.id].delivery.state, 'pending')
-    assert.equal(clock.timers.length, 4)
+    await f.rt.recoverTasks()
+    assert.equal(inspected.length, count + 1)
+    assert.equal(agent.calls.length, 1)
+    assert.equal(f.saved().tasks[f.task.id].delivery.targets.length, count + 1, 'no history is removed')
+    assert.equal(f.saved().tasks[f.task.id].delivery.state, 'delivered')
+    for (const state of ['pending', 'delivered']) await assert.rejects(f.rt.commitTask(f.task.id, task => {
+      task.delivery.targets[0].state = state
+      return task
+    }), /cleared/)
+    f.rt.botOf('a').sessionId = 'old-0'
+    await f.rt.save({ required: true })
+    await assert.rejects(f.rt.forwardTaskMessage({ botId: 'a' }, agent.calls[0][1]), /cleared part/)
+    assert.equal(f.agentOf('old-0').calls.length, 0)
+    assert.equal(inspected.length, count + 1)
   })
 }
+test('a 65-target upgrade with consumed proof prunes absence proofs and confirms once after restart', async t => {
+  const f = await pendingConclusion(t)
+  await f.rt.commitTask(f.task.id, task => {
+    task.delivery.targets = ['a', ...Array.from({ length: 64 }, (_, index) => `old-${index}`)]
+      .map(sessionId => ({ sessionId, state: 'pending' }))
+    task.delivery.targetSessionId = 'a'
+    return task
+  })
+  const proof = [{ type: 'user/message', data: { source: { kind: SOURCE_KIND, taskId: f.task.id,
+    exchangeId: `${f.task.id}:closed`, role: 'task-conclusion' } } }]
+  f.logs.set('old-63', proof)
+  f.ctx.sessions.flush = async session => { if (session.id === 'old-63') asyncScope(f.rt).stop() }
+  await assert.rejects(f.rt.recoverTasks(), /stopped/)
+  const seed = f.saved()
+  assert.equal(seed.tasks[f.task.id].delivery.targets.filter(target => target.state === 'cleared').length, 63)
+  assert.equal(seed.tasks[f.task.id].delivery.state, 'pending')
+  const g = await setup(t, {}, seed)
+  g.logs.set('old-63', proof)
+  const inspected = [], inspect = g.ctx.sessionController.inspect
+  g.ctx.sessionController.inspect = async id => {
+    assert.ok(['a', 'old-63'].includes(id), 'a persisted cleared target must not be read')
+    inspected.push(id)
+    return inspect(id)
+  }
+  await g.rt.recoverTasks()
+  await g.rt.recoverTasks()
+  assert.deepEqual(inspected, ['a', 'old-63'])
+  assert.equal(g.agentOf('a').calls.length, 0)
+  assert.equal(g.rt.taskOf(f.task.id).delivery.state, 'delivered')
+  assert.equal(g.rt.taskOf(f.task.id).delivery.targets.at(-1).state, 'delivered')
+})
+test('one hundred rotations keep only unverified targets active and eventually deliver exactly once', async t => {
+  let f = await pendingConclusion(t)
+  const id = f.task.id, reads = new Map()
+  let rotations = 0, enqueued = 0
+  for (let generation = 0; generation <= 20; generation += 1) {
+    if (generation) {
+      const seed = f.saved()
+      await f.ctx.dispose()
+      f = await setup(t, {}, seed)
+    }
+    const clock = retryClock(f.rt)
+    const ensure = f.rt.ensureCapabilities, inspect = f.ctx.sessionController.inspect
+    f.rt.ensureCapabilities = async sessionId => {
+      await ensure(sessionId)
+      if (rotations >= 100) return
+      f.rt.botOf('a').sessionId = `rotation-${++rotations}`
+      await f.rt.save({ required: true })
+    }
+    f.ctx.sessionController.inspect = async sessionId => {
+      const targets = f.rt.taskOf(id).delivery.targets
+      assert.notEqual(targets.find(target => target.sessionId === sessionId)?.state, 'cleared')
+      assert.ok(targets.filter(target => target.state !== 'cleared').length <= 2)
+      reads.set(sessionId, (reads.get(sessionId) ?? 0) + 1)
+      return inspect(sessionId)
+    }
+    await f.rt.recoverTasks()
+    for (let retry = 0; retry < 4 && f.rt.taskOf(id).delivery.state !== 'delivered'; retry += 1) {
+      await clock.fire(clock.timers[retry])
+    }
+    enqueued += [...f.logs.values()].flat().filter(event => event.type === 'agent/inbox/spliced')
+      .flatMap(event => event.data.inserted).filter(message => message.source?.role === 'task-conclusion').length
+    if (generation < 20) {
+      assert.equal(enqueued, 0)
+      assert.equal(f.saved().tasks[id].delivery.state, 'pending')
+    }
+  }
+  await f.rt.recoverTasks()
+  assert.equal(rotations, 100)
+  assert.equal(enqueued, 1)
+  assert.equal([...reads.values()].reduce((sum, count) => sum + count, 0), 201)
+  assert.ok([...reads.values()].every(count => count <= 2), 'each part is read at most once current and once archived')
+  const delivery = f.saved().tasks[id].delivery
+  assert.equal(delivery.state, 'delivered')
+  assert.equal(delivery.targets.length, 101)
+  assert.equal(delivery.targets.filter(target => target.state === 'cleared').length, 100)
+})
+test('restart resumes a partially pruned outbox without rereading cleared targets and delivers once', async t => {
+  const f = await pendingConclusion(t, 100)
+  const save = f.rt.save
+  f.rt.save = async options => {
+    await save(options)
+    if (f.rt.taskOf(f.task.id).delivery.targets.filter(target => target.state === 'cleared').length === 40) asyncScope(f.rt).stop()
+  }
+  await assert.rejects(f.rt.recoverTasks(), /stopped/)
+  const seed = f.saved()
+  assert.equal(seed.tasks[f.task.id].delivery.targets.filter(target => target.state === 'cleared').length, 40)
+  assert.equal(f.agentOf('a').calls.length, 0)
+  const g = await setup(t, {}, seed)
+  const inspected = [], inspect = g.ctx.sessionController.inspect
+  g.ctx.sessionController.inspect = async sessionId => {
+    assert.notEqual(g.rt.taskOf(f.task.id).delivery.targets.find(target => target.sessionId === sessionId)?.state, 'cleared')
+    inspected.push(sessionId)
+    return inspect(sessionId)
+  }
+  await g.rt.recoverTasks()
+  await g.rt.recoverTasks()
+  assert.equal(inspected.length, 61)
+  assert.equal(g.agentOf('a').calls.length, 1)
+  assert.equal(g.saved().tasks[f.task.id].delivery.targets.filter(target => target.state === 'cleared').length, 100)
+  const h = await setup(t, {}, g.saved())
+  await h.rt.recoverTasks()
+  assert.equal(h.agentOf('a').calls.length, 0)
+  assert.equal(h.saved().tasks[f.task.id].delivery.state, 'delivered')
+})
+test('a failed cleared-proof save is persisted on retry before enqueue without rescanning its proof', async t => {
+  const f = await pendingConclusion(t, 1)
+  const clock = retryClock(f.rt)
+  const save = f.rt.save, inspect = f.ctx.sessionController.inspect
+  let oldReads = 0
+  f.ctx.sessionController.inspect = async id => { if (id === 'old-0') oldReads += 1; return inspect(id) }
+  f.rt.save = async options => {
+    if (f.rt.taskOf(f.task.id).delivery.targets[0].state === 'cleared') throw new Error('clear save')
+    return save(options)
+  }
+  await f.rt.recoverTasks()
+  assert.equal(f.saved().tasks[f.task.id].delivery.targets[0].state, 'pending')
+  assert.equal(f.rt.taskOf(f.task.id).delivery.targets[0].state, 'cleared')
+  assert.equal(f.agentOf('a').calls.length, 0)
+  f.rt.save = save
+  const agent = f.agentOf('a'), followup = agent.followup.bind(agent)
+  agent.followup = message => {
+    assert.equal(f.saved().tasks[f.task.id].delivery.targets[0].state, 'cleared')
+    followup(message)
+  }
+  await clock.fire(clock.timers[0])
+  assert.equal(oldReads, 1)
+  assert.equal(agent.calls.length, 1)
+  assert.equal(f.saved().tasks[f.task.id].delivery.state, 'delivered')
+})
+test('a mismatched summary id cannot clear another conclusion target', async t => {
+  const f = await pendingConclusion(t, 1)
+  let reads = 0
+  f.ctx.sessionController.inspect = async () => { reads += 1; return { events: [] } }
+  await assert.rejects(f.rt.forwardTaskMessage({ botId: 'a' }, { content: [], source: {
+    kind: SOURCE_KIND, taskId: f.task.id, role: 'task-conclusion', exchangeId: `${f.task.id}:another`,
+  } }), /Invalid task conclusion/)
+  assert.equal(reads, 0)
+  assert.equal(f.saved().tasks[f.task.id].delivery.targets[0].state, 'pending')
+})
 for (const phase of ['resolve', 'inspect']) {
   test(`an attempt deadline releases a hung ${phase} and prevents its late continuation from enqueueing`, async t => {
     const f = await pendingConclusion(t)

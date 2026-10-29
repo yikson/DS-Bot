@@ -14,7 +14,7 @@ function validateDeliveryUpdate(before, after) {
   require(text(after.summaryId) && (before?.summaryId === undefined || after.summaryId === before.summaryId), 'summaryId is immutable once recorded')
   require(stages.includes(after.state) && Array.isArray(after.targets), 'invalid state or target history')
   require(after.targets.every(target => record(target) && Object.keys(target).every(key => ['sessionId', 'state'].includes(key))
-    && text(target.sessionId) && stages.includes(target.state)), 'invalid target record')
+    && text(target.sessionId) && (stages.includes(target.state) || target.state === 'cleared')), 'invalid target record')
   require(new Set(after.targets.map(target => target.sessionId)).size === after.targets.length, 'target Sessions must be unique')
   if (after.targetSessionId === undefined) {
     require(after.targets.length === 0 && after.state === 'pending'
@@ -26,8 +26,11 @@ function validateDeliveryUpdate(before, after) {
   const oldTargets = before?.targets ?? []
   require(Array.isArray(oldTargets) && after.targets.length >= oldTargets.length, 'target history cannot be removed')
   for (const [index, target] of oldTargets.entries()) {
-    require(after.targets[index].sessionId === target.sessionId
-      && stages.indexOf(after.targets[index].state) >= stages.indexOf(target.state), 'saved targets cannot be replaced or lose confirmations')
+    const next = after.targets[index]
+    require(next.sessionId === target.sessionId
+      && (target.state === 'cleared' ? next.state === 'cleared'
+        : next.state === 'cleared' || stages.indexOf(next.state) >= stages.indexOf(target.state)),
+    'saved targets cannot be replaced, lose confirmations or revive a cleared part')
   }
   for (const key of ['enqueuedAt', 'deliveredAt']) {
     require((after[key] === undefined || Number.isFinite(after[key]))
