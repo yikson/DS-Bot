@@ -150,6 +150,7 @@ export function install(rt) {
   const mounted = {}
   mountBrowserPlugin(rt.ctx, {
     lifecycle: safe,
+    warn: (...args) => rt.warn(...args),
     api: mounted,
     toolDefs: plugin.tools ?? plugin.toolDefs,
     defineTool,
