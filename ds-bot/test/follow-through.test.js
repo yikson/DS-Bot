@@ -290,6 +290,67 @@ test('an answer a turn produced while DS Bot was not watching goes to the Bot th
   assert.deepEqual([third.agentOf('a').calls.length, third.agentOf('b').calls.length], [0, 0])
 })
 
+test('a completed Session answer is recovered through the controller service receiver', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const home = freshHome(t)
+  const logs = new Map()
+  const first = await start(home, logs)
+  const request = await askWriter(first, home)
+  logs.set('b', writerLog(request, 'The plan is ready.'))
+  await first.stop()
+
+  const second = await start(home, logs)
+  const controller = second.ctx.sessionController
+  controller.ctx = { sessions: { get: id => ({ events: logs.get(id) ?? [] }) } }
+  // DSH's controller is a service whose inspect method reads its own context.
+  controller.inspect = function (id) { return Promise.resolve(this.ctx.sessions.get(id)) }
+  second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  t.mock.timers.tick(3000)
+  await settle(() => second.agentOf('a').calls.length === 1)
+  const reply = second.agentOf('a').calls[0]
+  assert.equal(reply.source.replyTo, request.source.exchangeId)
+  assert.match(text(reply), /The plan is ready\./)
+  await settleState(t, home, () => stateOf(home).works?.[request.source.exchangeId] === undefined)
+  assert.equal(second.agentOf('b').calls.length, 0)
+})
+
+for (const failure of ['rejected', 'missing', 'invalid events']) {
+  test(`a Session log read that is ${failure} once is retried after one second`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const home = freshHome(t)
+    const logs = new Map()
+    const first = await start(home, logs)
+    const request = await askWriter(first, home)
+    logs.set('b', writerLog(request, 'The plan is ready.'))
+    await first.stop()
+
+    let reads = 0
+    const second = await start(home, logs, async (id) => {
+      if (id === 'b' && ++reads === 1) {
+        if (failure === 'rejected') throw new Error('the session is still opening')
+        return failure === 'missing' ? undefined : { events: {} }
+      }
+      return { events: logs.get(id) ?? [] }
+    })
+    second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+    t.mock.timers.tick(3000)
+    await settle(() => reads === 1)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(second.agentOf('a').calls.length, 0)
+    t.mock.timers.tick(999)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(reads, 1)
+    t.mock.timers.tick(1)
+    await settle(() => second.agentOf('a').calls.length === 1)
+    assert.equal(reads, 2)
+    const reply = second.agentOf('a').calls[0]
+    assert.equal(reply.source.replyTo, request.source.exchangeId)
+    assert.match(text(reply), /The plan is ready\./)
+    await settleState(t, home, () => stateOf(home).works?.[request.source.exchangeId] === undefined)
+    assert.equal(second.agentOf('b').calls.length, 0)
+  })
+}
+
 test('a turn whose record cannot be read says the result is unknown, and is not run again', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const home = freshHome(t)
@@ -302,11 +363,17 @@ test('a turn whose record cannot be read says the result is unknown, and is not 
 
   // DSH cannot read that Session's record: whether the turn answered cannot be
   // established, so the sender is told that, and the work is not run again.
-  const unreadable = async () => { throw new Error('session not found') }
+  let reads = 0
+  const unreadable = async () => { reads += 1; throw new Error('session not found') }
   const second = await start(home, logs, unreadable)
   second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
   t.mock.timers.tick(3000)
+  // A first failed read is tried again a second later before it counts as unreadable.
+  await settle(() => reads === 1)
+  await new Promise(resolve => setImmediate(resolve))
+  t.mock.timers.tick(1000)
   await settle(() => second.agentOf('a').calls.length === 1)
+  assert.equal(reads, 2)
   const reply = second.agentOf('a').calls[0]
   assert.deepEqual([reply.source.role, reply.source.replyTo], ['reply', exchangeId])
   assert.match(text(reply), /what it did is unknown/)
