@@ -53,6 +53,18 @@ test('concurrent close calls enqueue one conclusion and exclude the closing turn
   assert.equal(f.agentOf('a').calls.length, 1)
   assert.equal(f.rt.taskOf(f.task.id).delivery.state, 'delivered')
 })
+test('the closing turn own request does not block done or produce a second late result', async t => {
+  const f = await opened(t)
+  await f.settle()
+  f.rt.openWork('closing-work', { from: 'b', to: 'a', taskId: f.task.id })
+  const source = { kind: SOURCE_KIND, taskId: f.task.id, role: 'request', exchangeId: 'closing-work',
+    senderSessionId: 'b', replySessionId: f.task.sessions.b }
+  f.handling(f.task.sessions.a, source)
+  await f.close()
+  await answerSender(f.rt, f.task.sessions.a, source, 'closing turn ended')
+  assert.equal(f.rt.taskOf(f.task.id).lateReplies.count, 0)
+  assert.equal(f.agentOf('a').calls.length, 1)
+})
 test('another active task turn blocks done, while unrelated shared-trunk work is not cancelled', async t => {
   const f = await opened(t)
   const source = f.incoming(f.task.sessions.b)

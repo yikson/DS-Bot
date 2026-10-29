@@ -124,6 +124,7 @@ export function summaryBlocks(text) {
 
 export function isHiddenTurn(roster, sessionId, turn) {
   if (sessionId === undefined || turn === undefined) return false
+  if (roster.taskSessions?.[sessionId]) return false
   return (roster.exchangeTurns[sessionId] ?? []).includes(turn)
 }
 

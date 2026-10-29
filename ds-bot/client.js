@@ -2027,6 +2027,7 @@ function summaryBlocks(text) {
 }
 function isHiddenTurn(roster, sessionId, turn) {
   if (sessionId === void 0 || turn === void 0) return false;
+  if (roster.taskSessions?.[sessionId]) return false;
   return (roster.exchangeTurns[sessionId] ?? []).includes(turn);
 }
 var toolName = (root) => root.name || root.call?.name;
@@ -7880,6 +7881,14 @@ function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnClock, us
             { type: "button", className: "bt-mini", onClick: () => actions.openBranch(branch.sessionId) },
             `${t("Open branch")} · ${elapsedLabel(branch.closedAt - branch.openedAt)}`
           ) : null
+        );
+      }
+      if (source.taskId && roster.taskSessions?.[sessionId]) {
+        return (0, import_react13.createElement)(
+          "div",
+          { className: "bt-branch-summary" },
+          (0, import_react13.createElement)("strong", null, `${t(source.role === "reply" ? "Reply from" : "Message from")} ${source.senderName ?? t("a Bot")}`),
+          (0, import_react13.createElement)("div", null, stripHeader(contentText(data.content)))
         );
       }
       if (source.handoff === true) return roster.roomsById[sessionId] ? null : (0, import_react13.createElement)(EarlierParts, { sessionId, roster, actions });

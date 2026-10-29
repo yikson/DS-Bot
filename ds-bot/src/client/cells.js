@@ -601,6 +601,11 @@ export function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnCl
           branch ? h('button', { type: 'button', className: 'bt-mini', onClick: () => actions.openBranch(branch.sessionId) },
             `${t('Open branch')} · ${elapsedLabel(branch.closedAt - branch.openedAt)}`) : null)
       }
+      if (source.taskId && roster.taskSessions?.[sessionId]) {
+        return h('div', { className: 'bt-branch-summary' },
+          h('strong', null, `${t(source.role === 'reply' ? 'Reply from' : 'Message from')} ${source.senderName ?? t('a Bot')}`),
+          h('div', null, stripHeader(contentText(data.content))))
+      }
       // A part opens with its handoff package, so the earlier parts go right above it.
       if (source.handoff === true) return roster.roomsById[sessionId] ? null : h(EarlierParts, { sessionId, roster, actions })
       // Group turns belong to the group chat; the member's own chat stays one-to-one.

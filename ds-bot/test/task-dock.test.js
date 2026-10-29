@@ -4,6 +4,7 @@ import { build } from 'esbuild'
 import { runInNewContext } from 'node:vm'
 import { indexRoster, conversationTarget } from '../src/client/sources.js'
 import { fileURLToPath } from 'node:url'
+import { isHiddenTurn } from '../src/client/text.js'
 
 const { outputFiles } = await build({
   stdin: { contents: "export { BranchDock } from './src/client/branch-dock.js'", resolveDir: fileURLToPath(new URL('..', import.meta.url)) },
@@ -32,6 +33,9 @@ test('task-owned endpoints index as Bots without claiming shared trunks or conve
   assert.equal(conversationTarget(roster, 'a'), 'a-now')
   assert.equal(conversationTarget(roster, 't1-a'), 't1-a')
   assert.equal(conversationTarget(roster, 't2-a'), 't2-a')
+  roster.exchangeTurns = { 't1-a': [1], a: [1] }
+  assert.equal(isHiddenTurn(roster, 't1-a', 1), false)
+  assert.equal(isHiddenTurn(roster, 'a', 1), true)
 })
 test('participant trunk docks open their own endpoint and label a shared trunk explicitly', () => {
   const tasks = [record('t1'), record('t2', 'done')]
@@ -49,4 +53,10 @@ test('participant trunk docks open their own endpoint and label a shared trunk e
     assert.ok(JSON.stringify(buttons[1]).includes('Late results'))
   }
   assert.equal(BranchDock({ sessionId: 't1-a', useRoster: pick => pick(roster), useWork: pick => pick({}), actions: {} }), null)
+})
+test('creating task endpoints are not opened before setup is ready', () => {
+  const task = { ...record('t1'), phase: 'creating' }
+  const roster = indexRoster({ bots: [{ id: 'a', name: 'A' }], rooms: [], tasks: [task] })
+  const tree = BranchDock({ sessionId: 'a', useRoster: pick => pick(roster), useWork: pick => pick({}), actions: {} })
+  assert.equal(tree.props.children.flat().find(child => child?.type === 'button').props.disabled, true)
 })
