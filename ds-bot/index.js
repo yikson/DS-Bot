@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { asyncScope } from './src/host/async.js'
 import * as diagnostics from './src/host/diagnostics.js'
 import * as store from './src/host/store.js'
+import * as tasks from './src/host/tasks.js'
 import * as models from './src/host/models.js'
 import * as providers from './src/host/providers.js'
 import * as permissions from './src/host/permissions.js'
@@ -49,7 +50,7 @@ export const inject = ['llm', 'tools', 'systemPrompt', 'sessionController', 'ses
 // the functions other modules call; they call them through `rt` at run time, never during
 // install. Listeners run and tools are listed in registration order, so this order holds:
 // usage meters model requests after every listener that rewrites them.
-const MODULES = [diagnostics, store, models, providers, permissions, turns, handoffs, requests, delivery, roster, branches, folders, agents, prompt, timeContext, tools, chatIndex, groups, approvals, resume, memory, parts, images, avatarLibrary, secrets, connectors, capabilities, schedules, browser, browserPlugins, usage, update, dshUpdate, thinking, feed, channel]
+const MODULES = [diagnostics, store, tasks, models, providers, permissions, turns, handoffs, requests, delivery, roster, branches, folders, agents, prompt, timeContext, tools, chatIndex, groups, approvals, resume, memory, parts, images, avatarLibrary, secrets, connectors, capabilities, schedules, browser, browserPlugins, usage, update, dshUpdate, thinking, feed, channel]
 
 export function apply(ctx, config = {}) {
   createRuntime(ctx, config)
