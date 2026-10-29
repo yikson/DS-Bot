@@ -254,7 +254,8 @@ test('team tools are restricted on DSH Agent Sessions but not on Bot Sessions', 
     },
   })
   await flush()
-  assert.equal(restricted.length, 0)
+  // A Bot Session outside a work branch only loses close_work_branch, never the team tools.
+  assert.deepEqual(restricted.splice(0).map(r => [...r.filter.deny]), [['close_work_branch']])
   // Creating the agent records the session, then restrict fires on its own agent.
   const agent = (await call('add-agent')).value
   assert.equal(restricted.length, 1)

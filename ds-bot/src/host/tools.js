@@ -77,19 +77,23 @@ export function install(rt) {
         '',
         rooms.length === 0 ? 'Group chats: none you can see.' : 'Group chats:',
         ...rooms.map(room => roomLine(room, self)),
+        ...(rt.workBranchChoices?.(self) ?? []),
       ].join('\n')
     },
   }))
 
-  // Sessions a Bot is running in right now: its own chat plus each group Session
-  // with a live turn. An idle Bot reports just its own chat.
+  // Sessions a Bot is running in right now, including its open work branches.
   const activeSessions = (botId) => {
-    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId)])]
+    const branches = Object.values(rt.botOf(botId)?.workBranches ?? {})
+      .filter(branch => branch.state === 'open').map(branch => branch.sessionId).filter(Boolean)
+    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId), ...branches])]
       .filter(sessionId => rt.live.get(sessionId)?.turn !== undefined)
     return { running, idle: running.length === 0 }
   }
   const whereOf = (sessionId) => {
     const room = rt.roomOf(rt.groupOwners.get(sessionId)?.roomId)
+    const branch = rt.branchOf?.(sessionId)
+    if (branch) return `work branch "${branch.title}"`
     return room ? `group "${room.name}"` : 'its own chat'
   }
   // A Bot request still in the inbox: no step or turn has taken it out yet.
@@ -158,6 +162,10 @@ export function install(rt) {
         type: 'string',
         description: `Your own name for this request, up to ${NAME_MAX} characters, so that a repeat of it is not sent twice. Send the same request_id with the same message when you repeat a call: the receipt of the first call comes back and nothing is sent again. A request_id names one request: with other content it is refused.`,
       },
+      work: {
+        type: 'string',
+        description: 'For a configured work-branch pair, use an open branch id from list_bots or the work-branch prompt, or "new" for a separate task. Outside that branch\'s turn, one open branch is reused by default; multiple open branches require a choice. Ignored for unconfigured pairs.',
+      },
     },
     output,
     async execute(args, exec) {
@@ -172,16 +180,21 @@ export function install(rt) {
       if (name.length > NAME_MAX) return `The request_id is ${name.length} characters long; a request name is at most ${NAME_MAX}.`
       const text = absoluteLinks(String(args.message), rt.sessionFolder?.(exec.agent?.session ?? exec.agent))
       const room = rt.roomOf(rt.groupOwners.get(exec.agent?.id)?.roomId)
+      const branchContext = rt.branchOf?.(exec.agent?.id) ?? rt.relatedBranch?.(exec.agent?.id, target.id)
+      const workChoice = room === undefined && args.reply_to !== 'user' && !branchContext
+        && exec.agent?.id === rt.chatOf(sender.id) && rt.workBranchPair?.(sender, target) !== undefined
+        ? args.work : undefined
       // The request the caller named: it is admitted once, and a repeat of it is not sent again.
       const request = name === '' ? undefined : rt.requestIdentity({
         caller: sender.id,
-        context: room === undefined ? 'chat' : `room:${room.id}`,
+        context: room === undefined ? (branchContext ? `branch:${branchContext.sessionId}` : 'chat') : `room:${room.id}`,
         name,
         payload: {
           to: target.id,
           message: String(args.message ?? '').replace(/\r\n?/g, '\n').trim(),
           reply_to: args.reply_to === 'user' ? 'user' : 'me',
           when: args.when === 'queue' ? 'queue' : 'now',
+          ...(workChoice === undefined ? {} : { work: workChoice }),
         },
       })
       // What the caller gets for a request that was admitted before.
@@ -217,13 +230,16 @@ export function install(rt) {
       const send = async () => {
         const toUser = args.reply_to === 'user'
         const work = toUser ? undefined : works[0]
-        const chat = rt.chatOf(target.id)
+        const route = await rt.routeBranch?.(sender, target, exec.agent?.id, text, toUser, workChoice) ?? {}
+        const chat = route.sessionId ?? rt.chatOf(target.id)
         const agent = await rt.resolveAgent(chat)
         const status = rt.statusOf(target.id)
         // A request it has not read yet, sent for the same work, takes this one in, so
         // messages to a Bot that cannot read them do not pile up.
         const earlier = unreadRequest(agent, sender.id, toUser)
-        const joinable = earlier !== undefined && (toUser || rt.sameWork(earlier.message.source.exchangeId, work))
+        const joinable = earlier !== undefined && !route.exchangeId
+          && earlier.message.source.replySessionId === route.replySessionId
+          && (toUser || rt.sameWork(earlier.message.source.exchangeId, work))
         const before = joinable ? bodyOf(earlier.message) : undefined
         let long = await rt.attachLong(before ? `${before.text}\n\n${text}` : text, `Message from ${sender.name}.txt`)
         // Nothing went out, so a named request must not take this as a delivered
@@ -233,13 +249,22 @@ export function install(rt) {
         if (before !== undefined && !joins) long = await rt.attachLong(text, `Message from ${sender.name}.txt`) ?? long
         const working = rt.live.get(chat)?.turn !== undefined
         const steer = (args.when !== 'queue' && !toUser) || (joins && earlier.steered)
-        const exchangeId = joins ? earlier.message.source.exchangeId : randomUUID()
+        const exchangeId = joins ? earlier.message.source.exchangeId : route.exchangeId ?? randomUUID()
+        if (route.replySessionId && route.branch && !route.branch.workIds.includes(exchangeId)) {
+          route.branch.workIds.push(exchangeId)
+          rt.indexSessions()
+        }
         if (joins) rt.forgetDelivery?.(exchangeId)
         else if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work })
+        if (route.branch && state.works[exchangeId]) {
+          Object.assign(state.works[exchangeId], { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) })
+        }
         try {
-          await rt.deliver({ fromId: sender.id, toId: target.id, text: long.text, files: [...long.files, ...(joins ? before.files : [])], length: long.length, role: 'request', steer, exchangeId, ...(joins ? { merged: true } : {}), ...(toUser ? { audience: 'user' } : {}) })
+          const delivery = { fromId: sender.id, toId: target.id, text: long.text, files: [...long.files, ...(joins ? before.files : [])], ...(long.length === undefined ? {} : { length: long.length }), role: 'request', steer, exchangeId, ...(route.branch ? { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) } : {}), ...(joins ? { merged: true } : {}), ...(toUser ? { audience: 'user' } : {}) }
+          if (route.branch) await rt.sendBranchTask(route.branch, delivery)
+          else await rt.deliver(delivery)
         } catch (error) {
-          if (!joins) rt.dropWork(exchangeId)
+          if (!joins && !route.branch) rt.dropWork(exchangeId)
           throw error
         }
         const sent = toUser
@@ -255,7 +280,7 @@ export function install(rt) {
           status === 'idle' ? '' : `${target.name} now: ${status}.`,
           asker ? `When you have handed on everything, end your turn: each reply brings you back to this work, and your answer goes to ${asker} once all of it is back.` : '',
         ].filter(Boolean)
-        const out = [sent, ...notes].join(' ')
+        const out = [sent, ...notes, ...(route.branch ? [`Work branch: ${route.branch.id} (${route.branch.sessionId}). Follow up there; its conclusion returns to the main chat.`] : [])].join(' ')
         // Messages reach a Bot's own chat only; work in a group goes on without them.
         const groups = activeSessions(target.id).running.filter(sessionId => sessionId !== chat)
         if (groups.length === 0) return out
@@ -633,7 +658,7 @@ export function install(rt) {
       await rt.load()
       const id = exec.agent?.id
       if (rt.groupOwners.has(id)) return 'Question cards only work in your own chat. In a group, ask in your message instead.'
-      if (!rt.chatOwners.has(id)) return `Only Bots on the team can use ask_user. Use ${BLOCKING_QUESTION_TOOL} if it is available in this session, or ask the user in your reply.`
+      if (!rt.chatOwners.has(id) && !rt.branchOwners?.has(id)) return `Only Bots on the team can use ask_user. Use ${BLOCKING_QUESTION_TOOL} if it is available in this session, or ask the user in your reply.`
       const options = (Array.isArray(args.options) ? args.options : [])
         .map(option => (typeof option === 'string' ? { label: option } : option ?? {}))
         .map(option => ({
@@ -681,7 +706,7 @@ export function install(rt) {
       await rt.load()
       const id = exec.agent?.id
       if (rt.groupOwners.has(id)) return 'View cards only work in your own chat. In a group, ask in your message instead.'
-      if (!rt.chatOwners.has(id)) return `Only Bots on the team can use show_view. Use ${BLOCKING_QUESTION_TOOL} if it is available in this session, or ask the user in your reply.`
+      if (!rt.chatOwners.has(id) && !rt.branchOwners?.has(id)) return `Only Bots on the team can use show_view. Use ${BLOCKING_QUESTION_TOOL} if it is available in this session, or ask the user in your reply.`
       const checked = checkShownView(args.title, args.view)
       if (checked.error !== undefined) return checked.error
       const title = checked.title
@@ -719,6 +744,7 @@ export function install(rt) {
       // restrict() throws on a name this profile does not serve.
       const served = new Set(ctx.tools.schemas(agent).map(schema => schema.name))
       const deny = HIDDEN_TOOLS.filter(name => served.has(name))
+      if (!rt.branchOwners?.has(agent.session?.id) && served.has('close_work_branch')) deny.push('close_work_branch')
       if (deny.length === 0) return
       agent.ctx.tools.restrict({ deny })
       hiddenTools.add(agent)
@@ -869,6 +895,21 @@ export function install(rt) {
       },
     }))
   }
+
+  ctx.tools.register(defineTool({
+    name: 'close_work_branch',
+    description: 'Close this work branch and deliver one concise conclusion to its main chat.',
+    parameters: {
+      status: { type: 'string', required: true, enum: ['done', 'blocked', 'cancelled'] },
+      conclusion: { type: 'string', required: true, description: 'Concise conclusion; the complete rendered card must fit 1000 characters.' },
+      link: { type: 'string', description: 'One URL, absolute file path or Session link.' },
+    },
+    output,
+    async execute(args, exec) {
+      await rt.load()
+      return rt.closeBranch(exec.agent?.id, args)
+    },
+  }))
 
   Object.assign(rt, { pickRoom, hideBotUnusedTools })
 }

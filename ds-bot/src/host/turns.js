@@ -6,6 +6,7 @@ import { HANDOFF_ACK, MESSAGE_INLINE_MAX, REFERENCE_KIND, REPLY_KIND, SOURCE_KIN
 import { absoluteLinks } from './links.js'
 import { textOf } from './text.js'
 import { reminderText } from './schedules.js'
+import { replyTarget } from './branches.js'
 
 // A failed turn's `LlmFailure`, kept to what can be shown and logged. Like DSH's own
 // error row, an AUTH failure loses its message: providers may echo part of the key.
@@ -26,7 +27,10 @@ export const failureLine = failure => `${failure.code}${failure.status ? ` ${fai
 // for closes, and the answer goes up to the Bot that asked. `id` is the Session the
 // answer comes from; `source` is the trigger the turn answered.
 export function answerSender(rt, id, source, text, long) {
-  const back = rt.roomOf(source.senderRoomId)?.sessions?.[source.senderSessionId]
+  if (rt.branchOf?.(id) || rt.branchForWork?.(source.exchangeId) || rt.branchOf?.(source.replySessionId)) {
+    return rt.sendAnswer(id, source, text, long).catch(error => rt.warn('ds-bot: reply delivery failed: %s', error))
+  }
+  const back = replyTarget(rt, source)
   const work = rt.closeWork?.(source.exchangeId, rt.botOf(rt.selfOf(id))?.name ?? 'The other Bot', text)
   void rt.deliver({
     fromId: rt.selfOf(id),
@@ -83,6 +87,7 @@ export function install(rt) {
       ...(keeps && info.audience ? { audience: info.audience } : {}),
       ...(keeps && info.askedBy ? { askedBy: info.askedBy } : {}),
       ...(keeps && info.senderRoomId ? { fromRoomId: info.senderRoomId } : {}),
+      ...(keeps && info.replySessionId ? { replySessionId: info.replySessionId } : {}),
       note: 'your tool call did not run',
       retried: true,
       text: RETRY_TEXT,
@@ -565,11 +570,13 @@ export function install(rt) {
           void rt.deliver({
             fromId: result.info.senderSessionId,
             toId: rt.selfOf(id),
+            sessionId: id,
             text: result.text,
             role: result.info.role,
             exchangeId: result.info.exchangeId,
             replyTo: result.info.replyTo,
             work: result.info.work,
+            ...(result.info.replySessionId ? { replySessionId: result.info.replySessionId } : {}),
             ...(result.info.roomId ? { roomId: result.info.roomId } : {}),
             deferred: true,
           }).catch(error => rt.warn('ds-bot: handing back a result failed: %s', error))
@@ -662,6 +669,7 @@ export function install(rt) {
             exchangeId: request.info.exchangeId,
             ...(request.info.role === 'room' ? { roomId: request.info.roomId, askedBy: request.info.askedBy, note: 'you read this call during your last task; answer it now' } : {}),
             ...(request.info.senderRoomId ? { fromRoomId: request.info.senderRoomId } : {}),
+            ...(request.info.replySessionId ? { replySessionId: request.info.replySessionId } : {}),
             deferred: true,
           }).catch(error => rt.warn('ds-bot: deferred request delivery failed: %s', error))
         }

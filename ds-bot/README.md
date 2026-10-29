@@ -75,7 +75,10 @@ Options go in the profile's `cordis.patch.yml`, under the `bot` entry. All of th
     updateCheck: true               # look for a newer DS Bot when a window opens; default true
     updateRegistry: https://registry.example/   # ask only this npm registry for updates
     github: false                   # hide the GitHub connector; default shown in Connectors
+    workBranches: [[Chief, Coder]]  # private task branches for this pair of Bots; default none
 ```
+
+**Work branches**: with `workBranches` naming two Bots (the first owns the branches), a new task between them runs in a fork of the owner's Session instead of its main chat, and the main chat receives one short conclusion when the branch closes. Needs a DSH that provides `sessionController.fork`. Removing the option stops new branches; open ones keep working until they close. See [the design note](../docs/plans/2026-10-29-work-branch-sessions.md) and [`dev/work-branches.md`](dev/work-branches.md).
 
 **Updates**: when a window opens, DS Bot asks where it was installed from for a newer release: the npm registry (the one the DSH plugin manager installs from, then its fallbacks), or the latest GitHub release for a `github:…#vX.Y.Z` install. A newer version shows a cloud button at the top right of the sidebar; **Update** reinstalls DS Bot through the DSH plugin manager, and the new version runs from the next DSH start. A linked or local checkout is never offered an update. Settings → About DS Bot shows the same state, with **Check for updates** to ask again at once.
 
