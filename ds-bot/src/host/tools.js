@@ -30,6 +30,11 @@ const AVATAR_PARAM = {
   description: 'Profile picture: a local image path (a relative path starts in your working folder) or a data URL. PNG, JPEG, WebP, or GIF; square, 256x256 recommended, up to 120 KB. Images are not resized.',
 }
 const WORKING_DIRECTORY_TOOL = 'working_directory'
+const foreignRegistryName = (spec) => {
+  const name = /^((?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*)(?:@[a-zA-Z0-9*^~<>=][a-zA-Z0-9*^~<>=|.+-]*)?$/.exec(spec)?.[1]
+  return name !== undefined && name.length <= 214 && !['ds-bot', 'node_modules', 'favicon.ico'].includes(name)
+    && !/\.(?:tgz|tar\.gz)(?:@|$)/i.test(spec) ? name : undefined
+}
 
 export function install(rt) {
   const { ctx, state } = rt
@@ -61,9 +66,9 @@ export function install(rt) {
       } else {
         // Remote, tarball and local specs hide their package identity until
         // installation. They must be installed outside the running plugin.
-        if (action === 'install_bundle' && !/^(?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+(?:@[^@:\s]+)?$/.test(spec)) return next()
+        const name = action === 'install_bundle' ? foreignRegistryName(spec) : target
+        if (name === undefined) return next()
         const bundles = await manager.listBundles()
-        const name = action === 'install_bundle' ? /^(?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+/.exec(spec)[0] : target
         const bundle = bundles.find(bundle => bundle.name === name)
         if (bundle?.rows?.some(row => selfModule(row.moduleName))) return next()
         if (bundle?.overrides?.length) {

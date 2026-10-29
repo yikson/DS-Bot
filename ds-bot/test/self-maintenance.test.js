@@ -111,6 +111,47 @@ test('bundle overrides and unverified install sources cannot bypass self-change 
   assert.deepEqual(ran, [])
 })
 
+test('only positively identified foreign registry packages may be installed in managed Sessions', async (t) => {
+  const { execute, ran } = await setup(t)
+  const denied = [
+    '.', '..', ' . ', ' .. ', './', '../', '.\\', '..\\',
+    './ds-bot', '../ds-bot', '.\\ds-bot', '..\\ds-bot',
+    '/work/ds-bot', '\\work\\ds-bot', 'C:\\work\\ds-bot', 'C:/work/ds-bot',
+    '\\\\server\\share\\ds-bot', '~/ds-bot',
+    'file:.', 'file:..', 'file:/work/ds-bot', 'link:.', 'link:..', 'link:/work/ds-bot',
+    'owner/repo', 'github:owner/repo', 'gitlab:owner/repo', 'git@github.com:owner/repo.git',
+    'git+https://github.com/owner/repo.git', 'https://github.com/owner/repo',
+    'https://example.com/release.tgz', 'https://example.com/release.tar.gz',
+    'release.tgz', 'release.tar.gz', './release.tgz',
+    'other-plugin@.', 'other-plugin@..', 'other-plugin@./ds-bot', 'other-plugin@../ds-bot',
+    'other-plugin@/work/ds-bot', 'other-plugin@..\\ds-bot', 'other-plugin@C:\\work\\ds-bot',
+    'other-plugin@file:/work/ds-bot', 'other-plugin@link:../ds-bot',
+    'other-plugin@github:owner/repo', 'other-plugin@npm:ds-bot', 'other-plugin@release.tgz',
+    '', '.plugin', '_plugin', '@scope/.plugin', '@scope/_plugin', '@scope/..',
+    '@.scope/plugin', '@scope/plugin/extra', 'MixedCase', 'node_modules', 'favicon.ico',
+    'plugin@', 'plugin@%2e%2e', 'ds-bot', 'ds-bot@latest',
+    'a'.repeat(215), `@${'a'.repeat(210)}/plugin`,
+  ]
+  for (const session of ['chief', 'dsh-agent']) {
+    for (const target of denied) {
+      const result = await execute('install_bundle', target, session)
+      assert.equal(result.isError, true, `${session}: ${JSON.stringify(target)}`)
+      assert.equal(result.error.message, SELF_UPDATE_REFUSAL)
+    }
+  }
+  assert.deepEqual(ran, [])
+  const allowed = [
+    'foreign-plugin', 'foreign-plugin@latest', 'foreign-plugin@^1.2.3', 'foreign-plugin@~1.2',
+    'foreign.plugin@1.0.0-beta.2+build', '@scope/foreign-plugin', '@scope/foreign-plugin@1.0.0',
+  ]
+  for (const session of ['chief', 'dsh-agent']) {
+    for (const target of allowed) {
+      assert.equal((await execute('install_bundle', target, session)).isError, false, target)
+    }
+  }
+  assert.equal(ran.length, allowed.length * 2)
+})
+
 test('discovery and verifiable unrelated plugin changes remain available', async (t) => {
   const { execute, ran } = await setup(t)
   const calls = [
