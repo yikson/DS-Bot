@@ -485,13 +485,8 @@ const ZH = {
 
   // Plugin updates
   'DS Bot {version} is available': 'DS Bot {version} 可以更新',
-  'Updating DS Bot…': '正在更新 DS Bot…',
-  'DS Bot {version} is installed. Restart DSH to use it.': 'DS Bot {version} 已安装，重启 DSH 后生效',
-  'DS Bot {version} is installed.': 'DS Bot {version} 已安装。',
   'DS Bot update': 'DS Bot 更新',
   'DS Bot {version}': 'DS Bot {version}',
-  'Update installed': '更新已安装',
-  'Restart DSH to start using DS Bot {version}.': '重启 DSH 后开始使用 DS Bot {version}。',
   'You have {version}.': '当前版本 {version}。',
   'The update did not finish: {reason}': '更新没有完成：{reason}',
   "What's new": '更新说明',
@@ -916,6 +911,7 @@ const ZH = {
   '{version} is available': '{version} 已发布',
   'Installed from a local folder; update it there.': '从本地文件夹安装，请在那里更新。',
   'Updates are not offered for this install.': '这种安装方式不提供更新。',
+  'Stop DSH and follow the out-of-band update procedure in the README.': '请停止 DSH，再按 README 中的带外更新步骤操作。',
   'Updates come with the DeepSeek Bot app.': '随 DeepSeek Bot 应用一起更新。',
   Links: '链接',
   'Source code': '源代码',

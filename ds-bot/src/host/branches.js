@@ -158,13 +158,13 @@ export function install(rt) {
       (source.exchangeId === exchangeId || (replyTo !== undefined && source.replyTo === replyTo)))
   }
 
-  async function sendBranchTask(branch, args) {
+  async function sendBranchTask(branch, args, receipt) {
     return serial(`dispatch:${branch.id}`, async () => {
       if (branch.pendingDelivery) throw new Error('A branch delivery is still pending; resolve it before sending more work')
       branch.pendingDelivery = args
       branch.state = 'open'
       await rt.save({ required: true })
-      await rt.deliver(args)
+      await rt.deliver(args, receipt)
       delete branch.pendingDelivery
       await rt.save({ required: true })
     })

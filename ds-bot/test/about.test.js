@@ -29,20 +29,20 @@ const { AboutPage, ownAppRow } = module.exports
 
 // The DS Bot row in Settings → About, with the row's hint and its buttons' text, class
 // and clicks. `update` is the value the update source holds.
-function page(update) {
+function page(update, label = 'DS Bot') {
   const calls = []
   const actions = new Proxy({ repoStars: async () => null }, {
     get: (target, name) => target[name] ?? (() => calls.push(name)),
   })
-  const run = promise => promise
+  const run = promise => Promise.resolve(promise)
   const tree = AboutPage({ useUpdate: select => select(update), actions, run, Section: 'section', Row: 'row' })
   const find = (node, pick) => (Array.isArray(node) ? node.flatMap(one => find(one, pick))
     : node && typeof node === 'object' ? [...pick(node), ...find(node.children, pick)] : [])
-  const [row] = find(tree, node => (node.props?.label === 'DS Bot' ? [node] : []))
+  const [row] = find(tree, node => (node.props?.label === label ? [node] : []))
   const buttons = find(row?.children ?? [], node => (node.type === 'button' ? [node] : []))
   return {
     hint: row?.props?.hint,
-    buttons: buttons.map(node => ({ text: node.children[0], className: node.props.className, click: () => node.props.onClick() })),
+    buttons: buttons.map(node => ({ text: node.children[0], className: node.props.className, disabled: node.props.disabled === true, click: () => node.props.onClick() })),
     calls,
   }
 }
@@ -98,4 +98,36 @@ test('ownAppRow maps each phase to its hint and button kind', () => {
   const downloaded = ownAppRow({ phase: 'downloaded', version: '0.2.2' })
   assert.equal(downloaded.hint, '0.2.2 is ready; it installs when you restart')
   assert.equal(downloaded.button, 'restart')
+})
+
+test('a plugin release notice offers a check and release notes without a self-install action', () => {
+  const view = page({ source: 'registry', available: true, latest: '9.0.0' })
+  assert.match(view.hint, /DS Bot 9\.0\.0 is available.*out-of-band update procedure/)
+  assert.equal(view.buttons.length, 1)
+  assert.equal(view.buttons[0].text, 'Check for updates')
+  view.buttons[0].click()
+  assert.deepEqual(view.calls, ['checkUpdate'])
+})
+
+test('the separate DSH update states retain their hints and controls', () => {
+  const cases = [
+    ['idle', 'DSH 9.0.0 is available', 'Update'],
+    ['installing', 'Updating DSH…', 'Updating…'],
+    ['installed', 'Restart DSH to start using DSH 9.0.0.', undefined],
+    ['failed', 'The update did not finish: offline', 'Try again'],
+  ]
+  for (const [phase, hint, button] of cases) {
+    const view = page({
+      dsh: { kind: 'npm', current: '1.0.0', verified: '9.0.0', available: true, phase, error: 'offline' },
+    }, 'DeepSeek Harness')
+    assert.equal(view.hint, hint)
+    assert.equal(view.buttons[0]?.text, button)
+    if (button !== undefined) {
+      assert.equal(view.buttons[0].disabled, phase === 'installing')
+      if (!view.buttons[0].disabled) {
+        view.buttons[0].click()
+        assert.deepEqual(view.calls, ['installDshUpdate'])
+      }
+    }
+  }
 })

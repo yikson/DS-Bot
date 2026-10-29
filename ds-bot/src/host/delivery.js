@@ -46,6 +46,24 @@ export function install(rt) {
   // Roles recorded as team exchanges.
   const EXCHANGE_ROLES = new Set(['request', 'reply', 'stopped'])
 
+  const privateScope = (source) => {
+    if (source?.kind !== SOURCE_KIND || source.audience === 'user'
+      || !['request', 'stopped', 'reply'].includes(source.role)) return undefined
+    const id = rt.workOf(source)
+    const work = state.works?.[id]
+    if (!id || !work || (work.parent && !state.works[work.parent])) return undefined
+    // Follow-up requests share the caller's established work, never an absent parent.
+    const parent = work.parent ?? id
+    const task = work.taskId ?? state.works[parent]?.taskId ?? rt.branchForWork?.(id)?.id
+    if (source.taskId && task && source.taskId !== task) return undefined
+    return { work: parent, task: source.taskId ?? task }
+  }
+  const samePrivateWork = (left, right) => {
+    const a = privateScope(left)
+    const b = privateScope(right)
+    return a !== undefined && b !== undefined && a.work === b.work && a.task === b.task
+  }
+
   // `sessionId` defaults to the recipient's own chat; group turns name its group Session.
   // `deferred`: a request the Bot already read mid-turn, handed back to answer in a
   // turn of its own; its exchange was recorded when it first arrived. `resumed` and
@@ -58,7 +76,8 @@ export function install(rt) {
   // `length`: the whole message's length when it went as a file (attachLong). `work`:
   // the work (handoffs.js) a result that came back goes on with. `merged`: a request
   // that takes in an earlier one its recipient had not read, under that one's exchange.
-  async function deliver({ fromId, toId, sessionId, replySessionId, text, role, replyTo, roomId, audience, note, exchangeId = randomUUID(), steer = false, deferred = false, resumed = false, retried = false, resent = false, merged = false, askedBy, fromRoomId, files = [], length, work, failureResumes }) {
+  async function deliver(args, receipt = {}) {
+    let { fromId, toId, sessionId, replySessionId, text, role, replyTo, roomId, audience, note, exchangeId = randomUUID(), steer = false, deferred = false, resumed = false, retried = false, resent = false, merged = false, askedBy, fromRoomId, files = [], length, work, taskId, failureResumes, merge } = args
     const from = rt.botOf(fromId)
     const to = rt.botOf(toId)
     if (to === undefined) throw new Error(`Unknown Bot ${toId}`)
@@ -73,6 +92,7 @@ export function install(rt) {
       exchangeId,
       senderName: fromName,
       ...(work ? { work } : {}),
+      ...(taskId ? { taskId } : {}),
       ...(fromId ? { senderSessionId: fromId } : {}),
       ...(replyTo ? { replyTo } : {}),
       ...(replySessionId ? { replySessionId } : {}),
@@ -87,18 +107,6 @@ export function install(rt) {
     }
     const targetSessionId = rt.deliverySession?.({ sessionId, toId, replyTo }) ?? sessionId ?? rt.chatOf(toId)
     const branch = rt.branchOf?.(targetSessionId)
-    // A failed turn resumes with the exchange its trigger already recorded.
-    if (EXCHANGE_ROLES.has(role) && !deferred && !resumed && !retried && !resent && failureResumes === undefined) {
-      // The whole text is in its file, or in the Session it goes to; exchangeText reads
-      // it back there.
-      const kept = headOf(text, TEXT_KEPT)
-      const whole = length !== undefined ? { length, files } : kept.length < text.length ? { length: text.length, sessionId: targetSessionId } : {}
-      const entry = { id: exchangeId, from: fromId, to: toId, text: kept, ...whole, role, time: Date.now(), ...(replyTo ? { replyTo } : {}), ...(audience === 'user' ? { audience } : {}) }
-      const earlier = merged ? state.exchanges.findIndex(other => other.id === exchangeId) : -1
-      if (earlier === -1) state.exchanges.push(entry)
-      else state.exchanges[earlier] = entry
-      safe.run('delivery background job', () => rt.save())
-    }
     await rt.ensureCapabilities(targetSessionId)
     if (rt.isStopped?.()) return exchangeId
     const agent = await resolveAgent(targetSessionId)
@@ -111,6 +119,38 @@ export function install(rt) {
       rt.forgetDelivery?.(exchangeId)
       return exchangeId
     }
+    // The candidate may have been consumed, replaced or edited during admission.
+    const candidate = merge && [...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])]
+      .find(message => message.id === merge.id)
+    if (candidate && JSON.stringify(candidate.source) === merge.source && JSON.stringify(candidate.content) === merge.content
+      && candidate.source.senderSessionId === fromId && candidate.source.replySessionId === replySessionId
+      && !candidate.source.deferred && !candidate.source.resumed
+      && (audience === 'user' ? candidate.source.audience === 'user' : samePrivateWork(source, candidate.source))
+      && agent.inbox.remove(candidate.id)) {
+      const replaced = exchangeId
+      exchangeId = candidate.source.exchangeId
+      source.exchangeId = exchangeId
+      text = merge.text
+      files = merge.files
+      length = merge.length
+      merged = true
+      rt.dropWork(replaced)
+      const replacement = { ...args, exchangeId, text, files, length, merged: true }
+      delete replacement.merge
+      rt.replaceDelivery?.(replaced, replacement)
+      Object.assign(args, replacement)
+      delete args.merge
+    }
+    // A failed turn resumes with the exchange its trigger already recorded.
+    if (EXCHANGE_ROLES.has(role) && !deferred && !resumed && !retried && !resent && failureResumes === undefined) {
+      const kept = headOf(text, TEXT_KEPT)
+      const whole = length !== undefined ? { length, files } : kept.length < text.length ? { length: text.length, sessionId: targetSessionId } : {}
+      const entry = { id: exchangeId, from: fromId, to: toId, text: kept, ...whole, role, time: Date.now(), ...(replyTo ? { replyTo } : {}), ...(audience === 'user' ? { audience } : {}) }
+      const earlier = merged ? state.exchanges.findIndex(other => other.id === exchangeId) : -1
+      if (earlier === -1) state.exchanges.push(entry)
+      else state.exchanges[earlier] = entry
+      safe.run('delivery background job', () => rt.save())
+    }
     // A steered message cuts into a running turn at its next step; a follow-up
     // queues for the next turn (see turns.js for how each is routed).
     const message = createUserMessage({
@@ -120,7 +160,12 @@ export function install(rt) {
       ],
       source,
     })
-    if (steer) agent.steer(message)
+    receipt.working = rt.live.get(targetSessionId)?.turn !== undefined
+    receipt.merged = merged
+    // This is the enqueue boundary: no await may follow the final turn/scope check.
+    if (rt.isStopped?.()) return exchangeId
+    receipt.steer = steer && (role !== 'request' || (audience !== 'user' && samePrivateWork(source, rt.privateTurn(targetSessionId))))
+    if (receipt.steer) agent.steer(message)
     else agent.followup(message)
     await ctx.sessions.flush(agent.session)
     return exchangeId
@@ -182,5 +227,5 @@ export function install(rt) {
     return { text, whole: true }
   }
 
-  Object.assign(rt, { resolveAgent, deliver, exchangeText, attachLong, fileText })
+  Object.assign(rt, { resolveAgent, deliver, samePrivateWork, exchangeText, attachLong, fileText })
 }

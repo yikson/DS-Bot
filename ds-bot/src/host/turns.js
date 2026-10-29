@@ -12,6 +12,24 @@ import { textOf } from './text.js'
 import { reminderText } from './schedules.js'
 import { replyTarget } from './branches.js'
 
+const CONTEXT_ONLY_KINDS = new Set([
+  'agent-instructions', 'runtime-context', 'skill-catalog', 'time-context',
+  'compact-checkpoint', REFERENCE_KIND,
+])
+const VISIBLE_INPUT_KINDS = new Set(['user', 'schedule', REPLY_KIND])
+const PRIVATE_INPUT_ROLES = new Set(['request', 'stopped', 'reply'])
+
+// DSH context snapshots use user/message too, but do not change turn visibility.
+const turnInput = (source) => {
+  if (CONTEXT_ONLY_KINDS.has(source?.kind)) return 'context'
+  if (VISIBLE_INPUT_KINDS.has(source?.kind)) return 'visible'
+  if (source?.kind === SOURCE_KIND) {
+    if (source.audience === 'user' || source.role === 'room') return 'visible'
+    return PRIVATE_INPUT_ROLES.has(source.role) ? 'private' : 'unknown'
+  }
+  return 'unknown'
+}
+
 // A failed turn's `LlmFailure`, kept to what can be shown and logged. Like DSH's own
 // error row, an AUTH failure loses its message: providers may echo part of the key.
 export function turnFailure(error) {
@@ -214,6 +232,11 @@ export function install(rt) {
   // Roles whose turn owes the sender a reply: a 'stopped' notice asks the Bot to
   // acknowledge, exactly like a request.
   const expectsReply = info => info.role === 'request' || info.role === 'stopped'
+  const privateTurn = (sessionId) => {
+    const entry = live.get(sessionId)
+    return entry?.turn !== undefined && entry.steerable && !entry.visible && !rt.groupOwners.has(sessionId)
+      && state.exchangeTurns[sessionId]?.includes(entry.turn) ? entry.info : undefined
+  }
   // A group Session speaks only in its group, so what its turns write goes there, also
   // for turns that a finished background job or a fresh part starts; a Bot's private
   // message to it is answered privately.
@@ -436,6 +459,8 @@ export function install(rt) {
         entry.shown = 0
         entry.step = undefined
         entry.info = undefined
+        entry.visible = false
+        entry.steerable = true
         // A turn turned away before its first step may end without a turn/end.
         entry.switched = false
         entry.answers = false
@@ -450,6 +475,11 @@ export function install(rt) {
         break
       case 'user/message': {
         const source = event.data?.source
+        const input = turnInput(source)
+        if (entry.turn !== undefined && input !== 'context' && input !== 'private') {
+          entry.steerable = false
+          if (input === 'visible') entry.visible = true
+        }
         // A result that came back counts as taken once a turn reads it.
         if (source?.kind === SOURCE_KIND && source.work !== undefined && source.replyTo !== undefined) rt.takenWork?.(source.work, source.replyTo)
         // A message that shares a step with a bare handoff package is what the turn
@@ -719,5 +749,5 @@ export function install(rt) {
     }
   })
 
-  Object.assign(rt, { live, liveOf, roomWaiters, roomProgress, roomInbox, activityView, workView, roomWorkView, turnsView, steeredView, callDetail, doingOf, stopRoomTurn, releaseBot })
+  Object.assign(rt, { live, liveOf, privateTurn, roomWaiters, roomProgress, roomInbox, activityView, workView, roomWorkView, turnsView, steeredView, callDetail, doingOf, stopRoomTurn, releaseBot })
 }

@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import { createRuntime } from '../index.js'
 import { fakeContext } from './fake-ctx.js'
 import { install as installRequests } from '../src/host/requests.js'
+import { SOURCE_KIND } from '../src/host/constants.js'
 
 test('old identities survive age and receipt volume without permitting another delivery', async () => {
   const rt = { state: {}, own: (object, key) => Object.hasOwn(object, key) ? object[key] : undefined, readOnly: () => undefined, save: async () => {}, warn() {} }
@@ -197,10 +198,10 @@ test('a request whose delivery failed is not sent again', async (t) => {
   t.after(async () => { await stop(); cleanup(home) })
 
   const writer = agentOf('b')
-  const steer = writer.steer
-  writer.steer = () => { throw new Error('dsh is down') }
+  const followup = writer.followup
+  writer.followup = () => { throw new Error('dsh is down') }
   await assert.rejects(tool('message_bot', { to: 'Writer', message: 'do the thing', request_id: 'r-1' }, 'a'), /dsh is down/)
-  writer.steer = steer
+  writer.followup = followup
   // The outcome of that admission is not known, so it is not sent again.
   await assert.rejects(tool('message_bot', { to: 'Writer', message: 'do the thing', request_id: 'r-1' }, 'a'), /outcome of request_id "r-1" is not known/)
   assert.equal(writer.calls.length, 0)
@@ -208,22 +209,30 @@ test('a request whose delivery failed is not sent again', async (t) => {
 
 test('a request with an id takes in the message before it, and a repeat merges nothing', async (t) => {
   const home = tempHome()
-  const { agentOf, emit, tool, stop } = await boot(home, team())
+  const seed = team()
+  seed.works.root = { from: 'other', to: 'a', open: [], results: [], at: 1 }
+  const { rt, agentOf, emit, tool, stop } = await boot(home, seed)
   t.after(async () => { await stop(); cleanup(home) })
 
   const writer = agentOf('b')
-  writer.steer = (message) => { writer.calls.push(['steer', message]); writer.inbox.nextStep.push(message) }
+  writer.followup = (message) => { writer.calls.push(['followup', message]); writer.inbox.nextTurn.push(message) }
+  emit('a', 'turn/start', { turn: 1 })
+  emit('a', 'user/message', { content: [], source: { kind: SOURCE_KIND, role: 'request', exchangeId: 'root', senderSessionId: 'other' } })
   emit('b', 'turn/start', { turn: 1 })
 
   const first = await tool('message_bot', { to: 'Writer', message: 'task 1', request_id: 'r-1' }, 'a')
   const second = await tool('message_bot', { to: 'Writer', message: 'task 2', request_id: 'r-2' }, 'a')
   assert.match(second, /had not read your earlier message yet/)
-  assert.equal(writer.inbox.nextStep.length, 1)
+  assert.equal(writer.inbox.nextTurn.length, 1)
 
   const again = await tool('message_bot', { to: 'Writer', message: 'task 1', request_id: 'r-1' }, 'a')
   assert.equal(again, first)
-  assert.equal(writer.inbox.nextStep.length, 1)
-  assert.equal(writer.inbox.nextStep[0].source.exchangeId, writer.calls[0][1].source.exchangeId)
+  assert.equal(writer.inbox.nextTurn.length, 1)
+  assert.equal(writer.inbox.nextTurn[0].source.exchangeId, writer.calls[0][1].source.exchangeId)
+  // Recovery retains the merged payload once, under the original exchange.
+  assert.equal(rt.unreadOf('b').length, 1)
+  assert.equal(rt.unreadOf('b')[0].text, 'task 1\n\ntask 2')
+  assert.deepEqual(Object.keys(rt.state.works).sort(), ['root', writer.calls[0][1].source.exchangeId].sort())
 })
 
 test('a request with an id that queues, or that answers the user, goes out once', async (t) => {
