@@ -10,7 +10,7 @@ import { install as installTurns } from '../src/host/turns.js'
 import { install as installParts } from '../src/host/parts.js'
 import { install as installDelivery } from '../src/host/delivery.js'
 import { install as installBranches } from '../src/host/branches.js'
-import { SOURCE_KIND } from '../src/host/constants.js'
+import { REFERENCE_KIND, REPLY_KIND, SOURCE_KIND } from '../src/host/constants.js'
 import { isHiddenTurn } from '../src/client/text.js'
 
 // A two-Bot team, optionally with b in a group Session 'gb' of room 'Ops'.
@@ -524,7 +524,7 @@ function deliveryHost() {
 }
 
 for (const where of ['capabilities', 'resolve', 'save']) {
-  for (const kind of ['user', 'schedule', 'group', 'unknown', 'missing', 'missing-work', 'other-task', 'other-work', 'incoming-task', 'incoming-work', 'stopped']) {
+  for (const kind of ['user', 'schedule', 'group', 'unknown', 'bot-unknown-role', 'missing', 'missing-work', 'other-task', 'other-work', 'incoming-task', 'incoming-work', 'stopped']) {
     test(`private enqueue rechecks ${kind} after awaiting ${where}`, async () => {
       const host = deliveryHost()
       const gate = host.pause(where)
@@ -534,6 +534,8 @@ for (const where of ['capabilities', 'resolve', 'save']) {
       if (kind === 'stopped') host.stop()
       else if (kind === 'group') {
         host.trigger(replySource('room', { exchangeId: 'running', taskId: 'T1' }))
+      } else if (kind === 'bot-unknown-role') {
+        host.trigger(replySource('unknown', { exchangeId: 'running', taskId: 'T1' }))
       } else if (kind === 'missing-work') {
         delete host.rt.state.works.running
       } else if (kind === 'other-task') {
@@ -562,13 +564,37 @@ for (const where of ['capabilities', 'resolve', 'save']) {
 }
 
 test('a visible or unknown message inside a hidden turn disables private steering', async () => {
-  for (const source of [{ kind: 'user' }, { kind: 'schedule' }, { kind: 'unknown' }, undefined]) {
+  for (const source of [{ kind: 'user' }, { kind: 'schedule' }, { kind: REPLY_KIND }, { kind: 'unknown' }, undefined]) {
     const host = deliveryHost()
     host.emit('b', 'user/message', { content: textBlock('visible'), source })
     await host.rt.deliver(host.args)
     assert.deepEqual(host.calls.map(([method]) => method), ['followup'])
   }
 })
+
+for (const kind of ['runtime-context', 'agent-instructions', 'skill-catalog', 'time-context']) {
+  test(`DSH ${kind} does not make hidden private work visible`, async () => {
+    for (const deferred of [false, true]) {
+      const host = deliveryHost()
+      if (deferred) {
+        host.rt.state.works.deferred = { parent: 'root', taskId: 'T1' }
+        host.trigger(replySource('request', { exchangeId: 'deferred', taskId: 'T1', deferred: true }))
+      }
+      host.emit('b', 'user/message', { content: [], source: { kind } })
+      await host.rt.deliver(host.args)
+      assert.deepEqual(host.calls.map(([method]) => method), ['steer'], `${kind}, deferred=${String(deferred)}`)
+    }
+  })
+}
+
+for (const kind of ['compact-checkpoint', REFERENCE_KIND]) {
+  test(`DSH ${kind} context does not make hidden private work visible`, async () => {
+    const host = deliveryHost()
+    host.emit('b', 'user/message', { content: [], source: { kind } })
+    await host.rt.deliver(host.args)
+    assert.deepEqual(host.calls.map(([method]) => method), ['steer'])
+  })
+}
 
 test('non-task hidden turns require matching known private work', async () => {
   for (const mode of ['matching', 'different', 'unknown']) {
