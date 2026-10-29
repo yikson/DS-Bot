@@ -533,8 +533,20 @@ export function install(rt) {
     const session = exec.agent?.session
     if (cd === '' || session === undefined) return next()
     await rt.load()
-    const bot = callerBot(exec)
+    const task = rt.taskForSession?.(exec.agent.id)
+    const bot = task === undefined ? callerBot(exec) : rt.botOf(Object.keys(task.sessions).find(id => task.sessions[id] === exec.agent.id))
     if (bot === undefined) return next()
+    if (task !== undefined) {
+      const target = await rt.folderAt(rt.sessionFolder(session), cd)
+      if (target === undefined || !(await rt.isFolder(target))) return next()
+      const readOnly = rt.readOnly()
+      if (readOnly !== undefined) throw new Error(`Your working folder cannot change now: ${readOnly}`)
+      const workDir = await rt.workFolder(target)
+      await rt.approveFolder(exec, { path: workDir, sessions: [session.id], who: { en: bot.name, zh: ` ${bot.name} ` } })
+      if (safe.stopped) throw new Error('The host stopped during folder approval')
+      exec.signal?.throwIfAborted()
+      return next()
+    }
     const room = rt.roomOf(rt.groupOwners.get(exec.agent.id)?.roomId)
     const home = rt.workDirOf({ botId: bot.id, roomId: room?.id }) ?? rt.teamFolder()
     const target = await rt.folderAt(rt.sessionFolder(session), cd)
