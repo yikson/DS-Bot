@@ -5,6 +5,36 @@ const record = value => value !== null && typeof value === 'object' && !Array.is
 const text = value => typeof value === 'string' && value.trim().length > 0
 const states = ['open', 'blocked', 'done', 'cancelled', 'failed']
 
+function validateDeliveryUpdate(before, after) {
+  if (isDeepStrictEqual(before, after)) return
+  const require = (valid, message) => { if (!valid) throw new Error(`Invalid terminal task delivery: ${message}`) }
+  const stages = ['pending', 'enqueued', 'delivered']
+  const fields = ['summaryId', 'targetSessionId', 'targets', 'state', 'enqueuedAt', 'deliveredAt']
+  require(record(after) && Object.keys(after).every(key => fields.includes(key)), 'only conclusion delivery bookkeeping is allowed')
+  require(text(after.summaryId) && (before?.summaryId === undefined || after.summaryId === before.summaryId), 'summaryId is immutable once recorded')
+  require(stages.includes(after.state) && Array.isArray(after.targets), 'invalid state or target history')
+  require(after.targets.every(target => record(target) && Object.keys(target).every(key => ['sessionId', 'state'].includes(key))
+    && text(target.sessionId) && stages.includes(target.state)), 'invalid target record')
+  require(new Set(after.targets.map(target => target.sessionId)).size === after.targets.length, 'target Sessions must be unique')
+  if (after.targetSessionId === undefined) {
+    require(after.targets.length === 0 && after.state === 'pending'
+      && after.enqueuedAt === undefined && after.deliveredAt === undefined, 'delivery needs a recorded target')
+  } else {
+    require(text(after.targetSessionId) && after.targets.some(target => target.sessionId === after.targetSessionId),
+      'current target must be in the target history')
+  }
+  const oldTargets = before?.targets ?? []
+  require(Array.isArray(oldTargets) && after.targets.length >= oldTargets.length, 'target history cannot be removed')
+  for (const [index, target] of oldTargets.entries()) {
+    require(after.targets[index].sessionId === target.sessionId
+      && stages.indexOf(after.targets[index].state) >= stages.indexOf(target.state), 'saved targets cannot be replaced or lose confirmations')
+  }
+  for (const key of ['enqueuedAt', 'deliveredAt']) {
+    require((after[key] === undefined || Number.isFinite(after[key]))
+      && (before?.[key] === undefined || after[key] !== undefined), 'confirmation times must be finite and retained')
+  }
+}
+
 // Validate persisted data without repairing it: unknown creation outcomes must survive reload.
 export function validateTask(task, id) {
   const require = (valid, message) => { if (!valid) throw new Error(`Invalid task ${id}: ${message}`) }
@@ -118,8 +148,8 @@ export function install(rt) {
         if (previous.mode !== next.mode || previous.requester !== next.requester || previous.assignee !== next.assignee
           || JSON.stringify(previous.capabilityAtCreation) !== JSON.stringify(next.capabilityAtCreation)) throw new Error('Task creation identity is immutable')
         if (previous.state !== 'open') {
-          const { lateReplies: before, ...closed } = previous
-          const { lateReplies: after, ...changed } = next
+          const { lateReplies: before, delivery: oldDelivery, ...closed } = previous
+          const { lateReplies: after, delivery, ...changed } = next
           const { ids: oldIds, count: _oldCount, results: oldResults = [], ...oldExtra } = before
           const { ids, count: _count, results = [], ...extra } = after
           const added = ids.length - oldIds.length
@@ -130,8 +160,9 @@ export function install(rt) {
             || results.slice(oldResults.length).some((result, index) => !record(result)
               || result.resultId !== ids[oldIds.length + index] || !text(result.exchangeId)
               || !text(result.sessionId) || !Number.isFinite(result.at))) {
-            throw new Error('A terminal task may only append late replies')
+            throw new Error('A terminal task may only append late replies or update conclusion delivery')
           }
+          validateDeliveryUpdate(oldDelivery, delivery)
         }
         for (const [botId, participant] of Object.entries(previous.participants)) {
           if (!Object.hasOwn(next.participants, botId)) throw new Error('Task participants cannot be removed')

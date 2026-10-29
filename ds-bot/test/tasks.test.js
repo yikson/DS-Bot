@@ -382,9 +382,9 @@ test('stopped generations cannot commit queued mutations or start a new save', a
 })
 
 for (const state of ['done', 'blocked', 'cancelled', 'failed']) {
-  test(`terminal ${state} rejects changes outside appended late replies`, async t => {
+  test(`terminal ${state} rejects changes outside late replies and conclusion delivery`, async t => {
     const { rt, statePath } = await setup(t, { seed: { ...legacy(), tasks: { t1: { ...task(), state, closedAt: 2000,
-      conclusion: { status: state, text: 'Recorded outcome' },
+      conclusion: { status: state, text: 'Recorded outcome', evidence: 'Verified checks' },
       delivery: { summaryId: 't1:closed', state: 'pending', targets: [] },
     } } } })
     const original = readFileSync(statePath, 'utf8')
@@ -392,6 +392,8 @@ for (const state of ['done', 'blocked', 'cancelled', 'failed']) {
       value => { value.state = 'open' },
       value => { value.state = state === 'done' ? 'failed' : 'done' },
       value => { value.conclusion.text = 'Rewritten outcome' },
+      value => { value.conclusion.status = state === 'done' ? 'failed' : 'done' },
+      value => { value.conclusion.evidence = 'Rewritten evidence' },
       value => { value.conclusion = null },
       value => { value.delivery.summaryId = 'replacement' },
       value => { value.title = 'Rewritten title' },
@@ -407,6 +409,103 @@ for (const state of ['done', 'blocked', 'cancelled', 'failed']) {
     }
     assert.equal(rt.openTasksOf('a').length, 0)
     assert.equal(rt.taskOf('t1').delivery.summaryId, 't1:closed')
+  })
+
+  test(`terminal ${state} persists conclusion targets, migrations and confirmations after close`, async t => {
+    const { rt, ctx, statePath } = await setup(t)
+    await rt.commitTask('t1', () => task())
+    await rt.commitTask('t1', current => ({
+      ...current, state, phase: 'closing', closedAt: 2000,
+      conclusion: { status: state, text: 'Recorded outcome', evidence: 'Verified checks' },
+      delivery: { summaryId: 't1:closed', state: 'pending', targets: [] },
+    }))
+    const closed = structuredClone(rt.taskOf('t1'))
+    const saveDelivery = async update => {
+      await rt.commitTask('t1', current => { update(current.delivery); return current })
+      assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')).tasks.t1, rt.taskOf('t1'))
+      assert.deepEqual({ ...rt.taskOf('t1'), delivery: closed.delivery, lateReplies: closed.lateReplies }, closed)
+    }
+    await saveDelivery(delivery => {
+      delivery.targetSessionId = 'a-part-0'
+      delivery.targets.push({ sessionId: 'a-part-0', state: 'pending' })
+    })
+    // Rotation before enqueue also keeps the target that was already persisted.
+    await saveDelivery(delivery => {
+      delivery.targetSessionId = 'a-part-1'
+      delivery.targets.push({ sessionId: 'a-part-1', state: 'pending' })
+    })
+    await saveDelivery(delivery => {
+      delivery.state = 'enqueued'
+      delivery.enqueuedAt = 2100
+    })
+    await saveDelivery(delivery => { delivery.targets[1].state = 'enqueued' })
+    // Rotation after enqueue retains the old target before forwarding the same summary.
+    await saveDelivery(delivery => {
+      delivery.targetSessionId = 'a-part-2'
+      delivery.targets.push({ sessionId: 'a-part-2', state: 'pending' })
+      delivery.state = 'pending'
+    })
+    await saveDelivery(delivery => {
+      delivery.state = delivery.targets[2].state = 'enqueued'
+      delivery.enqueuedAt = 2200
+    })
+    await rt.commitTask('t1', current => {
+      current.delivery.state = current.delivery.targets[2].state = 'delivered'
+      current.delivery.deliveredAt = 2300
+      current.lateReplies = { count: 1, ids: ['late:reply'],
+        results: [{ exchangeId: 'late', resultId: 'late:reply', sessionId: 't1-b', at: 2400 }] }
+      return current
+    })
+    const saved = JSON.parse(readFileSync(statePath, 'utf8')).tasks.t1
+    assert.deepEqual(saved.conclusion, closed.conclusion)
+    assert.equal(saved.delivery.summaryId, 't1:closed')
+    assert.deepEqual(saved.delivery.targets, [
+      { sessionId: 'a-part-0', state: 'pending' }, { sessionId: 'a-part-1', state: 'enqueued' },
+      { sessionId: 'a-part-2', state: 'delivered' },
+    ])
+    assert.equal(saved.delivery.enqueuedAt, 2200)
+    assert.equal(saved.delivery.deliveredAt, 2300)
+    assert.equal(saved.lateReplies.count, 1)
+    await rt.commitTask('t1', current => current)
+    await ctx.dispose()
+    const reloaded = await setup(t, { seed: { ...legacy(), tasks: { t1: saved } } })
+    assert.deepEqual(reloaded.rt.taskOf('t1'), saved)
+  })
+
+  test(`terminal ${state} refuses invalid delivery fields and loss of target history`, async t => {
+    const value = { ...task(), state, closedAt: 2000, conclusion: { status: state, text: 'Recorded outcome' },
+      delivery: { summaryId: 't1:closed', targetSessionId: 'a-part-2', state: 'pending', enqueuedAt: 2100,
+        targets: [{ sessionId: 'a-part-1', state: 'enqueued' }, { sessionId: 'a-part-2', state: 'pending' }] } }
+    const { rt, statePath } = await setup(t, { seed: { ...legacy(), tasks: { t1: value } } })
+    const original = readFileSync(statePath, 'utf8')
+    const changes = [
+      delivery => { delivery.summaryId = 'replacement' },
+      delivery => { delete delivery.summaryId },
+      delivery => { delivery.conclusion = { text: 'Hidden rewrite' } },
+      delivery => { delivery.evidence = 'Hidden evidence' },
+      delivery => { delivery.state = 'done' },
+      delivery => { delivery.targetSessionId = '' },
+      delivery => { delivery.targetSessionId = 'unrecorded' },
+      delivery => { delete delivery.targetSessionId },
+      delivery => { delivery.targets = {} },
+      delivery => { delivery.targets.shift() },
+      delivery => { delivery.targets.reverse() },
+      delivery => { delivery.targets[0].sessionId = 'rewritten' },
+      delivery => { delivery.targets[0].state = 'pending' },
+      delivery => { delivery.targets[1].state = 'failed' },
+      delivery => { delivery.targets[1].text = 'Hidden conclusion' },
+      delivery => { delivery.targets.push({ sessionId: 'a-part-2', state: 'pending' }) },
+      delivery => { delivery.enqueuedAt = 'later' },
+      delivery => { delete delivery.enqueuedAt },
+      delivery => { delivery.deliveredAt = null },
+    ]
+    for (const change of changes) {
+      await assert.rejects(rt.commitTask('t1', current => { change(current.delivery); return current }), /terminal task/)
+      assert.deepEqual(rt.taskOf('t1'), value)
+      assert.equal(readFileSync(statePath, 'utf8'), original)
+    }
+    await assert.rejects(rt.commitTask('t1', current => { delete current.delivery; return current }), /terminal task/)
+    await assert.rejects(rt.commitTask('t1', current => ({ ...current, delivery: null })), /terminal task/)
   })
 
   test(`terminal ${state} only appends complete late records without rewriting history`, async t => {
@@ -443,6 +542,19 @@ for (const state of ['done', 'blocked', 'cancelled', 'failed']) {
     }
   })
 }
+
+test('terminal delivery may be initialized once without changing the saved conclusion', async t => {
+  const value = { ...task(), state: 'done', closedAt: 2000, conclusion: { status: 'done', text: 'Recorded outcome' } }
+  const { rt, statePath } = await setup(t, { seed: { ...legacy(), tasks: { t1: value } } })
+  await rt.commitTask('t1', current => ({
+    ...current, delivery: { summaryId: 't1:closed', state: 'pending', targets: [] },
+  }))
+  assert.deepEqual(rt.taskOf('t1').conclusion, value.conclusion)
+  assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).tasks.t1.delivery.summaryId, 't1:closed')
+  await assert.rejects(rt.commitTask('t1', current => ({
+    ...current, delivery: { ...current.delivery, summaryId: 'replacement' },
+  })), /terminal task/)
+})
 
 test('invalid records are preserved for diagnosis and excluded from indexes', async t => {
   const bad = { ...task('bad'), state: 'waiting' }
