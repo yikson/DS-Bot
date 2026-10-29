@@ -163,7 +163,11 @@ export function install(rt) {
       && ((rt.config.taskSessionsEnabled === true && rt.taskCapabilities().has(self))
         || [...rt.taskById.values()].some(task => Object.hasOwn(task.participants, self)))
     const dispose = taskToolAgents.get(agent)
-    if (eligible && !dispose) taskToolAgents.set(agent, agent.ctx.tools.register(listTasks))
+    if (eligible && !dispose) {
+      const list = agent.ctx.tools.register(listTasks)
+      const message = agent.ctx.tools.register(taskMessageBot)
+      taskToolAgents.set(agent, () => { message(); list() })
+    }
     else if (!eligible && dispose) {
       dispose()
       taskToolAgents.set(agent, undefined)
@@ -239,7 +243,7 @@ export function install(rt) {
   const calledInPosts = new Map()
   const turnOf = exec => rt.live.get(exec.agent?.id)?.turn
 
-  ctx.tools.register(defineTool({
+  const messageBot = {
     name: 'message_bot',
     description: 'Send a message to another Bot on the team. It reads a private message at its next step only while working privately on the same task and work; otherwise the message queues for its next turn. If it is idle, it starts on it right away. Its reply arrives later as a new message to you; with reply_to "user" it answers the user in its own chat instead. In a group chat it reaches only members of that group, as writing "@Name" there does. With request_id you name the request yourself: a repeat of that name with the same message is not sent again, but gives the receipt of the first call back.',
     parameters: {
@@ -261,11 +265,7 @@ export function install(rt) {
       },
       work: {
         type: 'string',
-        description: 'Explicit legacy work-branch id, or "new" for a configured legacy pair. Root calls never implicitly reuse a legacy branch. Ignored when task is supplied.',
-      },
-      task: {
-        type: 'string',
-        description: 'An open task id from list_tasks, or "new" from an eligible root trunk. Inside a task, omit this or use its current id; new or different tasks are refused. Takes precedence over work.',
+        description: 'For a configured work-branch pair, use an open branch id from list_bots or the work-branch prompt, or "new" for a separate task. Outside that branch\'s turn, one open branch is reused by default; multiple open branches require a choice. Ignored for unconfigured pairs.',
       },
     },
     output,
@@ -397,7 +397,22 @@ export function install(rt) {
       }
       return request === undefined ? await send() : answer(await rt.admitRequest(request, send))
     },
-  }))
+  }
+  ctx.tools.register(defineTool(messageBot))
+  const taskMessageBot = defineTool({
+    ...messageBot,
+    parameters: {
+      ...messageBot.parameters,
+      work: {
+        type: 'string',
+        description: 'Explicit legacy work-branch id, or "new" for a configured legacy pair. Root calls never implicitly reuse a legacy branch. Ignored when task is supplied.',
+      },
+      task: {
+        type: 'string',
+        description: 'An open task id from list_tasks, or "new" from an eligible root trunk. Inside a task, omit this or use its current id; new or different tasks are refused. Takes precedence over work.',
+      },
+    },
+  })
 
   ctx.tools.register(defineTool({
     name: 'stop_bot',
