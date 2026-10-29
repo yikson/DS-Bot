@@ -248,6 +248,27 @@ export function install(rt) {
 
   // The messages around an anchor, in its part.
   async function aroundOwnChat(botId, anchor) {
+    const taskAnchor = /^task (\S+) session (\S+) #(\d+)$/.exec(anchor)
+    if (taskAnchor !== null) {
+      const [, taskId, sessionId, at] = taskAnchor
+      const task = rt.taskForSession?.(sessionId)
+      if (task?.id !== taskId || task.sessions[botId] !== sessionId) return { error: 'That task Session does not belong to this Bot.' }
+      const seq = Number(at)
+      const before = []
+      const after = []
+      for await (const line of rt.partLines(sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS), { pages: Infinity })) {
+        if (line.seq >= seq) {
+          after.push(line)
+          if (after.length > AROUND_LINES + 1) after.shift()
+        } else {
+          before.push(line)
+          if (before.length >= AROUND_LINES) break
+        }
+      }
+      const rows = [...after, ...before].reverse()
+      return { taskId, exact: rows.some(row => row.seq === seq), lines: rows.map(row =>
+        `[task ${taskId} session ${sessionId} #${row.seq}] ${excerpt(row.text, '', row.seq === seq ? ANCHOR_LINE_MAX : OWN_CHAT_LINE_MAX)}`) }
+    }
     const { index, parts } = await indexedParts(botId)
     if (index === null) return { error: 'Anchors need the chat index, which is unavailable here. Search with words instead.' }
     const found = /(?:part\s*)?(\d+)?\s*#\s*(\d+)/i.exec(anchor)

@@ -703,7 +703,8 @@ export function install(rt) {
       const member = rt.botOf(botId)
       const room = rt.roomOf(owner?.roomId)
       const query = String(args.query ?? '').trim().slice(0, 80)
-      const around = String(args.around ?? '').trim().slice(0, 40)
+      const rawAround = String(args.around ?? '').trim()
+      const around = rawAround.startsWith('task ') ? rawAround.slice(0, 500) : rawAround.slice(0, 40)
       const parts = rt.partsOf(botId)
       const number = Number.isInteger(args.part) ? args.part : undefined
       if (room !== undefined && member !== undefined) {
@@ -721,6 +722,7 @@ export function install(rt) {
         if (found.error) return `${found.error}${partsNote}`
         if (found.lines.length === 0) return `Nothing was said around ${around}.${partsNote}`
         const heading = found.exact ? `around ${around}` : `with no message at ${around}; the nearest ones`
+        if (found.taskId !== undefined) return `Task ${found.taskId}, ${heading} (oldest first):\n${found.lines.join('\n')}`
         return `Your own chat ${heading} (oldest first):\n${found.lines.join('\n')}${partsNote}`
       }
       if (query === '' && number !== undefined) {
