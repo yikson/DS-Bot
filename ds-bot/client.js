@@ -42,6 +42,12 @@ module.exports = __toCommonJS(index_exports);
 // src/client/i18n.js
 var NAMESPACE = "ds-bot";
 var ZH = {
+  "Work branches": "任务分支",
+  "Work branch closed": "任务已闭合",
+  "Open branch": "打开分支",
+  "Needs close": "待闭合",
+  Waiting: "等待中",
+  Creating: "创建中",
   // Shared
   "Main Bot": "主 Bot",
   Working: "工作中",
@@ -1440,8 +1446,8 @@ function bodyOf(def, paint, flat = false) {
     return "";
   }
 }
-var eyeMarkup = ([cx, cy, w, h45, tilt]) => `<g transform="translate(${cx} ${cy}) rotate(${tilt})"><rect class="bt-eye" x="${-w / 2}" y="${-h45 / 2}" width="${w}" height="${h45}" rx="${w / 2}"/></g>`;
-var happyEyeMarkup = ([cx, cy, w, h45, tilt]) => `<g transform="translate(${cx} ${cy}) rotate(${tilt})"><path class="bt-eye-happy" opacity="0" d="M${-w * 0.62} ${h45 * 0.14}Q0 ${-h45 * 0.42} ${w * 0.62} ${h45 * 0.14}" fill="none" stroke="#000" stroke-width="${w * 0.5}" stroke-linecap="round"/></g>`;
+var eyeMarkup = ([cx, cy, w, h46, tilt]) => `<g transform="translate(${cx} ${cy}) rotate(${tilt})"><rect class="bt-eye" x="${-w / 2}" y="${-h46 / 2}" width="${w}" height="${h46}" rx="${w / 2}"/></g>`;
+var happyEyeMarkup = ([cx, cy, w, h46, tilt]) => `<g transform="translate(${cx} ${cy}) rotate(${tilt})"><path class="bt-eye-happy" opacity="0" d="M${-w * 0.62} ${h46 * 0.14}Q0 ${-h46 * 0.42} ${w * 0.62} ${h46 * 0.14}" fill="none" stroke="#000" stroke-width="${w * 0.5}" stroke-linecap="round"/></g>`;
 var maskBox = (size) => `maskUnits="userSpaceOnUse" x="${-size}" y="${-size}" width="${size * 3}" height="${size * 3}"`;
 var holes = (def, eyes) => `<rect x="${-def.size}" y="${-def.size}" width="${def.size * 3}" height="${def.size * 3}" fill="#fff"/>${eyes}`;
 var MASK_ID = "%MASK%";
@@ -1502,6 +1508,7 @@ function indexRoster(value) {
   const byId = {};
   for (const bot of value.bots) {
     for (const id of [...bot.parts ?? [], bot.sessionId ?? bot.id, bot.id]) byId[id] = bot;
+    for (const branch of Object.values(bot.workBranches ?? {})) if (branch.sessionId) byId[branch.sessionId] = bot;
   }
   const roomsById = {};
   for (const room2 of value.rooms) roomsById[room2.id] = room2;
@@ -2188,12 +2195,12 @@ function liveSprings(apply2) {
     const dt = Math.min(0.5, Math.max(1e-3, (now - last) / 1e3));
     last = now;
     const steps = Math.ceil(dt * 240);
-    const h45 = dt / steps;
+    const h46 = dt / steps;
     let moving = false;
     for (const value of values.values()) {
       for (let index = 0; index < steps; index += 1) {
-        value.v += (-value.k * (value.x - value.to) - value.c * value.v) * h45;
-        value.x += value.v * h45;
+        value.v += (-value.k * (value.x - value.to) - value.c * value.v) * h46;
+        value.x += value.v * h46;
       }
       if (Math.abs(value.x - value.to) < 0.05 && Math.abs(value.v) < 1) {
         value.x = value.to;
@@ -7835,6 +7842,20 @@ function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnClock, us
   return unreadOpening ? (0, import_react13.createElement)(import_react13.Fragment, null, (0, import_react13.createElement)("div", { className: "bt-open-new" }, (0, import_react13.createElement)(NewDivider), (0, import_react13.createElement)("div", { className: "bt-time-sep", role: "separator" }, unreadOpening)), body) : body;
   function triggerBody() {
     if (source.kind === "bot") {
+      if (source.role === "branch-summary") {
+        const branch = Object.values(roster.byId[selfId]?.workBranches ?? {}).find((item) => item.summaryId === source.exchangeId);
+        return (0, import_react13.createElement)(
+          "div",
+          { className: "bt-branch-summary" },
+          (0, import_react13.createElement)("strong", null, t("Work branch closed")),
+          (0, import_react13.createElement)("div", null, stripHeader(contentText(data.content))),
+          branch ? (0, import_react13.createElement)(
+            "button",
+            { type: "button", className: "bt-mini", onClick: () => actions.openBranch(branch.sessionId) },
+            `${t("Open branch")} · ${elapsedLabel(branch.closedAt - branch.openedAt)}`
+          ) : null
+        );
+      }
       if (source.handoff === true) return roster.roomsById[sessionId] ? null : (0, import_react13.createElement)(EarlierParts, { sessionId, roster, actions });
       if (source.role === "kickoff" || source.role === "room") return null;
       if (source.role === "secret" || deferred) return null;
@@ -9227,6 +9248,7 @@ function AccountLauncher({ seat = true, settingsOpen, openSettings, openOnboardi
     ), document.body) : null
   );
 }
+var isWorkBranch = (bot, id) => Object.values(bot.workBranches ?? {}).some((branch) => branch.sessionId === id);
 function useLandOnMainBot(roster, useSessions, actions) {
   const mainView = useSessions((list) => {
     const row = Object.values(list.byId).find((session) => (session?.retainedBy?.mainView ?? 0) > 0);
@@ -9239,7 +9261,7 @@ function useLandOnMainBot(roster, useSessions, actions) {
     const bot = id === "" ? void 0 : roster.byId[id];
     if (bot !== void 0) {
       lastBot.current = { botId: bot.id, sessionId: id };
-      if (currentPart(bot) !== id) actions.landOn(bot.id);
+      if (currentPart(bot) !== id && !isWorkBranch(bot, id)) actions.landOn(bot.id);
       return void 0;
     }
     if (id !== "" && (roster.roomsById[id] || (actions.isAgentSession?.(id) ?? roster.agentOf[id] !== void 0) || blank3 !== "1")) {
@@ -19180,6 +19202,48 @@ function listedOpener({ list, open, refresh, current }) {
   };
 }
 
+// src/client/branch-dock.js
+var import_react47 = require("react");
+function BranchDock({ sessionId, useRoster, useWork, actions }) {
+  const roster = useRoster((value) => value);
+  const work = useWork((value) => value);
+  const bot = roster.byId[sessionId];
+  if (!bot || sessionId !== (bot.sessionId ?? bot.id)) return null;
+  const branches = Object.values(bot.workBranches ?? {}).filter((branch) => branch.state !== "closed");
+  if (!branches.length) return null;
+  return (0, import_react47.createElement)("div", { className: "bt-branch-dock", "aria-label": t("Work branches") }, branches.map((branch) => {
+    const target = roster.byId[branch.targetBotId];
+    const status = branch.state === "open" ? work.branches?.[branch.sessionId] ?? "Needs close" : branch.state === "failed" ? "Failed" : "Creating";
+    return (0, import_react47.createElement)(
+      "button",
+      {
+        key: branch.id,
+        type: "button",
+        className: "bt-mw-pill",
+        disabled: !branch.sessionId,
+        onClick: () => actions.openBranch(branch.sessionId),
+        title: branch.title
+      },
+      (0, import_react47.createElement)(
+        "span",
+        { className: "bt-mw-pill-in" },
+        target ? (0, import_react47.createElement)(BotMark, { bot: target, size: 24 }) : null,
+        (0, import_react47.createElement)("span", { className: "bt-branch-label" }, `${target?.name ?? ""} · ${branch.title} · ${t(status)}`),
+        (0, import_react47.createElement)(Elapsed, { at: branch.openedAt })
+      )
+    );
+  }));
+}
+var BRANCH_CSS = `
+.bt-branch-dock{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0;max-width:100%}
+.bt-branch-dock .bt-mw-pill{max-width:100%}
+.bt-branch-dock .bt-mw-pill-in{flex:1;min-width:0}
+.bt-branch-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.bt-branch-dock button:focus-visible,.bt-branch-summary button:focus-visible{outline:2px solid var(--bt-accent);outline-offset:2px}
+.bt-branch-summary{border:1px solid var(--bt-line);background:var(--bt-card);border-radius:12px;padding:12px 16px;white-space:pre-wrap;overflow-wrap:anywhere}
+@media(prefers-reduced-motion:reduce){.bt-branch-dock .bt-mw-pill{animation:none;transition:none}}
+`;
+
 // src/client/index.js
 var inject = ["sessions", "uiWorkspace", "uiConversation", "slots", "theme", "layout"];
 function apply(ctx) {
@@ -19553,6 +19617,11 @@ function apply(ctx) {
     // The full-pane overlays sit above the conversation, so opening one must dismiss them
     // or the click appears to do nothing.
     isAgentSession: (id) => isAgentSessionId(id),
+    openBranch: (sessionId) => {
+      ui2.set((state) => ({ ...state, newChat: null, exchange: null, menu: null, palette: null }));
+      setPlain(false);
+      show2(sessionId);
+    },
     openSession: (id) => {
       if (isAgentSessionId(id)) return actions.openAgentSession(id);
       ui2.set((state) => state.newChat || state.exchange || state.menu || state.palette ? { ...state, newChat: null, exchange: null, menu: null, palette: null } : state);
@@ -19983,6 +20052,7 @@ function apply(ctx) {
       priority: BOT_PRIORITY,
       select: (owner) => owner.pendingInteraction?.kind === "question" ? owner.pendingInteraction : null
     }, QuestionCard),
+    () => shadow("conversation.input.dock", { id: "bot-branches", order: -130, inject: face }, BranchDock),
     () => shadow("conversation.input.dock", { id: "bot-members", order: -120, inject: face }, MemberDock),
     () => shadow("conversation.input.dock", { id: "bot-model", order: -110, inject: face }, ModelChoiceDock),
     () => shadow("conversation.input.dock", { id: "bot-question", order: -100, inject: face }, QuestionDock),
@@ -19991,6 +20061,7 @@ function apply(ctx) {
     () => shadow("conversation.input.dock", { id: "bot-handoff", order: -85, inject: face }, HandoffDock)
   ];
   ctx.effect(() => installCompiledStyles(RETURN_CSS, "return"), "ds-bot: return styles");
+  ctx.effect(() => installCompiledStyles(BRANCH_CSS, "branches"), "ds-bot: branch styles");
   shadow("sidebar.footer.action", { id: "bot-return", order: -300, inject: face }, BotReturn);
   ctx.effect(() => {
     let previous;
