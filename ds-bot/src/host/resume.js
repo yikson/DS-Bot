@@ -21,6 +21,8 @@ import { textOf } from './text.js'
 export const RESUME_DELAY_MS = 3000
 // A delivery waiting longer than this was not lost to a restart.
 const QUEUED_KEPT_MS = 24 * 60 * 60 * 1000
+// DSH may still be opening the Session when its log is first read.
+export const LOG_RETRY_MS = 1000
 const QUEUED_MAX = 50
 
 export const resumeText = record => [
@@ -264,10 +266,15 @@ export function install(rt) {
   // A Session's durable log, as DSH keeps it: what happened there, and what it said.
   // Undefined when this DSH cannot read it, or when the Session is gone.
   async function logOf(sessionId) {
-    const inspect = ctx.sessionController?.inspect
-    if (typeof inspect !== 'function') return undefined
-    const seen = await inspect(sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS)).catch(() => undefined)
-    return Array.isArray(seen?.events) ? seen.events : undefined
+    const controller = ctx.sessionController
+    if (typeof controller?.inspect !== 'function') return undefined
+    // DSH's controller is a service: inspect reads its own ctx.
+    for (let attempt = 0; ; attempt += 1) {
+      const seen = await controller.inspect(sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS)).catch(() => undefined)
+      if (Array.isArray(seen?.events)) return seen.events
+      if (attempt > 0) return undefined
+      await new Promise(resolve => setTimeout(resolve, LOG_RETRY_MS))
+    }
   }
 
   // A turn that ended while DS Bot was not watching it: its answer may exist and never
