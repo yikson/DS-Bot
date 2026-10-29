@@ -7,6 +7,7 @@ import { setTimeout as realDelay } from 'node:timers/promises'
 import { apply } from '../index.js'
 import { fakeContext } from './fake-ctx.js'
 import { stripWrittenCalls, writesToolCall } from '../src/host/turns.js'
+import { FAILURE_RESUME_DELAY_MS } from '../src/host/constants.js'
 
 // Chief in its own chat 'a'; Writer, the admin of group 'r1', speaks there from 'gb'.
 const seed = () => ({
@@ -524,6 +525,127 @@ test('in its own chat, a Bot that wrote a tool call as text is asked to make it'
   const retry = host.agentOf('b').calls[0]
   assert.deepEqual([retry.source.role, retry.source.retried], ['retry', true])
   assert.match(text(retry), /^\[Your last reply wrote a tool call as text, so nothing ran\]/)
+})
+
+// A failed model call, as DSH reports it to a turn's end.
+const failureOf = (code, message = 'the call failed') => ({ kind: 'error', error: { code, message } })
+
+test('a turn that failed on a transient fault runs again before the sender hears of it', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const home = freshHome(t)
+  const host = await start(home)
+  const request = await askWriter(host, home)
+  host.emit('b', 'turn/end', { turn: 1, reason: failureOf('TIMEOUT', 'request timed out') })
+  await new Promise(resolve => setImmediate(resolve))
+  // The sender was told a reply comes later, so it waits: nothing says it failed.
+  assert.equal(host.agentOf('a').calls.length, 0)
+  assert.equal(host.agentOf('b').calls.length, 1)
+
+  // The wait is a minute, and the resume keeps the trigger's exchange.
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS - 1)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(host.agentOf('b').calls.length, 1)
+  t.mock.timers.tick(1)
+  await settle(() => host.agentOf('b').calls.length === 2)
+  const resume = host.agentOf('b').calls[1]
+  assert.deepEqual([resume.source.role, resume.source.exchangeId, resume.source.failureResumes], ['request', request.source.exchangeId, 1])
+  assert.match(text(resume), /^\[Message from Chief · your last turn stopped before it finished\]/)
+  assert.match(text(resume), /the model connection failed \(TIMEOUT\)/)
+  assert.match(text(resume), /Check what is already done \(files, commands, messages\) before you repeat anything, then finish the task and give your reply\./)
+  assert.equal(host.agentOf('a').calls.length, 0)
+})
+
+test('a third transient failure tells the sender, and says how often the turn ran again', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const home = freshHome(t)
+  const host = await start(home)
+  await askWriter(host, home)
+  for (const turn of [1, 2]) {
+    host.emit('b', 'turn/end', { turn, reason: failureOf('RATE_LIMIT', 'busy') })
+    t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+    await settle(() => host.agentOf('b').calls.length === turn + 1)
+    run(host, 'b', turn + 1, host.agentOf('b').calls[turn])
+  }
+  host.emit('b', 'turn/end', { turn: 3, reason: failureOf('RATE_LIMIT', 'busy') })
+  await settle(() => host.agentOf('a').calls.length === 1)
+  const notice = text(host.agentOf('a').calls[0])
+  assert.match(notice, /Writer could not answer your message/)
+  assert.match(notice, /its model call failed \(RATE_LIMIT: busy\) after 2 automatic resumes/)
+  // Two resumes were all it got: the sender is not left waiting for another.
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(host.agentOf('b').calls.length, 3)
+})
+
+test('a failure that will not pass on its own is told at once, and the turn does not run again', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const home = freshHome(t)
+  const host = await start(home)
+  await askWriter(host, home)
+  host.emit('b', 'turn/end', { turn: 1, reason: failureOf('AUTH', 'the key was rejected') })
+  await settle(() => host.agentOf('a').calls.length === 1)
+  assert.match(text(host.agentOf('a').calls[0]), /its model call failed \(AUTH\)\. Tell the user if it matters/)
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(host.agentOf('b').calls.length, 1)
+})
+
+test('a turn the user started in a Bot chat runs again after a transient failure', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const home = freshHome(t)
+  const host = await start(home)
+  run(host, 'b', 1, { content: [{ type: 'text', text: 'move the docs' }], source: { kind: 'user' } })
+  host.emit('b', 'turn/end', { turn: 1, reason: failureOf('TRANSPORT', 'the socket closed') })
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await settle(() => host.agentOf('b').calls.length === 1)
+  const resume = host.agentOf('b').calls[0]
+  assert.deepEqual([resume.source.role, resume.source.failureResumes], ['retry', 1])
+  assert.match(text(resume), /^\[Your last turn stopped before it finished; carry on with it\]/)
+  assert.match(text(resume), /the model connection failed \(TRANSPORT\)/)
+})
+
+test('disposing the plugin clears every pending transient failure resume', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const host = await start(freshHome(t))
+  for (const id of ['a', 'b']) {
+    run(host, id, 1, { content: [{ type: 'text', text: 'finish the docs' }], source: { kind: 'user' } })
+    host.emit(id, 'turn/end', { turn: 1, reason: failureOf('EMPTY_RESPONSE') })
+  }
+  await host.stop()
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(host.agentOf('a').calls.length, 0)
+  assert.equal(host.agentOf('b').calls.length, 0)
+})
+
+test('input during the wait keeps its turn and the failed request resumes as a followup', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const home = freshHome(t)
+  const host = await start(home)
+  const request = await askWriter(host, home)
+  host.emit('b', 'turn/end', { turn: 1, reason: failureOf('SERVER') })
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS / 2)
+  run(host, 'b', 2, { content: [{ type: 'text', text: 'handle this new input' }], source: { kind: 'user' } })
+  host.agentOf('b').steer = () => assert.fail('the resume must queue instead of steering the user turn')
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS / 2)
+  await settle(() => host.agentOf('b').calls.length === 2)
+  const resume = host.agentOf('b').calls[1]
+  assert.deepEqual([resume.source.exchangeId, resume.source.failureResumes], [request.source.exchangeId, 1])
+  // followup() queues for the next turn; it does not replace the user's trigger.
+  host.emit('b', 'assistant/message', { message: { content: [{ type: 'text', text: 'new input answered' }] } })
+  host.emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  assert.equal(host.agentOf('a').calls.length, 0)
+  run(host, 'b', 3, resume)
+  host.emit('b', 'assistant/message', { message: { content: [{ type: 'text', text: 'original plan finished' }] } })
+  host.emit('b', 'turn/end', { turn: 3, reason: { kind: 'completed' } })
+  await settle(() => host.agentOf('a').calls.length === 1)
+  assert.match(text(host.agentOf('a').calls[0]), /original plan finished/)
+  assert.doesNotMatch(text(host.agentOf('a').calls[0]), /new input answered/)
+  await settleState(t, home, () => {
+    const exchanges = stateOf(home).exchanges
+    return exchanges.filter(entry => entry.id === request.source.exchangeId).length === 1
+      && exchanges.filter(entry => entry.replyTo === request.source.exchangeId).length === 1
+  })
 })
 
 test('a written tool call is told apart from text about one', () => {

@@ -39,6 +39,7 @@ test('apply registers listeners, tools, and effects in a fixed order', (t) => {
     'on llm/adapters-updated',
     'on credentials/reference-updated',
     'on settings/document-updated',
+    'effect ds-bot: transient failure resumes',
     'on session/event',
     'effect ds-bot: agent tool restrict retry',
     'on agent/created',
