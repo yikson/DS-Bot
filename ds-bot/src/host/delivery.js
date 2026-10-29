@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { BRANCH_SUMMARY_HEADER, HISTORY_TIMEOUT_MS, LONG_HEAD, MESSAGE_INLINE_MAX, READ_LINE_MAX, SOURCE_KIND, TEXT_KEPT, TEXT_SHOW_MAX } from './constants.js'
 import { headOf, textOf } from './text.js'
+import { taskBrief } from './task-routing.js'
 
 export function install(rt) {
   const safe = asyncScope(rt)
@@ -105,13 +106,23 @@ export function install(rt) {
       ...(askedBy ? { askedBy } : {}),
       ...(fromRoomId ? { senderRoomId: fromRoomId } : {}),
     }
-    const targetSessionId = rt.deliverySession?.({ sessionId, toId, replyTo }) ?? sessionId ?? rt.chatOf(toId)
+    let targetSessionId = rt.deliverySession?.({ sessionId, toId, replyTo }) ?? sessionId ?? rt.chatOf(toId)
+    let agent
+    for (;;) {
+      if (taskId) {
+        await rt.prepareTaskDelivery(args)
+        targetSessionId = args.sessionId
+      }
+      await rt.ensureCapabilities(targetSessionId)
+      if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
+      agent = await resolveAgent(targetSessionId)
+      if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
+      const task = taskId && rt.taskOf(taskId)
+      if (task?.participants[toId]?.kind === 'trunk' && rt.chatOf(toId) !== targetSessionId) continue
+      break
+    }
     const branch = rt.branchOf?.(targetSessionId)
-    await rt.ensureCapabilities(targetSessionId)
-    if (rt.isStopped?.()) return exchangeId
-    const agent = await resolveAgent(targetSessionId)
-    // Keep the recovery queue intact when disposal overtakes an async delivery.
-    if (rt.isStopped?.()) return exchangeId
+    if (taskId) rt.checkTaskDelivery({ ...args, sessionId: targetSessionId })
     // Work can finish while capabilities or the Session are being resolved.
     const failureWork = work ?? (role === 'request' && audience !== 'user' ? exchangeId : undefined)
     if (failureResumes !== undefined && (rt.failureResumePending?.(exchangeId, failureResumes) === false
@@ -145,7 +156,7 @@ export function install(rt) {
     if (EXCHANGE_ROLES.has(role) && !deferred && !resumed && !retried && !resent && failureResumes === undefined) {
       const kept = headOf(text, TEXT_KEPT)
       const whole = length !== undefined ? { length, files } : kept.length < text.length ? { length: text.length, sessionId: targetSessionId } : {}
-      const entry = { id: exchangeId, from: fromId, to: toId, text: kept, ...whole, role, time: Date.now(), ...(replyTo ? { replyTo } : {}), ...(audience === 'user' ? { audience } : {}) }
+      const entry = { id: exchangeId, from: fromId, to: toId, text: kept, ...whole, role, time: Date.now(), ...(taskId ? { taskId } : {}), ...(replyTo ? { replyTo } : {}), ...(audience === 'user' ? { audience } : {}) }
       const earlier = merged ? state.exchanges.findIndex(other => other.id === exchangeId) : -1
       if (earlier === -1) state.exchanges.push(entry)
       else state.exchanges[earlier] = entry
@@ -153,9 +164,10 @@ export function install(rt) {
     }
     // A steered message cuts into a running turn at its next step; a follow-up
     // queues for the next turn (see turns.js for how each is routed).
+    const task = taskId && rt.taskOf(taskId)
     const message = createUserMessage({
       content: [
-        { type: 'text', text: `${headerFor(role, fromName, room?.name, audience, note, deferred, { resumed, retried, asker, failureResumes })}\n${branch ? `[Work branch: ${branch.title}]\nBranch: ${branch.id}\n` : ''}${text}` },
+        { type: 'text', text: `${headerFor(role, fromName, room?.name, audience, note, deferred, { resumed, retried, asker, failureResumes })}\n${task ? `${taskBrief(task)}\n` : ''}${branch ? `[Work branch: ${branch.title}]\nBranch: ${branch.id}\n` : ''}${text}` },
         ...files.map(attachment => ({ type: 'file', attachment })),
       ],
       source,
@@ -163,7 +175,8 @@ export function install(rt) {
     receipt.working = rt.live.get(targetSessionId)?.turn !== undefined
     receipt.merged = merged
     // This is the enqueue boundary: no await may follow the final turn/scope check.
-    if (rt.isStopped?.()) return exchangeId
+    if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
+    if (taskId) rt.checkTaskDelivery({ ...args, sessionId: targetSessionId })
     receipt.steer = steer && (role !== 'request' || (audience !== 'user' && samePrivateWork(source, rt.privateTurn(targetSessionId))))
     if (receipt.steer) agent.steer(message)
     else agent.followup(message)

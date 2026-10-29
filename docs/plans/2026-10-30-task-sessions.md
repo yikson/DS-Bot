@@ -284,13 +284,25 @@ The root requester's task Session is created as follows:
    ```js
    sessionController.fork({
      sessionId: rt.chatOf(requesterId),
+     atSeq: admittedTurnEndSeq,
      allowMigration: false
    })
    ```
 
-   DSH chooses its default boundary, the last completed turn.
+   At admission, inspect the requester trunk and capture the inclusive seq
+   of its last `turn/end`. Persist that source Session and boundary before
+   forking; concurrent trunk writes must not change the admitted prefix.
+   Do not use DSH's omitted-boundary default, which can include standalone
+   events after that ending.
 
-2. Only a confirmed DSH "no completed turn" fork error permits a fresh
+   A pending inbox enqueue can also precede `turn/end` while its consumption
+   follows it. Clear the fork's inherited inbox through the public Agent API,
+   flush, and verify it is empty before setup can become ready or task input
+   is delivered. The explicit brief is the only new task input. Never clear
+   or consume the original trunk's queue.
+
+2. A readable admission snapshot with no `turn/end`, or a confirmed DSH
+   "no completed turn" fork error, permits a fresh
    requester Session instead. A transport error, timeout, HMR stop or unknown
    fork result is not this condition and never permits a blind fresh fallback.
 3. Record the actual `inheritedThrough` boundary when a fork succeeds. Record
@@ -820,8 +832,9 @@ Session-owner lookup.
 4. A task has at most one endpoint per Bot.
 5. Only fork/fresh task-owned Sessions enter exclusive task indexes.
 6. A trunk endpoint never becomes a task-owned Session.
-7. A requester fork uses DSH's default boundary with
-   `allowMigration: false`; first-turn/no-completed-turn falls back to fresh.
+7. A requester fork uses its admitted inclusive `turn/end` boundary with
+   `allowMigration: false`, and clears and flushes inherited pending input before
+   ready; first-turn/no-completed-turn falls back to fresh.
 8. The current delegation is carried explicitly in the brief; inherited
    prefix content is never assumed to contain it.
 9. A recipient participant starts in a fresh Session.

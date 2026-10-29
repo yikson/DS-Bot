@@ -100,8 +100,7 @@ test('task records and indexes round-trip, including shared trunks across two ta
   assert.equal(rt.taskBySession.has('c'), false)
   assert.equal(rt.taskOwners.has('b'), false)
   assert.equal(rt.chatOwners.get('c'), 'c')
-  // S2a does not bind task Sessions into live identity/compaction/memory hooks yet.
-  assert.equal(rt.selfOf('t1-a'), undefined)
+  assert.equal(rt.selfOf('t1-a'), 'a')
   assert.match(await tool('t1-a'), /t1.*Check the pack/)
   assert.equal(rt.openTasksOf('c').length, 2)
   await rt.save({ required: true })
@@ -170,6 +169,28 @@ test('gate-off capabilities alone never register list_tasks', async t => {
   for (const id of ['a', 'b', 'c']) assert.equal((await schemas(id)).some(tool => tool.name === 'list_tasks'), false)
 })
 
+test('default Bot scopes expose the complete base message_bot schema', async t => {
+  const { ctx: recorded } = await setup(t)
+  const base = JSON.parse(readFileSync(new URL('./fixtures/message-bot-base-schema.json', import.meta.url), 'utf8'))
+  const ctx = new Context()
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  t.after(() => ctx.fiber.dispose())
+  for (const tool of recorded.registeredTools.values()) ctx.tools.register(tool)
+  const agents = ['a', 'b', 'c'].map(id => ({ id, session: { id } }))
+  const mountScopes = inner => {
+    for (const agent of agents) agent.ctx = createScope(inner, agent).ctx
+  }
+  mountScopes.inject = ['tools']
+  await ctx.plugin(mountScopes)
+  for (const agent of agents) {
+    for (const listener of recorded.listeners.get('agent/created') ?? []) await listener({ agent })
+    const schemas = ctx.tools.schemas(agent)
+    assert.deepEqual(schemas.find(tool => tool.name === 'message_bot'), base)
+    assert.equal(schemas.some(tool => tool.name === 'list_tasks'), false)
+  }
+})
+
 test('revoking capability removes a scoped tool unless the Bot has a persisted task', async t => {
   const { rt, schemas } = await setup(t, { config: { taskSessionsEnabled: true, taskSessions: ['ADA', 'Other'] } })
   const offered = async id => (await schemas(id)).some(tool => tool.name === 'list_tasks')
@@ -196,6 +217,10 @@ test('DSH tool schemas isolate task registration and restore the base list on re
   t.after(() => ctx.fiber.dispose())
   for (const tool of recorded.registeredTools.values()) ctx.tools.register(tool)
   const baseline = ctx.tools.schemas()
+  // Snapshot captured from the actual integration base at 3de2779.
+  const messageBase = JSON.parse(readFileSync(new URL('./fixtures/message-bot-base-schema.json', import.meta.url), 'utf8'))
+  const messageSchema = agent => ctx.tools.schemas(agent).find(tool => tool.name === 'message_bot')
+  assert.deepEqual(messageSchema(), messageBase)
   const agents = ['a', 'b', 'c', 'unmanaged', 't1-a'].map(id => ({ id, session: { id } }))
   const mountScopes = inner => {
     for (const agent of agents) agent.ctx = createScope(inner, agent).ctx
@@ -208,6 +233,9 @@ test('DSH tool schemas isolate task registration and restore the base list on re
   const [a, b, c, unmanaged, requester] = agents
   assert.equal(ctx.tools.get('list_tasks'), undefined)
   assert.ok(ctx.tools.get('list_tasks', a), warnings.map(args => args.map(value => String(value)).join(' ')).join('\n'))
+  assert.ok(messageSchema(a).parameters.properties.task)
+  assert.equal(ctx.tools.schemas(a).filter(tool => tool.name === 'message_bot').length, 1)
+  assert.deepEqual(messageSchema(c), messageBase)
   for (const agent of [b, c, unmanaged, requester]) assert.deepEqual(ctx.tools.schemas(agent), baseline)
   rt.config.taskSessionsEnabled = false
   await rt.save({ required: true })
@@ -217,6 +245,7 @@ test('DSH tool schemas isolate task registration and restore the base list on re
   delete value.sessions.c
   await rt.commitTask('t1', () => value)
   for (const agent of [a, b, requester]) assert.ok(ctx.tools.get('list_tasks', agent))
+  for (const agent of [a, b, requester]) assert.ok(messageSchema(agent).parameters.properties.task)
   for (const agent of [c, unmanaged]) assert.deepEqual(ctx.tools.schemas(agent), baseline)
   await recorded.dispose()
   for (const agent of agents) assert.equal(ctx.tools.get('list_tasks', agent), undefined)

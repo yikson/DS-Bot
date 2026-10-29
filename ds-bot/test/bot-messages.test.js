@@ -479,6 +479,10 @@ function deliveryHost() {
   rt.chatOf = id => id
   rt.hideBotUnusedTools = () => {}
   rt.ensureCapabilities = async () => {}
+  // This host isolates S1's final synchronous scope checks from task lifecycle.
+  rt.prepareTaskDelivery = async args => { args.sessionId ??= args.toId }
+  rt.checkTaskDelivery = () => {}
+  rt.taskOf = () => undefined
   rt.dropWork = id => { delete rt.state.works[id] }
   let stopped = false
   rt.isStopped = () => stopped
@@ -676,7 +680,7 @@ test('a candidate changed during attachment storage leaves the new request and f
   const writer = agentOf('b')
   writer.followup = message => { writer.calls.push(['followup', message]); writer.inbox.nextTurn.push(message) }
   emit('a', 'turn/start', { turn: 1 })
-  emit('a', 'user/message', { content: [], source: replySource('request', { exchangeId: 'root', senderSessionId: 'c', taskId: 'T1' }) })
+  emit('a', 'user/message', { content: [], source: replySource('request', { exchangeId: 'root', senderSessionId: 'c' }) })
   await tool('message_bot', { to: 'Writer', message: 'first request' }, 'a')
   const [earlier] = writer.inbox.nextTurn
   const entered = Promise.withResolvers()
@@ -694,7 +698,7 @@ test('a candidate changed during attachment storage leaves the new request and f
   assert.equal(writer.inbox.nextTurn.length, 2)
   assert.equal(writer.inbox.nextTurn[0], changed)
   const delivered = writer.inbox.nextTurn[1]
-  assert.equal(delivered.source.taskId, 'T1')
+  assert.equal(delivered.source.taskId, undefined)
   assert.doesNotMatch(textOf(delivered.content), /first request/)
   const file = delivered.content.find(block => block.type === 'file').attachment
   assert.equal(new TextDecoder().decode(store.files.get(file.attachmentId)), text)
