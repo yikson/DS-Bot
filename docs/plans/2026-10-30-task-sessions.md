@@ -2,7 +2,7 @@
 
 - Date: 2026-10-30
 - Related: Issue #11
-- Revised after the review on PR #12, comment 6500091279
+- Revised after the reviews on PR #12, comments 6500091279 and 6500519322
 - Supersedes, where they conflict: [Work-branch sessions](2026-10-29-work-branch-sessions.md)
 - Base examined: `origin/main` at `7fd222ad6dd09e6651e74c850dcda47215014c2e`
 
@@ -51,8 +51,9 @@ These are hard constraints:
 2. Omitting `atSeq` selects DSH's default boundary, the last completed turn.
    The current delegation and its tool call are not assumed to be inside that
    prefix.
-3. A fork of a trunk with no completed turn can fail. The requester then uses
-   a fresh Session instead.
+3. Only a confirmed "no completed turn" fork error permits a fresh requester
+   Session fallback. Unknown creation/fork results are reconciled or fail
+   closed.
 4. `ctx.workingDirectory.set(agent, path)` changes one Session only.
 5. `sessionController.create({ cwd | workspaceId })` creates a fresh root
    Session.
@@ -71,14 +72,16 @@ These are hard constraints:
 
 V1 is deliberately narrow:
 
-- Tasks are created only by a Bot-to-Bot `message_bot` call from a trunk.
+- Tasks are created only by a root Bot-to-Bot `message_bot` call from a trunk
+  with no inherited task or legacy work context.
 - A task is created only when both sides are task-enabled.
 - All other capability combinations keep the trunk path. The S1 no-steer rule
   still applies to all Bots.
 - Tasks are flat. There are no child tasks, parent pointers, depth counters,
   or task cycles.
-- From inside a task-owned Session, `message_bot` keeps the existing task id
-  for every target. `task: "new"` is refused there.
+- From a task-owned Session or a shared-trunk turn handling a task,
+  `message_bot` keeps the existing task id for every target. `task: "new"`
+  is refused in either context.
 - A task-enabled target gets or reuses its own fresh participant Session for
   that task. A non-enabled target uses its trunk as today.
 - Only the root requester's task-owned Session can close the task.
@@ -108,7 +111,8 @@ workBranches: [["ADA", "Cardpack"]]
 
 `workBranches` is config compatibility only. Each valid pair contributes both
 names to the effective capability set and logs one deprecation warning. It
-does not enable `taskSessionsEnabled` by itself.
+does not enable `taskSessionsEnabled` by itself or implicitly create a legacy
+branch. Explicit legacy selectors are handled separately below.
 
 To stop creating new v2 tasks, remove the names from both `taskSessions` and
 `workBranches`, or disable the rollout gate. Existing task records continue
@@ -120,7 +124,9 @@ gate are removed.
 ### Capability matrix and task creation
 
 Let `1` mean task-enabled and `0` mean not task-enabled. The root request is
-made from a trunk.
+made from a trunk with no inherited task/legacy context and no explicit
+selector. The matrix assumes the rollout gate is on; with it off all four
+combinations use the trunk path.
 
 | Requester | Target | Root routing |
 |---|---|---|
@@ -133,6 +139,69 @@ made from a trunk.
 The S1 no-steer hardening still applies: a private request never steers into
 a user-visible turn.
 
+### S1 no-steer at the enqueue boundary
+
+For every private Bot request, `delivery.js` decides steer versus followup
+after all capability, agent-resolution, path, save and other awaits. Immediately
+before the synchronous inbox enqueue it re-reads:
+
+- the target's actual running turn and its visibility/trigger;
+- the incoming and running task ids and work/exchange context;
+- the current generation/stopped flag.
+
+No await may separate that final check from `agent.steer()` or
+`agent.followup()`. An earlier busy/visibility snapshot in `tools.js` is not
+authority to steer. A visible user, scheduled or group turn, an unknown
+trigger, or unknown work identity means queue through `followup`.
+
+Steering is allowed only into an already-hidden turn of the same task and
+same work. Different tasks or works never steer into each other, even on a
+shared trunk. Non-task requests also require an established matching private
+work; two absent/unknown work ids are not a match.
+
+Unread merging uses the same task/work isolation. Re-check the actual unread
+candidate after awaits and before withdrawing/replacing it; if its identity,
+audience or task/work scope no longer matches, leave it in place and queue the
+new request independently. Never merge a private request into a user-visible
+message. This S1 rule applies before v2 is enabled and to legacy exchanges too.
+
+### Selection order and legacy precedence
+
+Route selection runs before capability-based creation:
+
+1. Explicit `task`.
+2. Explicit legacy `work`.
+3. Inherited trigger/work context: v2 task first, then legacy branch; a
+   task-owned Session's binding supplies the task context for a dock user turn.
+4. Capability gate for a new root task.
+
+Selection precedence does not grant permission to leave inherited work. With
+an inherited v2 task, `task: "new"`, a different task id or an explicit legacy
+`work` selector is refused before admission or any side effect. With an
+inherited legacy branch, a selector attempting to start v2 is likewise refused.
+When `task` and `work` are both supplied, `task` is the selected argument and
+`work` is ignored; the selected task must still pass these context checks.
+
+| Call context / selected argument | Gate on | Gate off |
+|---|---|---|
+| Root trunk, no `task`/`work` | Apply the `00/10/01/11` matrix | Trunk path, no automatic legacy branch creation/reuse |
+| Root trunk, `task: "new"` | New v2 only for `11`; otherwise refuse | Refuse new v2 |
+| Explicit existing v2 `task` id | Validate membership/state and use v2 | Same; existing records remain routable |
+| Explicit open legacy `work` id | Legacy compatibility path | Same |
+| Root trunk, explicit `work: "new"` | Legacy creation only for a valid configured legacy pair | Same; this is an explicit legacy operation |
+| Inherited legacy trigger, no selector or its own `work` id | Continue that legacy branch | Same |
+| Inherited v2 trigger, no selector or its own `task` id | Continue that v2 task | Same |
+
+The gate controls new v2 tasks, not explicit legacy operations. Gate-off
+intentionally replaces the old *implicit* legacy branch creation/sole-open
+reuse with trunk behavior for root calls without a selector. Existing open
+legacy routing/closing and explicit legacy operations keep their compatibility
+path. Disable new legacy creation too by removing the configured legacy pairs.
+No root v2 request is absorbed by a sole-open legacy branch, and no legacy
+follow-up becomes v2 when the gate or capability set changes.
+
+### Root admission
+
 A v2 task is opened only when:
 
 - `taskSessionsEnabled === true`;
@@ -142,7 +211,8 @@ A v2 task is opened only when:
 
 The task records `mode: "v2"` and the capability snapshot that created it.
 Later capability changes do not change the record's mode. Legacy records use
-`mode: "legacy"` through their separate compatibility path.
+a logical `mode: "legacy"` through their separate compatibility path; this
+does not migrate them into `state.tasks`.
 
 ### Flat tasks and participant routing
 
@@ -154,8 +224,18 @@ A task has:
   `message_bot` calls inside the task.
 
 Participants are not child tasks. A message to another Bot from a task-owned
-Session stays under the same task id. The caller's task Session receives the
-reply. The task record records each participant's endpoint.
+Session or a task-triggered shared-trunk turn stays under the same task id.
+Resolve the target by `(taskId, botId)`. Every exchange persists the actual
+calling Session as its reply address, so replies from multiple callers on the
+same task cannot be confused with the root requester's address.
+
+For a non-enabled participant C handling T1 in its trunk, the turn's
+trigger/work carries T1. Every `message_bot`, receipt key, unread merge,
+retry, deferred delivery and restart recovery in that turn inherits T1.
+C may concurrently participate in T2 through the same trunk; T1 and T2 remain
+separate contexts. Enabling C's capability later does not turn a T1 follow-up
+into a root task. Only a trunk turn without inherited task/legacy context
+can be a root.
 
 When the target is not yet a participant:
 
@@ -167,13 +247,14 @@ When the target is not yet a participant:
 When the target is already a participant:
 
 - reuse its recorded task-owned Session; or
-- reuse its recorded trunk endpoint.
+- resolve its recorded logical trunk endpoint to the Bot's current part,
+  migrating the persisted address as described under cross-part delivery.
 
 An existing participant stays routable from the persisted record even if its
 capability is later removed. A new participant is chosen with the capability
 effective at the time of that message.
 
-From inside a task-owned Session:
+From inside a task-owned Session or any turn with an inherited task trigger:
 
 - `message_bot` with no `task` uses the current task.
 - `message_bot` with this task id uses the current task.
@@ -181,7 +262,8 @@ From inside a task-owned Session:
 - `task: "new"` is refused.
 - Any other task id, a missing task, or a terminal task is refused.
 
-From a trunk:
+From a root trunk turn without inherited task/legacy context (subject to
+the selection order):
 
 - no task and a `1/1` pair opens a new task;
 - no task in `0/0`, `1/0` or `0/1` uses today's trunk path;
@@ -208,8 +290,9 @@ The root requester's task Session is created as follows:
 
    DSH chooses its default boundary, the last completed turn.
 
-2. If the trunk has no completed turn or the fork fails with the corresponding
-   boundary condition, create a fresh requester Session instead.
+2. Only a confirmed DSH "no completed turn" fork error permits a fresh
+   requester Session instead. A transport error, timeout, HMR stop or unknown
+   fork result is not this condition and never permits a blind fresh fallback.
 3. Record the actual `inheritedThrough` boundary when a fork succeeds. Record
    `null`/zero provenance when a fresh Session is used.
 4. Carry the current delegation explicitly in the task brief. The task section
@@ -220,8 +303,36 @@ The implementation never assumes that the fork contains the current user
 message, the current assistant analysis, the `message_bot` tool call, or the
 tool result. Those are supplied by the explicit brief and task provenance.
 
-The recipient participant Session is always fresh. It never forks the
-recipient trunk.
+An enabled recipient's task-owned Session is always fresh. A non-enabled
+participant remains on the trunk compatibility endpoint.
+
+### Creation intent and unknown results
+
+Before each create/fork attempt, save a `creating` intent with a stable
+request id, task id, Bot id, operation (`fork` or `fresh`), source Session
+where applicable, and expected marker. This includes additional participants
+and the confirmed first-turn fallback, not only the initial root.
+
+The marker identifies the operation through a title/metadata field supported
+by the documented Session APIs. Persist it before the create/fork call and
+apply it at the earliest supported creation step. A post-creation title rename
+alone does not make the earlier create atomic or prove absence of a Session.
+
+If crash/HMR occurs after Session creation but before its id is saved:
+
+- inspect available Session metadata/logs for that exact persisted marker;
+- adopt a uniquely verified matching Session, save its id, and complete
+  setup without prompting it twice;
+- if the result cannot be established, or marker lookup is unavailable or
+  ambiguous, mark the task `failed`, keep the intent/diagnostic, and enqueue
+  one blocked conclusion to the requester using the normal conclusion protocol;
+- never issue another create/fork merely because the saved id is missing.
+
+Only verified non-creation permits retry of the intended operation. The
+confirmed "no completed turn" error separately permits the fresh fallback.
+Other definitive setup errors fail closed too. A host-generated blocked
+conclusion for failed creation does not require a requester task Session to
+exist and is not a second Bot closing authority.
 
 ### Fresh participant Session
 
@@ -344,11 +455,14 @@ the current plugin generation before each side effect.
 
 Creation rules:
 
-1. Persist the task with `phase: "creating"` before fork/create.
+1. Persist the task and per-operation request id/marker with
+   `phase: "creating"` before fork/create.
 2. Persist each Session id before using it.
 3. Set `phase: "ready"` only after the participant is configured and its
    endpoint is saved.
 4. No prompt or followup is sent while `phase !== "ready"`.
+5. An unknown create/fork result follows "Creation intent and unknown results";
+   it is never interpreted as permission to repeat creation.
 
 Send rules:
 
@@ -356,7 +470,9 @@ Send rules:
 2. Re-read the task and reject a terminal task.
 3. Persist the pending send, exchange id, task id and exact endpoint before
    calling `deliver`.
-4. Re-check the terminal state immediately before the final inbox enqueue.
+4. After all awaits, synchronously re-check terminal state, actual endpoint,
+   current turn visibility/task/work and generation immediately before inbox
+   enqueue. Resolve steer/followup there, not from an earlier snapshot.
 5. Enqueue and flush.
 6. Mark the send delivered only after the enqueue and flush succeed.
 7. If the generation is stopped after an await, leave the durable pending
@@ -383,16 +499,37 @@ A non-enabled participant has no task-owned Session and therefore cannot
 close the task. A task-enabled participant other than the root requester also
 cannot close it.
 
+The complete rendered conclusion, including its header, is at most 1000
+Unicode code points. The assignee and other participants' trunks receive no
+closure note; they can inspect the task dock/history.
+
 `done` requires non-empty evidence and is refused while the task has:
 
 - a pending send to another participant;
 - an open request/work tied to this task;
-- an active task-owned turn or failure-retry path that can still produce a
-  result.
+- another active turn whose trigger/work belongs to this task, including
+  a turn in a shared trunk, or a failure-retry path that can still produce a
+  result. The calling turn executing `close_task` is excluded.
 
-`blocked`, `cancelled` and `failed` may close with outstanding work. Their
-pending sends are marked terminal and their active non-caller task turns are
-cancelled where possible. The closing caller's current turn ends normally.
+When all other dependencies have settled, the root requester's current turn
+can therefore close `done` successfully. After that terminal commit, any
+further task send or automatic retry from the closing turn is refused; its
+normal completion does not reopen work or emit a second task result.
+
+`blocked`, `cancelled` and `failed` may close with outstanding work. Mark
+un-enqueued sends terminal, cancel this task's scheduled failure resumes and
+settle its works through their exact task/work ids. Cancel an active
+non-caller turn only if its trigger/work is verified to belong to this task.
+Never cancel a whole shared trunk based only on its participant membership:
+its running turn may belong to another task or the user. The closing caller's
+current turn ends normally.
+
+Requests already durably queued for this task may still execute after close.
+V1 does not promise inbox withdrawal or prevention of those external side
+effects. They retain the task trigger and cannot open more task work; any
+reply/error they produce follows the late-reply path. Do not stop T2 merely
+because T1 closed on the same trunk. Dock/user input can still read a closed
+task's history, but cannot authorize new sends under its terminal id.
 
 Closing is one commit:
 
@@ -412,41 +549,86 @@ the task's `lateReplies` record with:
 - the time.
 
 A late reply is not delivered to any trunk, does not reopen the task and does
-not change the conclusion. A UI may show the late-result count on the closed
-task.
+not change the conclusion. Recording is idempotent by the source
+exchange/result id: a repeated event or recovery increments the count only
+once. Settle only that task's works and retries; do not drop a different
+task's work or failure resume on a shared trunk. A UI may show the late-result
+count on the closed task.
 
 ### Exactly-once conclusion delivery
 
 The conclusion is one task-conclusion followup to the root requester's trunk.
 The trunk turn it may start is an accepted cost and is counted in model usage.
 
-At the terminal commit:
+At the terminal commit, persist the conclusion and `summaryId`; resolving the
+delivery address is a separate durable step at enqueue time:
 
-1. Read the actual requester trunk Session id.
+1. After capability/agent resolution, read the requester's actual current
+   trunk part and persist the target before enqueue.
 2. Persist:
 
    ```js
    delivery: {
      summaryId,
      targetSessionId,
+     targets: [{ sessionId, state }],
      state: "pending" | "enqueued" | "delivered",
      enqueuedAt?,
      deliveredAt?
    }
    ```
 
-3. Enqueue the followup to the recorded `targetSessionId`, not to a newly
-   resolved "current trunk" during recovery.
-4. Mark `delivered` only after the target inbox is observed and the Session
-   flush succeeds.
+3. Re-check the current part after the save await. If it changed before
+   enqueue, persist an address migration and check prior targets before
+   selecting the new part. Repeat until the recorded target is current at the
+   final synchronous enqueue boundary.
+4. Enqueue to that recorded target; persist the enqueued target/ack after
+   flush. A `summaryId` is stable across all address changes.
+5. Mark `delivered` only after the inbox/log observation is made durable by
+   flush. In-memory inbox presence alone is not acknowledgement.
 
-If a trunk rotates from S0 to S1 to S2 after the record is written, recovery
-uses the recorded S1 target and checks its inbox, consumed messages and part
-forwarding records. It must not send a second conclusion to S0 or S2.
+### Cross-part delivery and address migration
 
-Delivery dedupe means "one DS Bot conclusion message is admitted once". It
-does not mean arbitrary external side effects of a task are exactly-once.
-The task's evidence and Session link are the basis for external verification.
+A trunk endpoint is a logical Bot address plus its recorded physical part,
+not a permanent address to an archived Session. For both participant trunk
+requests/replies and conclusions:
+
+- resolve the current part at final enqueue time, persist each
+  `(deliveryId, targetSessionId)` before sending, and retain earlier targets;
+- keep task/work/source and actual caller identity when forwarding; migrate
+  physical addresses, never task identity;
+- if a part rotates after enqueue, let `parts.forward()` move the same
+  durable message id, recording source -> target migration before forwarding;
+- for conclusions, `deliveryId` is `summaryId`; for task messages it is the
+  stable exchange/result id;
+- before a resend or forwarded copy, inspect the target's durable inbox
+  splice events and consumed `user/message` log as well as its current inbox;
+  a matching `summaryId`/delivery id already consumed counts as present;
+- flush an already-present copy before acknowledging forwarding, and save
+  the migration/ack before withdrawing the source copy;
+- on crash between target consumption and source acknowledgement, the same
+  target log proves delivery. Do not insert the copy again.
+
+The current `parts.forward()` checks only pending inbox entries. V2 must add
+these persisted id checks and forwarding records to `forward()`, part-switch
+recovery and task outbox recovery. Task sends/forwarding share their task's
+serialized path and perform the final state/generation check too; conclusions
+are the explicit permitted terminal delivery, ordinary task sends are not.
+Forwarding/resume of already-queued terminal requests may still result in
+execution under the terminal policy, but cannot create new work or a trunk
+reply.
+
+For S0 -> S1 -> S2, a conclusion may be enqueued in S1 and forwarded to S2.
+Recovery checks every recorded target and follows persisted migrations,
+including S2's already-consumed log, before any resend. Only absence from all
+verified target histories permits enqueue at the now-current part; unreadable
+or uncertain history leaves delivery pending with a diagnostic. Neither a
+stale S0 address nor an unrecorded fresh S2 send is an acceptable shortcut.
+
+Delivery dedupe means one logical conclusion, with forwarded copies sharing
+the same id and no repeated admission at a destination. It does not mean
+arbitrary external side effects of a task are exactly-once. The task's
+evidence and Session link are the basis for external verification.
 
 ### HMR generations and stopped work
 
@@ -474,7 +656,9 @@ Plugin disposal:
 
 The old generation may finish an already-started model turn, but its task
 handlers must not commit the result after stopped. The new generation settles
-from the persisted task and Session log.
+from the persisted task and Session log. An old generation stopped while
+awaiting create/fork cannot treat the missing saved id as non-creation; the
+new generation uses the persisted creation marker or fails closed.
 
 ### Request receipts in v1
 
@@ -509,6 +693,9 @@ They keep their own compatibility path:
 
 `close_work_branch` remains for open legacy branches. It writes the legacy
 record and uses the old delivery path. It does not create a v2 task.
+The selection-order table defines legacy id/trigger priority and the explicit
+`work: "new"` operation; no implicit sole-open-branch heuristic runs before
+new v2 admission.
 
 Removing the configuration does not stop existing legacy branches from routing
 or closing. Removing `workBranches` from config removes its capability alias,
@@ -575,6 +762,15 @@ V2 tasks live in `state.tasks`. There is no `state.workers` table in v1.
   updatedAt: 1790000000000,
   closedAt: null,
   conclusion: null,
+  creationIntents: {
+    "participant-operation-id": {
+      requestId: "participant-operation-id",
+      botId: "cardpack-bot-id",
+      operation: "fresh",
+      marker: "task-id:cardpack-bot-id:participant-operation-id",
+      state: "creating"         // created | unknown | failed after reconciliation
+    }
+  },
   pendingSends: {},
   lateReplies: { count: 0, ids: [] }
 }
@@ -600,11 +796,21 @@ The close record is stored separately from the public conclusion:
   },
   delivery: {
     summaryId: "task-id:closed",
-    targetSessionId: "requester-trunk-session-at-close",
+    targetSessionId: "requester-trunk-part-at-enqueue",
+    targets: [
+      { sessionId: "requester-trunk-part-at-enqueue", state: "pending" }
+    ],
     state: "pending"
   }
 }
 ```
+
+`targetSessionId`/`targets` are populated after the terminal commit and before
+enqueue, then updated durably during address migration. Forwarding records
+retain the prior and next targets with the same `summaryId`/delivery id.
+Task message records also retain the actual caller Session, task id and work
+id; a shared trunk's current trigger supplies identity, not an exclusive
+Session-owner lookup.
 
 ## Invariants
 
@@ -626,16 +832,19 @@ The close record is stored separately from the public conclusion:
 12. A fresh task Session's memory review starts at seq 0; a requester fork
     starts after its inherited boundary.
 13. Task messages carry the task id and route only to the recorded endpoint.
-14. Inside a task, a message to any Bot stays in that task.
-15. `task: "new"` is refused inside a task.
+14. Inside a task-owned Session or task-triggered shared-trunk turn, a message
+    to any Bot stays in that task; receipts/merge/recovery share its scope.
+15. `task: "new"` and cross-task/legacy escape are refused in task context.
 16. Only the root requester's task-owned Session can close.
 17. Send and close share one serialized per-task commit path.
 18. Every side effect is preceded by a durable intent record and followed by a
     durable completion record when appropriate.
-19. A terminal task refuses sends and never revives.
+19. A terminal task refuses sends and never revives. Already-queued requests
+    may execute; only matching-trigger turns may be cancelled.
 20. Late replies after terminal are counted and identified but not delivered
     to a trunk.
-21. A conclusion is one followup to the recorded requester target Session.
+21. A conclusion resolves the current trunk at enqueue; every physical
+    target/forwarding migration is persisted and deduped by its stable id.
 22. A skipped delivery because of HMR/stop is not success.
 23. Removing a Bot archives only that Bot's task-owned Sessions; trunk
     endpoints and other participants' Sessions are not archived by task code.
@@ -644,6 +853,13 @@ The close record is stored separately from the public conclusion:
     denied.
 26. No task/listener/timer path leaves an unhandled rejection.
 27. User-originated task creation and nested tasks are absent from v1.
+28. Final no-steer/merge checks run after all awaits; unknown triggers queue
+    and different task/work contexts never steer or merge.
+29. `done` excludes the closing turn itself from its dependency check.
+30. Creation with an unknown result uses marker reconciliation or fails with
+    a blocked conclusion; it never blindly recreates.
+31. Selection order is explicit task, legacy work, inherited context, then
+    capability admission; it never converts a legacy follow-up into v2.
 
 ## File and function changes
 
@@ -651,8 +867,9 @@ The close record is stored separately from the public conclusion:
 
 | File | Current symbols | Required change |
 |---|---|---|
-| `ds-bot/src/host/turns.js` | `claimTrigger`, `user/message`, `turn/end`, `answerSender` | Record the visible/hidden trigger class; private Bot requests queue rather than steer into user-visible turns |
-| `ds-bot/src/host/tools.js` | `message_bot`, `hideBotUnusedTools`, `tools/execute` | Apply the no-steer admission rule; add execution-level denial for `plugin_manager` set/install/remove of `ds-bot` |
+| `ds-bot/src/host/turns.js` | `claimTrigger`, `user/message`, `turn/end`, `answerSender` | Expose current visible/hidden trigger and task/work scope for the final enqueue decision |
+| `ds-bot/src/host/delivery.js` | `deliver`, steer/followup enqueue | Re-read visibility/task/work after all awaits with no await between validation and enqueue; unknown trigger queues |
+| `ds-bot/src/host/tools.js` | `message_bot`, unread merge, `tools/execute` | Revalidate merge scope/candidate after awaits; never steer/merge different works; add execution-level `plugin_manager` self-change denial |
 | `ds-bot/src/host/update.js` | `start`, `installBundle`, `removeBundle` | Disable in-plugin self-install/remove; keep version checking only |
 | `ds-bot/src/host/agents.js` and other timer/listener users | `setInterval`, fire-and-forget callbacks | Route every rejection through diagnostics; add tests that fail on unhandled rejection |
 | `ds-bot/test/bot-messages.test.js`, `agents.test.js`, `install.test.js` | existing security/routing tests | Add visible-turn no-steer, self-update deny and async-host regressions |
@@ -662,20 +879,21 @@ The close record is stored separately from the public conclusion:
 | File | Current symbols | Required change |
 |---|---|---|
 | `ds-bot/src/host/store.js` | `adopt`, `indexSessions`, `selfOf`, `isBotSession`, owner maps | Add `state.tasks`, v2 record validation, task-owned indexes and generation-aware saves; keep legacy branch indexes separate |
-| `ds-bot/src/host/branches.js` | current branch lifecycle | Keep legacy owner-requester routing and add separate v2 task lifecycle: create, participant endpoint, send, close, terminal guard, late-result record |
-| `ds-bot/src/host/tools.js` | `message_bot`, `working_directory` hook, `close_work_branch` | Add `task` routing, `list_tasks`, `close_task`; apply task-only cd branch that skips `updateBot`; keep `close_work_branch` legacy-only |
-| `ds-bot/src/host/delivery.js` | `deliver`, `headerFor`, `EXCHANGE_ROLES` | Persist task/exchange/endpoint intent; add task headers and typed skipped result; do not count stopped return as delivery |
-| `ds-bot/src/host/turns.js` | `answerSender`, turn settlement | Route task replies to the caller task endpoint; record late replies after terminal; preserve legacy branch routing |
-| `ds-bot/src/host/handoffs.js` | `openWork`, `closeWork`, `dropWork`, `workOf` | Link work to a task id; expose pending task work for `done` refusal and terminal cancellation |
+| `ds-bot/src/host/branches.js` | current branch lifecycle | Keep legacy path; add selector precedence, creation request ids/marker reconciliation, per-task send/close lane, terminal and late-result records |
+| `ds-bot/src/host/tools.js` | `message_bot`, `working_directory` hook, `close_work_branch` | Inherit task from trigger/work even on shared trunks; implement explicit selector priority, `list_tasks`, caller-excluding `close_task` check and Session-only cd |
+| `ds-bot/src/host/delivery.js` | `deliver`, `headerFor`, `EXCHANGE_ROLES` | Persist task/exchange/caller/endpoint intent; re-resolve trunk parts at enqueue, maintain target history, add typed skipped result |
+| `ds-bot/src/host/turns.js` | `answerSender`, turn settlement | Persist task in shared-trunk triggers; reply to the exact exchange caller; idempotent late recording and trigger-specific cancellation |
+| `ds-bot/src/host/handoffs.js` | `openWork`, `closeWork`, `dropWork`, `workOf` | Preserve task/work scope through nested requests within the flat task; settle only the closing task's works/retries |
+| `ds-bot/src/host/requests.js` | `requestIdentity`, receipt context | Scope receipts from selected/inherited task or legacy context; keep the documented crash-uncertain semantics |
 | `ds-bot/src/host/prompt.js` | `promptFor`, `workBranchChoices` | Remove mutable open-task choices; render a stable task section for task-owned Sessions; direct callers to `list_tasks` |
-| `ds-bot/src/host/resume.js` | branch recovery | Recover v2 task creation, pending sends, typed stopped deliveries, conclusions and late-result records; keep legacy recovery |
+| `ds-bot/src/host/resume.js` | branch recovery, `triggerOf`, retries | Preserve shared-trunk task triggers; reconcile creation markers, forwarded ids/target history and late replies; cancel only matching retries |
 | `ds-bot/src/host/permissions.js` | `setPermission`, `applyPermission` | Apply Bot permission changes to task-owned Sessions; never apply a group permission to a task |
 | `ds-bot/src/host/models.js` | `applyModel`, `selectSessionModel` | Select model/effort for fresh participant Sessions without changing profile defaults |
 | `ds-bot/src/host/capabilities.js` | `trackBotAgents`, `ensureCapabilities` | Track only task-owned Sessions as Bot Sessions for capability mounts |
 | `ds-bot/src/host/folders.js` | `cleanWorkDir`, `workFolder`, `approveFolder` | Validate initial workdir and approve each target Session independently |
-| `ds-bot/src/host/parts.js` | `isBotTarget`, `ownedByBot`, `agent/pre-step`, overflow rescue | Exclude task-owned Sessions from DS Bot compaction wrapping and part switching so native in-place compaction runs |
+| `ds-bot/src/host/parts.js` | `isBotTarget`, `ownedByBot`, `forward`, `heldBack`, part-switch paths | Allow native compaction for task-owned Sessions; integrate durable forwarding ids/acks, consumed-log dedupe and trunk address migration |
 | `ds-bot/src/host/memory.js` | `reviewOf`, `chatBatch`, `reviewChat`, cursors | Add task provenance, seq-0 fresh review, inherited-boundary review, task anchors and independent cursors |
-| `ds-bot/src/host/roster.js` | `deleteBot`, `createSession` | Archive only deleted Bot's task-owned Sessions; leave other endpoints; reuse standard preset for fresh task Sessions |
+| `ds-bot/src/host/roster.js` | `deleteBot`, `createSession` | Archive only deleted Bot's task-owned Sessions; add documented marker application/lookup where possible and fail closed if not reconcilable |
 | `ds-bot/src/host/channel.js` | live `work.branches` | Expose task records, participant endpoints, terminal/late state and delivery status |
 | `ds-bot/src/client/branch-dock.js` | `BranchDock` | Replace with flat `TaskDock`: task id/title, endpoint, state, late-result count, open task Session |
 | `ds-bot/src/client/cells.js`, `sidebar.js`, `sources.js`, `i18n.js` | branch UI | Keep legacy branch rendering; add v2 task/normal-trunk endpoint distinction |
@@ -721,7 +939,28 @@ Also test:
   closes;
 - removing names from both config lists: no new task, existing task closes;
 - `workBranches` alias still present: it contributes names but does not
-  bypass the rollout gate.
+  bypass the rollout gate;
+- open legacy branch plus alias with the gate on/off: root v2 admission is
+  not absorbed by the old branch; a legacy-triggered follow-up remains legacy;
+- both `task` and `work`: task wins selection; invalid or cross-context task
+  still refuses without side effects;
+- explicit legacy id, explicit `work: "new"`, inherited legacy trigger and
+  root no-selector calls follow the selection table in both gate states;
+- gate-off root no-selector calls use trunks and do not implicitly create
+  legacy branches.
+
+### S1 enqueue and merge races
+
+- pause during capabilities/resolve/save, change the target from a hidden
+  Bot turn to a user, scheduled or group turn, then release: final enqueue is
+  followup;
+- unknown or missing trigger/work identity queues even if the turn is hidden;
+- different private works with no v2 task do not steer/merge;
+- hidden turns of T1/T2, and distinct works within T1, do not steer/merge;
+- replace/consume an unread merge candidate while admission awaits: no
+  unrelated candidate is withdrawn or merged;
+- a matching known hidden task/work remains eligible only if still matching
+  at final synchronous enqueue; no awaits occur after that check.
 
 ### Session and fork scenarios
 
@@ -732,33 +971,62 @@ Also test:
 - first-turn fork failure, running trunk, concurrent trunk writes;
 - two concurrent tasks for one pair, plus concurrent reverse-direction tasks;
 - same `request_id` in two different tasks does not collide;
+- C is non-enabled and serves T1/T2 in one shared trunk: every message,
+  receipt, merge, deferred delivery, retry and resume inherits the turn's
+  exact task/work and replies to the actual caller;
+- two callers on the same task address C; replies use each exchange's saved
+  caller Session, not a guessed root address;
+- enable C while handling T1 and start a reverse-direction task independently:
+  C's T1 follow-up remains T1 and never creates T3;
 - a message from a task to another Bot:
   - enabled target gets one fresh participant Session;
   - already-added task target reuses its endpoint;
   - non-enabled target uses its trunk endpoint;
   - reply returns to the caller's task Session;
-- `task: "new"` inside a task is refused.
+- `task: "new"` and a different task id inside either a task-owned Session or
+  task-triggered trunk turn are refused before side effects.
 
 ### Commit, terminal and failure injection
 
 - close/send/close race;
 - close while a task-owned turn is active;
-- `done` with pending work, no evidence, and after all work settles;
+- `done` with pending work, no evidence, and after all other work settles:
+  the executing close turn itself does not block success;
+- further sends/retries in that calling turn after close are refused;
 - each terminal state: `done`, `blocked`, `cancelled`, `failed`;
 - late reply after every terminal state: count/id recorded, no trunk, no
-  revival;
+  revival; repeated source ids do not increment the count again;
+- a durably queued T1 request executes after terminal and produces a late
+  result only; T2/user work on the same trunk continues unaffected;
+- cancellation checks the running trigger, not Session membership; no
+  unrelated task/user turn is cancelled and no unrelated work/retry is settled;
 - fault injection after task create/fork, each Session save, each endpoint
   save, each pending-send save, before/after inbox enqueue, before/after flush,
   and before/after receipt/conclusion/result acknowledgement;
 - crash between every side effect and its save; recovery is idempotent;
+- Session created but id not saved: unique marker is adopted; unavailable or
+  ambiguous marker fails the task with one blocked conclusion, without
+  create/fork retry;
+- old generation stopped before create/fork returns: new generation follows
+  the same reconciliation; no double creation;
+- only confirmed "no completed turn" selects fresh fallback; timeout,
+  transport and arbitrary fork failures never do;
 - full host restart with a v2 task and with a legacy open branch;
 - deleting the root requester, the assignee, and an additional participant;
   only the deleted Bot's task-owned Sessions are archived.
 
 ### Conclusion and HMR
 
-- S0 -> S1 -> S2 trunk rotation after close: recovery checks the recorded S1
-  target and sends no duplicate to S0/S2;
+- trunk rotates between close, target save and enqueue: use the current part
+  at enqueue with its persisted target/migration record;
+- S0 -> S1 -> S2: S1 enqueue/forward to S2 is recovered by summary id in
+  target inbox/consumed logs and persisted forwarding acknowledgements;
+- forwarded target already consumed the conclusion, source copy/ack still
+  present at crash: recovery inserts no second copy;
+- shared-trunk participant rotates parts before request or reply: logical
+  endpoint migrates, exact caller/task identity survives and no request is
+  sent permanently to an archived part;
+- repeated forwarding and resume check stable ids beyond pending inboxes;
 - conclusion starts at most one trunk followup turn; its model cost is counted;
 - summary delivery dedupe does not claim external side effects are
   exactly-once;
@@ -806,13 +1074,17 @@ Branch: `fix/private-steer-self-update-hardening`
 Scope:
 
 - no-steer for all Bots, including non-task pairs;
+- final visibility/task/work check after all awaits and immediately before
+  enqueue; task/work-isolated unread merging;
 - execution-level denial of `plugin_manager` self set/install/remove;
 - disable in-plugin self-update install/remove;
 - unhandled-rejection and timer/listener hardening.
 
 Acceptance:
 
-- visible-turn no-steer regression passes;
+- visible-turn no-steer regression and every "S1 enqueue and merge races"
+  scenario passes, including capability/resolve waits, scheduled/group/unknown
+  triggers and distinct hidden works;
 - Bot calls to plugin-manager self-change are refused at the execution
   boundary;
 - no plugin self-install/remove path remains;
@@ -824,7 +1096,8 @@ Branch: `feat/task-sessions-v2`
 
 Scope:
 
-- read-only compatibility model for legacy work branches;
+- separate compatibility model for legacy work branches, whose open records
+  continue to route and close;
 - v2 task model, capability and route matrix;
 - requester fork/fresh, explicit brief and recipient fresh Session;
 - fresh/fork model, preset, permission, capability and memory setup;
@@ -843,7 +1116,9 @@ Acceptance:
 
 - complete matrix and lifecycle tests above pass with the flag on in
   isolation;
-- with the flag off, no task is created and no legacy path changes;
+- with the flag off, no new v2 task is created; existing v2/legacy selectors
+  and triggers still route/close, explicit legacy creation follows the table,
+  and root no-selector calls use trunks;
 - flag on is tested only after all S2 parts are present.
 
 ### S3: isolated acceptance and release procedure
@@ -932,6 +1207,11 @@ trunk directly.
 ## Known limits
 
 - Receipt replay remains uncertain after the documented crash window.
+- A missing saved Session id is an unknown creation outcome, not proof that
+  create/fork failed; failed marker reconciliation produces a blocked
+  conclusion and no automatic recreation.
+- Requests already queued when a task closes may still have external side
+  effects. Their replies are retained as late results only.
 - A non-enabled participant receives task work in its trunk; per-side context
   isolation applies only to a task-owned Session.
 - A conclusion may start one model turn in the requester trunk and costs
