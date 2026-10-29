@@ -169,6 +169,7 @@ export function install(rt) {
   async function recordLate(id, sessionId, exchangeId, text = '') {
     const resultId = `${exchangeId}:reply`
     const task = taskOf(id)
+    if (task.closedBy?.sessionId === sessionId && task.closedBy.workId === exchangeId) return
     if (!task.lateReplies.ids.includes(resultId)) {
       await commit(id, task => {
         if (task.lateReplies.ids.includes(resultId)) return task
@@ -248,7 +249,9 @@ export function install(rt) {
           task.closedAt = task.updatedAt = Date.now()
           task.conclusion = next
           task.delivery = { summaryId: `${id}:closed`, targets: [], state: 'pending' }
-          task.closedBy = { sessionId, ...(rt.live.get(sessionId)?.turn === undefined ? {} : { turn: rt.live.get(sessionId).turn }) }
+          task.closedBy = { sessionId,
+            ...(rt.live.get(sessionId)?.turn === undefined ? {} : { turn: rt.live.get(sessionId).turn }),
+            ...(rt.workOf(rt.live.get(sessionId)?.info) ? { workId: rt.workOf(rt.live.get(sessionId).info) } : {}) }
           for (const send of Object.values(task.pendingSends)) send.state = 'terminal'
           return task
         })
@@ -297,6 +300,10 @@ export function install(rt) {
   Object.assign(rt, { taskOfTurn: ofTurn, taskDependencies: dependencies, recordTaskLateReply: recordLate,
     prepareTaskDelivery: prepare, checkTaskDelivery: atBoundary, runTaskDelivery: runDelivery,
     closeTask, recoverTaskLifecycle: recover, taskLifecycleCheck: check, removeTaskBot: removeBot,
+    confirmTaskDeliveryTarget: async args => {
+      await prepare(args)
+      await updateLedger(args, ledger => { ledger.targetSessionId = args.sessionId })
+    },
     forwardTaskMessage: (owner, message) => {
       const source = message.source
       const task = taskOf(source.taskId)

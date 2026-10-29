@@ -118,6 +118,11 @@ export function install(rt) {
       if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
       agent = await resolveAgent(targetSessionId)
       if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
+      if (taskId && rt.confirmTaskDeliveryTarget) {
+        await rt.confirmTaskDeliveryTarget(args)
+        if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
+        if (args.sessionId !== targetSessionId) continue
+      }
       const task = taskId && rt.taskOf(taskId)
       if ((role === 'task-conclusion' || task?.participants[toId]?.kind === 'trunk') && rt.chatOf(toId) !== targetSessionId) continue
       break

@@ -186,6 +186,7 @@ export function install(rt) {
       rt.indexSessions()
       rt.validateTaskSessions(next)
       Object.defineProperty(rt.state.tasks, id, { value: structuredClone(next), enumerable: true, writable: true, configurable: true })
+      rt.indexSessions()
       // Like the rest of the store, failed writes retain dirty state for a later save.
       // Rolling back here could erase a task already captured by another queued save.
       await rt.save({ required: true })

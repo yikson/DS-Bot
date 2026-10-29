@@ -19227,7 +19227,7 @@ function BranchDock({ sessionId, useRoster, useWork, actions }) {
         key: task.id,
         type: "button",
         className: "bt-mw-pill",
-        disabled: !endpoint,
+        disabled: !endpoint || task.phase !== "ready",
         "aria-label": `${t("Open task")}: ${task.title}`,
         onClick: () => actions.openBranch(endpoint),
         title: `${task.id}

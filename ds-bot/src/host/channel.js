@@ -430,6 +430,8 @@ export function install(rt) {
           // A Bot id or an earlier part of its own chat means the current part.
           const past = rt.pastOwners.get(body.sessionId)
           const sessionId = rt.botOf(body.sessionId) ? rt.chatOf(body.sessionId) : past && past.roomId === undefined ? rt.chatOf(past.botId) : body.sessionId
+          const task = rt.taskForSession(sessionId)
+          if (task && task.phase !== 'ready') return fail('Task Session setup is incomplete; its history remains readable', 'bot/not-ready')
           await rt.ensureCapabilities(sessionId)
           await ctx.sessionController.prompt({
             requestId: randomUUID(),

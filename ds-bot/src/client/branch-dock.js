@@ -17,7 +17,7 @@ export function BranchDock({ sessionId, useRoster, useWork, actions }) {
     const status = work.tasks?.[task.id]?.status ?? (task.state === 'open' ? task.phase === 'ready' ? 'Needs close' : 'Creating' : task.state)
     const target = roster.byId[task.requester === bot.id ? task.assignee : task.requester]
     const suffix = participant.kind === 'trunk' ? t('Main chat') : t('Task Session')
-    return h('button', { key: task.id, type: 'button', className: 'bt-mw-pill', disabled: !endpoint,
+    return h('button', { key: task.id, type: 'button', className: 'bt-mw-pill', disabled: !endpoint || task.phase !== 'ready',
       'aria-label': `${t('Open task')}: ${task.title}`, onClick: () => actions.openBranch(endpoint),
       title: `${task.id}\n${task.title}\n${endpoint ?? t('Creating')}` },
     h('span', { className: 'bt-mw-pill-in' },
