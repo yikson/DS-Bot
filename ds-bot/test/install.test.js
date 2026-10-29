@@ -65,7 +65,7 @@ test('apply registers listeners, tools, and effects in a fixed order', (t) => {
     'on tools/pre-execute',
     'tools guard',
     'tool list_bots',
-    'tool list_tasks',
+    'effect ds-bot: task tools',
     'tool message_bot',
     'tool stop_bot',
     'tool create_bot',

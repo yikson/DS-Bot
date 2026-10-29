@@ -137,7 +137,7 @@ export function install(rt) {
     },
   }))
 
-  ctx.tools.register(defineTool({
+  const listTasks = defineTool({
     name: 'list_tasks',
     description: 'List your open tasks with their ids, titles and participant endpoints.',
     parameters: {},
@@ -153,7 +153,26 @@ export function install(rt) {
           `  ${rt.botOf(botId)?.name ?? botId}: ${participant.role}, ${participant.kind}, ${task.sessions[botId] ?? 'not created'}`),
       ].join('\n')).join('\n')
     },
-  }))
+  })
+  // Scoped registration keeps the flag-off global tool list byte-for-byte unchanged.
+  const taskToolAgents = new Map()
+  const syncTaskTool = (agent) => {
+    const self = rt.taskOwners.get(agent.session?.id)?.botId ?? rt.selfOf(agent.session?.id)
+    const eligible = rt.botOf(self) !== undefined
+      && ((rt.config.taskSessionsEnabled === true && rt.taskCapabilities().has(self))
+        || [...rt.taskById.values()].some(task => Object.hasOwn(task.participants, self)))
+    const dispose = taskToolAgents.get(agent)
+    if (eligible && !dispose) taskToolAgents.set(agent, agent.ctx.tools.register(listTasks))
+    else if (!eligible && dispose) {
+      dispose()
+      taskToolAgents.set(agent, undefined)
+    }
+  }
+  rt.syncTaskTools = () => { for (const agent of taskToolAgents.keys()) syncTaskTool(agent) }
+  safe.effect(() => () => {
+    for (const dispose of taskToolAgents.values()) dispose?.()
+    taskToolAgents.clear()
+  }, 'ds-bot: task tools')
 
   // Sessions a Bot is running in right now, including its open work branches.
   const activeSessions = (botId) => {
@@ -838,7 +857,18 @@ export function install(rt) {
   safe.on('agent/created', async ({ agent }) => {
     try {
       await rt.load()
+      if (safe.stopped) return
       hideBotUnusedTools(agent)
+      if (typeof agent?.ctx?.tools?.register === 'function') {
+        if (!taskToolAgents.has(agent)) {
+          taskToolAgents.set(agent, undefined)
+          safe.effect(() => () => {
+            taskToolAgents.get(agent)?.()
+            taskToolAgents.delete(agent)
+          }, 'ds-bot: task tool scope', agent.ctx)
+        }
+        syncTaskTool(agent)
+      }
     } catch (error) {
       rt.warn('ds-bot: hiding %s on agent/created failed: %s', HIDDEN_TOOLS.join(', '), error)
     }
