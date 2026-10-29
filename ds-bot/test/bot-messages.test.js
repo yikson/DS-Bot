@@ -9,6 +9,7 @@ import { fakeAttachments, fakeContext } from './fake-ctx.js'
 import { install as installTurns } from '../src/host/turns.js'
 import { install as installParts } from '../src/host/parts.js'
 import { SOURCE_KIND } from '../src/host/constants.js'
+import { isHiddenTurn } from '../src/client/text.js'
 
 // A two-Bot team, optionally with b in a group Session 'gb' of room 'Ops'.
 function team({ group = false } = {}) {
@@ -144,6 +145,108 @@ test('message_bot when "queue" waits for the current work, and reply_to "user" a
   assert.equal(toUser, 'Delivered to Writer. It will answer the user in its own chat; nothing comes back to you, so point the user to Writer\'s chat instead of relaying. Writer now: working in its own chat for less than a minute, for the user; not read yet: 1 from Chief.')
   assert.deepEqual(agents.get('b').calls.map(([kind]) => kind), ['followup', 'followup'])
   assert.equal(agents.get('b').calls[1][1].source.audience, 'user')
+})
+
+// The path the report described: a scheduled task runs a turn the user can see, a
+// private request steers into it, the model answers while it runs, and the request is
+// then handed back to a turn of its own. This records the current routing and what is
+// visible; it does not say what a model writes in the open turn, so it does not prove
+// the reported display leak (it is not a reproduced regression).
+test('a request steered into a scheduled task is answered there and handed back to a hidden turn', async (t) => {
+  const { agents, emit, tool, call, exchanges, stop } = await start(team())
+  t.after(stop)
+  const hiddenIn = async (turn) => isHiddenTurn({ exchangeTurns: (await call('state', {})).value.exchangeTurns }, 'b', turn)
+
+  emit('b', 'turn/start', { turn: 1 })
+  emit('b', 'user/message', { content: textBlock('routine check'), source: { kind: 'schedule' } })
+  const out = await tool('message_bot', { to: 'Writer', message: 'which year is the data?' }, 'a')
+  const [kind, steered] = agents.get('b').calls[0]
+  // A scheduled turn hides nothing: the request steers into it like any running turn.
+  assert.equal(kind, 'steer')
+  assert.match(out, /^Delivered to Writer while it is working/)
+  assert.equal(await hiddenIn(1), false)
+
+  // The model reads the request and answers it in the running turn.
+  emit('b', 'user/message', { content: steered.content, source: steered.source })
+  emit('b', 'assistant/message', assistantText('The data is from 2025.'))
+  emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  await settled(() => agents.get('b').calls.length === 2)
+
+  // The turn's text was not routed back; the request is handed back to answer next.
+  const [next, deferred] = agents.get('b').calls[1]
+  assert.equal(next, 'followup')
+  assert.equal(deferred.source.deferred, true)
+  assert.equal(deferred.source.exchangeId, steered.source.exchangeId)
+  assert.equal(agents.get('a')?.calls.length ?? 0, 0)
+  assert.deepEqual((await exchanges()).map(entry => entry.role), ['request'])
+  assert.equal((await call('state', {})).value.exchangeTurns.b, undefined)
+  // The scheduled turn stays visible: its text is shown to the user.
+  assert.equal(await hiddenIn(1), false)
+
+  // The handed-back turn is hidden, and its text is the reply the sender gets.
+  emit('b', 'turn/start', { turn: 2 })
+  emit('b', 'user/message', { content: deferred.content, source: deferred.source })
+  assert.deepEqual((await call('state', {})).value.exchangeTurns.b, [2])
+  assert.equal(await hiddenIn(2), true)
+  emit('b', 'assistant/message', assistantText('2025'))
+  emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  await settled(() => (agents.get('a')?.calls ?? []).length === 1)
+
+  const reply = agents.get('a').calls[0][1]
+  assert.equal(textOf(reply.content), '[Reply from Writer]\n2025')
+  assert.equal(reply.source.replyTo, steered.source.exchangeId)
+  assert.deepEqual((await exchanges()).map(entry => entry.role), ['request', 'reply'])
+  // One reply, once: the visible turn's text never went back to ADA.
+  assert.equal(agents.get('a').calls.length, 1)
+  assert.equal(await hiddenIn(1), false)
+})
+
+// The control: the user's own turn is never hidden, even when a private request steers
+// into it. Only the turn that answers the request is.
+test('a turn the user started stays visible when a private request steers into it', async (t) => {
+  const { agents, emit, tool, call, stop } = await start(team())
+  t.after(stop)
+  const hiddenIn = async (turn) => isHiddenTurn({ exchangeTurns: (await call('state', {})).value.exchangeTurns }, 'b', turn)
+
+  emit('b', 'turn/start', { turn: 1 })
+  emit('b', 'user/message', { content: textBlock('write the letter'), source: { kind: 'user' } })
+  await tool('message_bot', { to: 'Writer', message: 'which year is the data?' }, 'a')
+  const steered = agents.get('b').calls[0][1]
+  emit('b', 'user/message', { content: steered.content, source: steered.source })
+  emit('b', 'assistant/message', assistantText('the letter, for the user'))
+  assert.equal(await hiddenIn(1), false)
+  emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  await settled(() => agents.get('b').calls.length === 2)
+
+  assert.equal(await hiddenIn(1), false)
+  const [kind, deferred] = agents.get('b').calls[1]
+  assert.equal(kind, 'followup')
+  assert.equal(deferred.source.deferred, true)
+  emit('b', 'turn/start', { turn: 2 })
+  emit('b', 'user/message', { content: deferred.content, source: deferred.source })
+  assert.equal(await hiddenIn(2), true)
+  emit('b', 'assistant/message', assistantText('2025'))
+  emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  await settled(() => (agents.get('a')?.calls ?? []).length === 1)
+  assert.equal(await hiddenIn(1), false)
+})
+
+// The control: what the user is meant to see stays in the running turn, unmarked.
+test('a message for the user answers in the running turn and stays visible', async (t) => {
+  const { agents, emit, tool, call, stop } = await start(team())
+  t.after(stop)
+
+  emit('b', 'turn/start', { turn: 1 })
+  await tool('message_bot', { to: 'Writer', message: 'tell them', reply_to: 'user' }, 'a')
+  const [kind, message] = agents.get('b').calls[0]
+  assert.equal(kind, 'followup')
+  assert.equal(message.source.audience, 'user')
+  emit('b', 'turn/start', { turn: 2 })
+  emit('b', 'user/message', { content: message.content, source: message.source })
+  emit('b', 'assistant/message', assistantText('here it is'))
+  emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  assert.equal((await call('state', {})).value.exchangeTurns.b, undefined)
+  assert.equal(agents.get('a')?.calls.length ?? 0, 0)
 })
 
 test('a Bot busy in a group gets the message in its own chat, and the sender is told', async (t) => {
