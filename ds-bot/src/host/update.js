@@ -116,7 +116,7 @@ export function install(rt) {
 
   const status = {
     name: PKG.name, current: PKG.version, latest: null, source: 'unknown', notesUrl: releasesUrl(),
-    checkedAt: 0, phase: 'idle', installed: null, error: null,
+    checkedAt: 0,
   }
   // Where the newest version was found, and the spec that installs it.
   let target = null
@@ -125,8 +125,8 @@ export function install(rt) {
   const view = () => ({
     name: status.name, current: status.current, latest: status.latest, source: status.source, notesUrl: status.notesUrl,
     repoUrl: repoUrl(), enabled,
-    checkedAt: status.checkedAt, phase: status.phase, installed: status.installed, error: status.error,
-    available: status.phase !== 'installed' && status.phase !== 'updated' && target !== null && status.latest !== null && newer(status.latest, status.current),
+    checkedAt: status.checkedAt,
+    available: target !== null && status.latest !== null && newer(status.latest, status.current),
   })
 
   // Asked only while the About page is open, so a closed page never calls GitHub.

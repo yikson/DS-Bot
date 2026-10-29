@@ -83,7 +83,6 @@ test('a registry check finds the newest version without installing it', async ()
   assert.equal(view.notesUrl, 'https://github.com/Fei2411/DS-Bot/releases')
   assert.throws(() => rt.updateStart(), { message: SELF_UPDATE_REFUSAL })
   assert.deepEqual(installs, [])
-  assert.equal(rt.updateView().phase, 'idle')
   assert.equal(rt.updateView().available, true)
 })
 
@@ -222,7 +221,6 @@ test('all direct update starts refuse without calling the plugin manager or writ
     assert.deepEqual(installs, [])
     assert.deepEqual(removes, [])
     assert.equal(readFileSync(marker, 'utf8'), oldNote)
-    assert.equal(rt.updateView().phase, 'idle')
   }
   assert.equal(existsSync(marker), true)
 })

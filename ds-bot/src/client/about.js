@@ -17,10 +17,6 @@ const starCount = count => new Intl.NumberFormat(dateLocale(), { notation: 'comp
 
 function botHint(update) {
   if (update.available) return `${t('DS Bot {version} is available', { version: update.latest })}. ${t('Stop DSH and follow the out-of-band update procedure in the README.')}`
-  if (update.phase === 'installing') return t('Updating DS Bot…')
-  if (update.phase === 'installed') return t('Restart DSH to start using DS Bot {version}.', { version: update.installed ?? update.latest })
-  if (update.phase === 'updated') return t('DS Bot {version} is installed.', { version: update.installed ?? update.latest })
-  if (update.phase === 'failed') return t('The update did not finish: {reason}', { reason: hostText(update.error ?? '') })
   if (update.source === 'app') return t('Updates come with the DeepSeek Bot app.')
   if (update.enabled === false) return t('Update checks are off.')
   if (update.source === 'path') return t('Installed from a local folder; update it there.')
@@ -78,11 +74,10 @@ export function AboutPage({ useUpdate, actions, run, Section, Row }) {
     setChecking(true)
     void run(actions.checkUpdate()).then((done) => { setChecking(false); if (done) setCheer(true) })
   }
-  const phase = update.phase ?? 'idle'
   const dsh = update.dsh
   const dshPhase = dsh?.phase ?? 'idle'
-  useEffect(() => { if (phase === 'installed' || phase === 'updated' || dshPhase === 'installed') setCheer(true) }, [phase, dshPhase])
-  const markState = checking ? 'searching' : phase === 'installing' || dshPhase === 'installing' ? 'working' : cheer ? 'done' : 'idle'
+  useEffect(() => { if (dshPhase === 'installed') setCheer(true) }, [dshPhase])
+  const markState = checking ? 'searching' : dshPhase === 'installing' ? 'working' : cheer ? 'done' : 'idle'
   // Same rule as the sidebar card.
   const dshNew = showsDshRow(dsh, update.app)
   const dshShown = dshNew && dsh.available
@@ -95,7 +90,7 @@ export function AboutPage({ useUpdate, actions, run, Section, Row }) {
         ? h('button', { type: 'button', className: 'bt-soft bt-soft-sm', onClick: () => run(actions.openOwnApp()) }, t('Download'))
         : null
   const botControl = ownRow !== null ? ownControl
-    : phase === 'installed' || phase === 'updated' || update.source === 'app' ? null
+    : update.source === 'app' ? null
     : h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: checking || update.enabled === false, onClick: check }, checking ? t('Checking…') : t('Check for updates'))
   const dshControl = !dshNew || dshPhase === 'installed' ? null
     : dsh.kind === 'app'

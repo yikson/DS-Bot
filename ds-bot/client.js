@@ -543,13 +543,8 @@ var ZH = {
   "{n} d": "{n} 天",
   // Plugin updates
   "DS Bot {version} is available": "DS Bot {version} 可以更新",
-  "Updating DS Bot…": "正在更新 DS Bot…",
-  "DS Bot {version} is installed. Restart DSH to use it.": "DS Bot {version} 已安装，重启 DSH 后生效",
-  "DS Bot {version} is installed.": "DS Bot {version} 已安装。",
   "DS Bot update": "DS Bot 更新",
   "DS Bot {version}": "DS Bot {version}",
-  "Update installed": "更新已安装",
-  "Restart DSH to start using DS Bot {version}.": "重启 DSH 后开始使用 DS Bot {version}。",
   "You have {version}.": "当前版本 {version}。",
   "The update did not finish: {reason}": "更新没有完成：{reason}",
   "What's new": "更新说明",
@@ -8949,7 +8944,6 @@ function UpdateButton({ useUpdate, actions }) {
       window.removeEventListener("keydown", onKey, true);
     };
   }, [open]);
-  const phase = update?.phase ?? "idle";
   const dsh = update?.dsh;
   const dshPhase = dsh?.phase ?? "idle";
   const dshRow = showsDshRow(dsh, update?.app);
@@ -8959,14 +8953,13 @@ function UpdateButton({ useUpdate, actions }) {
     const rect = button.current?.getBoundingClientRect();
     if (rect) setBox({ left: Math.max(8, Math.min(rect.left, window.innerWidth - 288)), top: rect.bottom + 6 });
   }, [open, tick]);
-  if (!update?.available && !dshRow && phase === "idle" && dshPhase === "idle") return null;
-  const cloudPhase = phase === "installing" || dshPhase === "installing" ? "installing" : phase !== "idle" ? phase : dshPhase;
+  if (!update?.available && !dshRow && dshPhase === "idle") return null;
   const toggle = () => setOpen((value) => !value);
   const startDsh = () => {
     setDshError("");
     void actions.installDshUpdate().catch((failure) => setDshError(hostText(failure?.message ?? String(failure))));
   };
-  const label = phase === "installing" ? t("Updating DS Bot…") : dshPhase === "installing" ? t("Updating DSH…") : phase === "installed" ? t("DS Bot {version} is installed. Restart DSH to use it.", { version: update.installed ?? update.latest }) : phase === "updated" ? t("DS Bot {version} is installed.", { version: update.installed ?? update.latest }) : dshPhase === "installed" ? t("Restart DSH to start using DSH {version}.", { version: dsh.installed ?? dsh.verified }) : update?.available ? t("DS Bot {version} is available", { version: update.latest }) : t("DSH {version} is available", { version: dsh?.verified });
+  const label = dshPhase === "installing" ? t("Updating DSH…") : dshPhase === "installed" ? t("Restart DSH to start using DSH {version}.", { version: dsh.installed ?? dsh.verified }) : update?.available ? t("DS Bot {version} is available", { version: update.latest }) : t("DSH {version} is available", { version: dsh?.verified });
   const dshMessage = dshError || (dshPhase === "failed" ? dsh?.error : "");
   const dshText = dshPhase === "installed" ? t("Restart DSH to start using DSH {version}.", { version: dsh.installed ?? dsh.verified }) : dsh?.available === false && dsh?.blockedBy ? t("Update DS Bot {version} first.", { version: dsh.blockedBy }) : t("You have {version}.", { version: dsh?.current });
   return (0, import_react15.createElement)(
@@ -8976,21 +8969,21 @@ function UpdateButton({ useUpdate, actions }) {
       ref: button,
       type: "button",
       className: "bt-round bt-update",
-      "data-phase": cloudPhase,
+      "data-phase": dshPhase,
       "aria-label": label,
       title: label,
       "aria-haspopup": "dialog",
       "aria-expanded": open,
       onClick: toggle
-    }, (0, import_react15.createElement)(CloudDownloadIcon, { done: phase === "installed" || phase === "updated" }), phase === "failed" || dshPhase === "failed" ? (0, import_react15.createElement)("span", { className: "bt-update-dot", "aria-hidden": true }) : null),
+    }, (0, import_react15.createElement)(CloudDownloadIcon, { done: dshPhase === "installed" }), dshPhase === "failed" ? (0, import_react15.createElement)("span", { className: "bt-update-dot", "aria-hidden": true }) : null),
     open && box ? (0, import_react_dom3.createPortal)((0, import_react15.createElement)(
       "div",
-      { className: "bt-update-pop", role: "dialog", "aria-label": update?.available || phase !== "idle" ? t("DS Bot update") : t("DSH update"), style: box },
-      update?.available || phase !== "idle" ? (0, import_react15.createElement)(
+      { className: "bt-update-pop", role: "dialog", "aria-label": update?.available ? t("DS Bot update") : t("DSH update"), style: box },
+      update?.available ? (0, import_react15.createElement)(
         import_react15.Fragment,
         null,
-        (0, import_react15.createElement)("div", { className: "bt-update-title" }, phase === "installed" || phase === "updated" ? t("Update installed") : t("DS Bot {version}", { version: update.latest })),
-        (0, import_react15.createElement)("div", { className: "bt-update-text" }, phase === "installed" ? t("Restart DSH to start using DS Bot {version}.", { version: update.installed ?? update.latest }) : phase === "updated" ? t("DS Bot {version} is installed.", { version: update.installed ?? update.latest }) : t("You have {version}.", { version: update.current })),
+        (0, import_react15.createElement)("div", { className: "bt-update-title" }, t("DS Bot {version}", { version: update.latest })),
+        (0, import_react15.createElement)("div", { className: "bt-update-text" }, t("You have {version}.", { version: update.current })),
         (0, import_react15.createElement)("div", { className: "bt-update-text" }, t("Stop DSH and follow the out-of-band update procedure in the README.")),
         (0, import_react15.createElement)(
           "div",
@@ -15332,10 +15325,6 @@ var CHEER_MS = 1800;
 var starCount = (count) => new Intl.NumberFormat(dateLocale(), { notation: "compact", maximumFractionDigits: 1 }).format(count);
 function botHint(update) {
   if (update.available) return `${t("DS Bot {version} is available", { version: update.latest })}. ${t("Stop DSH and follow the out-of-band update procedure in the README.")}`;
-  if (update.phase === "installing") return t("Updating DS Bot…");
-  if (update.phase === "installed") return t("Restart DSH to start using DS Bot {version}.", { version: update.installed ?? update.latest });
-  if (update.phase === "updated") return t("DS Bot {version} is installed.", { version: update.installed ?? update.latest });
-  if (update.phase === "failed") return t("The update did not finish: {reason}", { reason: hostText(update.error ?? "") });
   if (update.source === "app") return t("Updates come with the DeepSeek Bot app.");
   if (update.enabled === false) return t("Update checks are off.");
   if (update.source === "path") return t("Installed from a local folder; update it there.");
@@ -15400,18 +15389,17 @@ function AboutPage({ useUpdate, actions, run: run2, Section, Row: Row3 }) {
       if (done) setCheer(true);
     });
   };
-  const phase = update.phase ?? "idle";
   const dsh = update.dsh;
   const dshPhase = dsh?.phase ?? "idle";
   (0, import_react38.useEffect)(() => {
-    if (phase === "installed" || phase === "updated" || dshPhase === "installed") setCheer(true);
-  }, [phase, dshPhase]);
-  const markState = checking ? "searching" : phase === "installing" || dshPhase === "installing" ? "working" : cheer ? "done" : "idle";
+    if (dshPhase === "installed") setCheer(true);
+  }, [dshPhase]);
+  const markState = checking ? "searching" : dshPhase === "installing" ? "working" : cheer ? "done" : "idle";
   const dshNew = showsDshRow(dsh, update.app);
   const dshShown = dshNew && dsh.available;
   const ownRow = update.source === "app" ? ownAppRow(update.ownApp) : null;
   const ownControl = ownRow?.button === "restart" ? (0, import_react38.createElement)("button", { type: "button", className: "bt-fb-primary", onClick: () => run2(actions.installOwnApp()) }, t("Restart to update")) : ownRow?.button === "check" ? (0, import_react38.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", onClick: () => run2(actions.checkOwnApp()) }, t("Check for updates")) : ownRow?.button === "open" ? (0, import_react38.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", onClick: () => run2(actions.openOwnApp()) }, t("Download")) : null;
-  const botControl = ownRow !== null ? ownControl : phase === "installed" || phase === "updated" || update.source === "app" ? null : (0, import_react38.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: checking || update.enabled === false, onClick: check }, checking ? t("Checking…") : t("Check for updates"));
+  const botControl = ownRow !== null ? ownControl : update.source === "app" ? null : (0, import_react38.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: checking || update.enabled === false, onClick: check }, checking ? t("Checking…") : t("Check for updates"));
   const dshControl = !dshNew || dshPhase === "installed" ? null : dsh.kind === "app" ? dsh.available ? (0, import_react38.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", onClick: () => run2(actions.openAppUpdates(dsh.verified)) }, t("Open updates")) : null : dsh.available || dshPhase !== "idle" ? (0, import_react38.createElement)(
     "button",
     { type: "button", className: "bt-fb-primary", disabled: dshPhase === "installing", onClick: () => run2(actions.installDshUpdate()) },
@@ -19382,7 +19370,7 @@ function apply(ctx) {
       document.removeEventListener("visibilitychange", wake);
     };
   }, "ds-bot: roster poll");
-  const update = createSource({ available: false, phase: "idle" });
+  const update = createSource({ available: false });
   let wakeUpdate = () => {
   };
   ctx.effect(() => {
@@ -19394,7 +19382,7 @@ function apply(ctx) {
       const value = await call("update-check", { fresh: false }).catch(() => null);
       if (stopped) return;
       if (value) update.set((previous) => ({ ...value, app: previous.app, ownApp: previous.ownApp }));
-      timer = setTimeout(loop, value?.phase === "installing" || value?.dsh?.phase === "installing" ? 2e3 : 60 * 6e4);
+      timer = setTimeout(loop, value?.dsh?.phase === "installing" ? 2e3 : 60 * 6e4);
     };
     wakeUpdate = loop;
     void loop();
