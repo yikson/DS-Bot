@@ -28,6 +28,23 @@ const seed = () => ({
 // One DS Bot host on `home`; a second start on the same home is a restart.
 // Hosts by home: a home is removed only after its hosts stopped and their writes landed.
 const started = new Map()
+const testByHome = new Map()
+
+// A Windows file replace can wait on the mocked clock while stop() waits for the write.
+// Keep that clock moving until stopping has finished.
+async function stopHost(t, stopping) {
+  let finished = false
+  stopping.then(() => { finished = true }, () => { finished = true })
+  while (!finished) {
+    try {
+      t.mock.timers.tick(100)
+    } catch (error) {
+      if (error?.code !== 'ERR_INVALID_STATE') throw error
+    }
+    await realDelay(10)
+  }
+  return stopping
+}
 
 // The durable logs DSH keeps, by Session: what a Session's turns did and said.
 // `inspect` stands in for DSH reading that log, when a test cannot read it.
@@ -69,7 +86,8 @@ async function start(home, logs, inspect) {
   const askApproval = sessionId => ctx.listeners.get('approval/request')[0]({ agent: { session: { id: sessionId } }, toolName: 'pwsh', reason: 'escalate sandbox' }, () => 'from-dsh')
   const call = async (endpoint, payload) => (await route.fetch(new Request('http://localhost/api/bot', { method: 'POST', body: JSON.stringify({ endpoint, payload }) }))).json()
   await tool('list_bots', {}, 'a')
-  const host = { ctx, agentOf, emit, tool, call, askApproval, stop: () => ctx.dispose() }
+  const t = testByHome.get(home)
+  const host = { ctx, agentOf, emit, tool, call, askApproval, stop: () => stopHost(t, ctx.dispose()) }
   started.set(home, [...(started.get(home) ?? []), host])
   return host
 }
@@ -92,10 +110,12 @@ async function stopHosts(t, hosts) {
 
 const freshHome = (t, state = seed()) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-follow-'))
+  testByHome.set(home, t)
   writeFileSync(join(home, 'state.json'), JSON.stringify(state))
   t.after(async () => {
     await stopHosts(t, started.get(home) ?? [])
     started.delete(home)
+    testByHome.delete(home)
     rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
   })
   return home
