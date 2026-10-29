@@ -68,6 +68,13 @@ export function validateTask(task, id) {
   require(task.closedAt === null || Number.isFinite(task.closedAt), 'invalid closedAt')
   require(task.conclusion === null || record(task.conclusion), 'invalid conclusion')
   require(record(task.creationIntents) && record(task.pendingSends), 'creationIntents and pendingSends must be maps')
+  require(task.sends === undefined || record(task.sends), 'send history must be a map')
+  for (const [deliveryId, send] of Object.entries(task.sends ?? {})) {
+    require(record(send) && record(send.args) && send.args.taskId === id && send.args.exchangeId === deliveryId
+      && Object.hasOwn(task.participants, send.args.toId), 'invalid saved send identity')
+    require(send.delivery?.summaryId === deliveryId, 'invalid saved delivery id')
+    validateDeliveryUpdate(undefined, send.delivery)
+  }
   for (const [requestId, intent] of Object.entries(task.creationIntents)) {
     require(record(intent) && text(requestId) && intent.requestId === requestId && intent.taskId === id, 'invalid creation request identity')
     require(text(intent.botId) && Object.hasOwn(task.participants, intent.botId)

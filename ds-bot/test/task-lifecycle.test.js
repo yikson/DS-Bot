@@ -348,6 +348,27 @@ test('named request receipts retain the selected task id without changing replay
   await f.send(task.sessions.a, 'B', { request_id: 'followup' })
   assert.equal(f.agentOf(task.sessions.b).calls.length, count)
 })
+test('merged updates confirm both the operation and the stable original delivery id', async t => {
+  const f = await opened(t)
+  f.handling(f.task.sessions.b, f.incoming(f.task.sessions.b))
+  await f.send(f.task.sessions.b, 'C', { message: 'first child' })
+  await f.send(f.task.sessions.b, 'C', { message: 'update child' })
+  const sends = Object.values(f.rt.taskOf(f.task.id).sends)
+  assert.equal(sends.length, 3)
+  assert.equal(sends.every(send => send.delivery.state === 'delivered'), true)
+})
+test('malformed send identities cannot claim a task or replace its recorded target history', async t => {
+  const f = await opened(t)
+  const id = Object.keys(f.rt.taskOf(f.task.id).sends)[0]
+  await assert.rejects(f.rt.commitTask(f.task.id, task => {
+    task.sends[id].args.exchangeId = 'another'
+    return task
+  }), /send identity/)
+  await assert.rejects(f.rt.commitTask(f.task.id, task => {
+    task.sends[id].delivery.targets.push({ sessionId: task.sessions.b, state: 'pending' })
+    return task
+  }), /unique/)
+})
 for (const removed of ['a', 'b', 'c']) {
   test(`removing participant ${removed} archives only that Bot's owned task Sessions`, async t => {
     const f = await opened(t)

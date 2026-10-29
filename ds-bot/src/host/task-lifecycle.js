@@ -158,12 +158,16 @@ export function install(rt) {
   }
   async function runDelivery(args, receipt, enqueue) {
     check()
+    const operationId = args.exchangeId
     await prepare(args)
     if (await alreadyPresent(args)) { receipt.present = true; return args.exchangeId }
     check()
     const result = await enqueue()
     check()
-    if (!receipt.skipped) await acknowledge(args, args.sessionId)
+    if (!receipt.skipped) {
+      if (ledgerOf(taskOf(args.taskId), args)) await acknowledge(args, args.sessionId)
+      if (operationId !== args.exchangeId) await acknowledge({ ...args, exchangeId: operationId }, args.sessionId)
+    }
     return result
   }
   async function recordLate(id, sessionId, exchangeId, text = '') {
