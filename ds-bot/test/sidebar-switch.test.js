@@ -281,8 +281,9 @@ test('the sidebar keeps work branch sessions open while redirecting earlier chat
   const bot = { id: 'ada', name: 'ADA', sessionId: 'current', parts: ['earlier'], workBranches: {
     task: { sessionId: 'branch', state: 'open' }, closed: { sessionId: 'closed-branch', state: 'closed' },
   } }
-  const roster = { bots: [bot], rooms: [], agents: [], byId: { ada: bot, current: bot, earlier: bot, branch: bot, 'closed-branch': bot }, ready: true, mainBotId: bot.id }
-  for (const id of ['branch', 'closed-branch', 'current', 'earlier']) {
+  const roster = { bots: [bot], rooms: [], agents: [], taskSessions: { 'task-owned': 't1', 'closed-task': 't2' },
+    byId: { ada: bot, current: bot, earlier: bot, branch: bot, 'closed-branch': bot, 'task-owned': bot, 'closed-task': bot }, ready: true, mainBotId: bot.id }
+  for (const id of ['branch', 'closed-branch', 'current', 'earlier', 'task-owned', 'closed-task']) {
     const calls = []
     passiveEffects = []
     try {

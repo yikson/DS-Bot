@@ -210,7 +210,7 @@ test('TEAM_TOOLS names exactly the global and task-scoped tools ds-bot registers
   await Promise.all(createdAgents({ agent: { id: 'm1', session: { id: 'm1' }, ctx: scope } }))
   assert.equal(ctx.registeredTools.has('list_tasks'), false)
   assert.deepEqual([...scope.registeredTools.keys()], ['list_tasks', 'message_bot'])
-  assert.deepEqual([...new Set([...ctx.registeredTools.keys(), ...scope.registeredTools.keys()])].sort(), [...TEAM_TOOLS].sort())
+  assert.deepEqual([...new Set([...ctx.registeredTools.keys(), ...scope.registeredTools.keys()])].sort(), TEAM_TOOLS.filter(name => name !== 'close_task').sort())
 })
 
 test('agent-session honors a known workspace and falls back to the team workspace', async (t) => {

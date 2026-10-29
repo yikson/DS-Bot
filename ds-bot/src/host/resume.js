@@ -169,12 +169,20 @@ export function install(rt) {
     failureTimers.delete(exchangeId)
     delete pendingResumes[exchangeId]
   }
-  const openResume = record => record.work === undefined || rt.ownsWork(record.args.toId, record.work)
+  const openResume = record => (!record.args.taskId || rt.taskOf(record.args.taskId)?.state === 'open')
+    && (record.work === undefined || rt.ownsWork(record.args.toId, record.work))
   const workOfDelivery = args => args.work ?? (args.role === 'request' && args.audience !== 'user' ? args.exchangeId : undefined)
   const queuedFailures = () => [...Object.values(interrupted.queued), ...Object.values(queued)].flat().filter(item => item.args.failureResumes !== undefined)
   const hasFailureResume = work => Object.values(pendingResumes).some(record => record.work === work)
     || queuedFailures().some(item => workOfDelivery(item.args) === work)
   rt.failureResumePending = (exchangeId, attempt) => queuedFailures().some(item => item.args.exchangeId === exchangeId && item.args.failureResumes === attempt)
+  rt.taskFailureResumes = id => Object.values(pendingResumes).some(record => record.args.taskId === id)
+    || queuedFailures().some(item => item.args.taskId === id)
+  rt.cancelTaskFailureResumes = id => {
+    for (const [exchangeId, record] of Object.entries(pendingResumes)) if (record.args.taskId === id) forgetResume(exchangeId)
+    for (const { args } of queuedFailures()) if (args.taskId === id) forgetQueued(args.exchangeId)
+    persist()
+  }
   const armResume = (exchangeId, record) => {
     safe.clearTimeout(failureTimers.get(exchangeId))
     const timer = safe.setTimeout(() => {
@@ -192,6 +200,7 @@ export function install(rt) {
   }
   rt.scheduleFailureResume = ({ work, args }) => {
     if (stopped || rt.readOnly() !== undefined) return
+    if (args.taskId && rt.taskOf(args.taskId)?.state !== 'open') return
     const exchangeId = args.exchangeId ?? randomUUID()
     const record = { due: Date.now() + FAILURE_RESUME_DELAY_MS, ...(work ? { work } : {}), args: { ...args, exchangeId } }
     pendingResumes[exchangeId] = record
@@ -305,6 +314,11 @@ export function install(rt) {
 
   async function resumeTurn(sessionId, record) {
     if (stopped) return
+    const legacy = rt.branchOf?.(sessionId) ?? rt.branchForWork?.(record.trigger?.exchangeId)
+    if (legacy && legacy.state !== 'open') {
+      rt.warn('ds-bot: terminal legacy branch %s is display-only; interrupted work requires inspection', legacy.id)
+      return
+    }
     const bot = rt.botOf(record.botId)
     if (bot === undefined) return
     const text = resumeText(record)
@@ -321,6 +335,7 @@ export function install(rt) {
     if (record.resumed) return
     const trigger = record.trigger
     const taskId = trigger?.taskId ?? rt.taskForSession?.(sessionId)?.id
+    if (taskId && rt.taskOf(taskId)?.state !== 'open') return
     const work = rt.workOf(trigger)
     if (work !== undefined && (hasFailureResume(work)
       || [...rt.live.values()].some(entry => entry.turn !== undefined && rt.workOf(entry.info) === work))) return
@@ -341,7 +356,11 @@ export function install(rt) {
       if (rt.isBotSession(sessionId)) return sessionId
       return args.roomId === undefined ? rt.chatOf(args.toId) : rt.roomOf(args.roomId)?.sessions?.[args.toId]
     }
-    const fresh = list.filter(item => Date.now() - item.at < QUEUED_KEPT_MS && rt.botOf(item.args?.toId) !== undefined
+    const routable = args => {
+      const branch = rt.branchOf?.(args.sessionId) ?? rt.branchOf?.(args.replySessionId) ?? rt.branchForWork?.(args.replyTo ?? args.exchangeId)
+      return !branch || branch.state === 'open'
+    }
+    const fresh = list.filter(item => routable(item.args) && Date.now() - item.at < QUEUED_KEPT_MS && rt.botOf(item.args?.toId) !== undefined
       && current(item.args) !== undefined && taken?.has(item.args.exchangeId) !== true)
     if (fresh.length === 0) return
     const target = current(fresh[0].args)
@@ -376,6 +395,16 @@ export function install(rt) {
     const trigger = record.trigger
     if (trigger === undefined) return
     const workId = rt.workOf(trigger)
+    const task = trigger.taskId && rt.taskOf(trigger.taskId)
+    if (task && task.state !== 'open') {
+      if (task.closedBy?.sessionId === sessionId && task.closedBy.turn === ended.turn) return
+      if (!workId || ended.reason?.kind === 'interrupted' || ended.reason?.reason?.kind === 'disposed') return
+      const events = await logOf(sessionId)
+      if (stopped || !events) return
+      const turn = turnOf(events, trigger.exchangeId)
+      if (turn) await rt.withTask(task.id, () => rt.recordTaskLateReply(task.id, sessionId, workId, turn.texts.join('\n\n')))
+      return
+    }
     if (!rt.ownsWork(record.botId, workId)) return
     const exchangeId = trigger.exchangeId
     const asker = rt.workAsker(workId)
@@ -459,6 +488,10 @@ export function install(rt) {
       for (const branch of Object.values(bot.workBranches ?? {})) {
         try {
           if (rt.creatingBranches.has(branch.id)) continue
+          if (branch.state === 'closed') {
+            if (branch.pendingDelivery || branch.conclusion && !branch.summaryDelivered) rt.warn('ds-bot: closed legacy branch %s has a pending delivery; inspect it manually', branch.id)
+            continue
+          }
           if (branch.state === 'creating') {
             branch.state = 'failed'
             await rt.save({ required: true })
@@ -483,6 +516,11 @@ export function install(rt) {
     }
     for (const [workId, work] of Object.entries(rt.state?.works ?? {})) {
       if (!work.pendingAnswer) continue
+      const branch = rt.branchForWork?.(workId) ?? rt.branchOf?.(work.pendingAnswer.args?.sessionId)
+      if (!work.taskId && branch?.state === 'closed') {
+        rt.warn('ds-bot: closed legacy reply %s requires inspection', workId)
+        continue
+      }
       try {
         await rt.resumeBranchAnswer(workId)
       } catch (error) { rt.warn('ds-bot: recovering reply %s failed: %s', workId, error) }
@@ -540,12 +578,16 @@ export function install(rt) {
     }).catch(error => rt.warn('ds-bot: loading pending failure resumes failed: %s', error)))
     let timer
     const hasBranches = bots => Object.values(bots ?? {}).some(bot => Object.keys(bot.workBranches ?? {}).length > 0)
+    const hasTasks = saved => Object.keys(saved?.tasks ?? {}).length > 0
     let pending = Object.keys(interrupted.turns).length > 0 || Object.keys(interrupted.queued).length > 0
-      || hasBranches(rt.state?.bots)
+      || hasBranches(rt.state?.bots) || hasTasks(rt.state)
     // Preserve the baseline timer and lazy load; disabled pairs can still have
     // persisted branches whose replies or conclusions need recovery.
     if (!pending && rt.statePath) {
-      try { pending = hasBranches(JSON.parse(readFileSync(rt.statePath, 'utf8')).bots) } catch {}
+      try {
+        const saved = JSON.parse(readFileSync(rt.statePath, 'utf8'))
+        pending = hasBranches(saved.bots) || hasTasks(saved)
+      } catch {}
     }
     if (pending) {
       timer = safe.setTimeout(() => safe.run('resume background job', () => resumeAll().catch(error => rt.warn('ds-bot: picking up interrupted work failed: %s', error))), RESUME_DELAY_MS)

@@ -41,7 +41,7 @@ export function install(rt) {
   const taskContext = sessionId => {
     const info = rt.live.get(sessionId)?.info
     const work = rt.state.works?.[rt.workOf(info)]
-    const ids = [rt.taskForSession(sessionId)?.id, info?.taskId, work?.taskId].filter(Boolean)
+    const ids = [rt.taskForSession(sessionId)?.id, info?.role === 'task-conclusion' ? undefined : info?.taskId, work?.taskId].filter(Boolean)
     if (new Set(ids).size > 1) throw new Error('Conflicting inherited task context')
     return ids[0]
   }
@@ -359,7 +359,9 @@ export function install(rt) {
     const work = rt.state.works?.[source.exchangeId]
     const taskId = source.taskId ?? work?.taskId
     return withTask(taskId, async enqueue => {
-      const task = openTask(taskId)
+      const task = rt.taskOf(taskId)
+      if (!task) throw new Error(`Unknown task "${taskId}"`)
+      if (task.state !== 'open') return rt.recordTaskLateReply(taskId, sessionId, source.exchangeId, text)
       const fromId = rt.selfOf(sessionId)
       if (!Object.hasOwn(task.participants, fromId)
         || (task.participants[fromId].kind !== 'trunk' && task.sessions[fromId] !== sessionId)) throw new Error('Reply is not from the task endpoint')
@@ -410,11 +412,14 @@ export function install(rt) {
         await withTask(task.id, enqueue => dispatchTask(task.id, args, {}, true, enqueue))
       }
     }
+    await rt.recoverTaskLifecycle?.()
   }
   Object.assign(rt, { taskContext, selectTaskRoute, routeTask, withTask, sendTask, sendTaskAnswer,
     resumeTaskAnswer, checkTaskDelivery, prepareTaskDelivery, recoverTaskCreations, recoverTasks })
   const deliver = rt.deliver
-  rt.deliver = (args, receipt, lane) => args.taskId && lane !== deliveryLane
-    ? withTask(args.taskId, () => deliver(args, receipt))
-    : deliver(args, receipt)
+  rt.deliver = (args, receipt = {}, lane) => {
+    const send = () => args.taskId && rt.runTaskDelivery
+      ? rt.runTaskDelivery(args, receipt, () => deliver(args, receipt)) : deliver(args, receipt)
+    return args.taskId && lane !== deliveryLane ? withTask(args.taskId, send) : send()
+  }
 }

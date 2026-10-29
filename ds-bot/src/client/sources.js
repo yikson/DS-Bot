@@ -19,6 +19,8 @@ export function createSource(initial) {
 export const EMPTY_ROSTER = { revision: -1, mainBotId: null, mainBotIds: [], bots: [], rooms: [], agents: [], exchangeTurns: {}, questions: {}, btwCards: {}, sideChats: {}, secrets: [], capabilities: [], capabilityStatuses: {}, secretRequests: {}, models: [], defaultModel: null, modelsKey: null, prefs: {}, byId: {}, roomsById: {}, agentsById: {}, agentOf: {}, ready: false }
 // Any Main Bot holds the Main Bot powers; `mainBotId`, the first one, is the sidebar tile.
 export const isMainOf = (roster, id) => id !== undefined && (roster.mainBotIds ?? []).includes(id)
+export const conversationTarget = (roster, id) => roster.taskSessions?.[id] ? id
+  : roster.byId[id]?.sessionId ?? roster.byId[id]?.id ?? id
 
 // A Bot's chat is a chain of Sessions ("parts"): the Bot id is its first part's id
 // and `sessionId` its current one. Every part id finds the Bot; Session state
@@ -29,6 +31,14 @@ export function indexRoster(value) {
     for (const id of [...(bot.parts ?? []), bot.sessionId ?? bot.id, bot.id]) byId[id] = bot
     for (const branch of Object.values(bot.workBranches ?? {})) if (branch.sessionId) byId[branch.sessionId] = bot
   }
+  const taskSessions = {}
+  for (const task of value.tasks ?? []) {
+    for (const [botId, sessionId] of Object.entries(task.sessions)) {
+      if (task.participants[botId].kind === 'trunk') continue
+      taskSessions[sessionId] = task.id
+      if (byId[botId]) byId[sessionId] = byId[botId]
+    }
+  }
   const roomsById = {}
   for (const room of value.rooms) roomsById[room.id] = room
   // The DSH Agent is not a Bot: it indexes by its own id and by each Session it owns.
@@ -38,7 +48,7 @@ export function indexRoster(value) {
     agentsById[agent.id] = agent
     for (const sessionId of agent.sessions ?? []) agentOf[sessionId] = agent.id
   }
-  return { ...value, agents: value.agents ?? [], byId, roomsById, agentsById, agentOf, ready: true }
+  return { ...value, tasks: value.tasks ?? [], taskSessions, agents: value.agents ?? [], byId, roomsById, agentsById, agentOf, ready: true }
 }
 
 // Whether a main-view Session id belongs to the team's DSH Agent: the conversation

@@ -32,6 +32,7 @@ export function install(rt) {
     if (resumed && role !== 'room') return `[Message from ${fromName} · DeepSeek Harness restarted while you were working on it]`
     if (role === 'reply') return `[Reply from ${fromName}${goesOn}]`
     if (role === 'branch-summary') return BRANCH_SUMMARY_HEADER
+    if (role === 'task-conclusion') return '[Task closed]'
     if (role === 'stopped') return `[Stopped by ${fromName}]`
     if (role === 'room') return `[Group chat "${roomName}" · ${note}]`
     if (role === 'report') return `[Group chat "${roomName}" · replies to your post${goesOn}]`
@@ -118,7 +119,7 @@ export function install(rt) {
       agent = await resolveAgent(targetSessionId)
       if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
       const task = taskId && rt.taskOf(taskId)
-      if (task?.participants[toId]?.kind === 'trunk' && rt.chatOf(toId) !== targetSessionId) continue
+      if ((role === 'task-conclusion' || task?.participants[toId]?.kind === 'trunk') && rt.chatOf(toId) !== targetSessionId) continue
       break
     }
     const branch = rt.branchOf?.(targetSessionId)
@@ -167,7 +168,7 @@ export function install(rt) {
     const task = taskId && rt.taskOf(taskId)
     const message = createUserMessage({
       content: [
-        { type: 'text', text: `${headerFor(role, fromName, room?.name, audience, note, deferred, { resumed, retried, asker, failureResumes })}\n${task ? `${taskBrief(task)}\n` : ''}${branch ? `[Work branch: ${branch.title}]\nBranch: ${branch.id}\n` : ''}${text}` },
+        { type: 'text', text: role === 'task-conclusion' ? text : `${headerFor(role, fromName, room?.name, audience, note, deferred, { resumed, retried, asker, failureResumes })}\n${task ? `${taskBrief(task)}\n` : ''}${branch ? `[Work branch: ${branch.title}]\nBranch: ${branch.id}\n` : ''}${text}` },
         ...files.map(attachment => ({ type: 'file', attachment })),
       ],
       source,

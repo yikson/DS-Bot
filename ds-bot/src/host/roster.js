@@ -617,12 +617,14 @@ export function install(rt) {
     const bot = rt.botOf(id)
     if (bot === undefined) throw new Error('Unknown Bot')
     if (rt.isMain(id)) throw new Error('A Main Bot cannot be deleted; remove its Main Bot role first')
+    await rt.removeTaskBot?.(id)
     // Before the Bot and its group Sessions leave the state, which the archive reads.
     const archived = rt.archiveBotMemory(id)
     const current = rt.chatOf(id)
     // Session state and armed tasks belong to branches too, including closed ones.
     const parts = new Set([id, current, ...(bot.segments ?? []).map(segment => segment.sessionId),
-      ...Object.values(bot.workBranches ?? {}).map(branch => branch.sessionId).filter(Boolean)])
+      ...Object.values(bot.workBranches ?? {}).map(branch => branch.sessionId).filter(Boolean),
+      ...[...rt.taskOwners].filter(([, owner]) => owner.botId === id).map(([sessionId]) => sessionId)])
     await rt.releaseBot(id, [...parts, ...rt.groupSessionsOf(id)])
     delete state.bots[id]
     for (const part of parts) {

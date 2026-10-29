@@ -148,8 +148,8 @@ export function install(rt) {
         if (previous.mode !== next.mode || previous.requester !== next.requester || previous.assignee !== next.assignee
           || JSON.stringify(previous.capabilityAtCreation) !== JSON.stringify(next.capabilityAtCreation)) throw new Error('Task creation identity is immutable')
         if (previous.state !== 'open') {
-          const { lateReplies: before, delivery: oldDelivery, ...closed } = previous
-          const { lateReplies: after, delivery, ...changed } = next
+          const { lateReplies: before, delivery: oldDelivery, sends: oldSends, ...closed } = previous
+          const { lateReplies: after, delivery, sends, ...changed } = next
           const { ids: oldIds, count: _oldCount, results: oldResults = [], ...oldExtra } = before
           const { ids, count: _count, results = [], ...extra } = after
           const added = ids.length - oldIds.length
@@ -163,6 +163,14 @@ export function install(rt) {
             throw new Error('A terminal task may only append late replies or update conclusion delivery')
           }
           validateDeliveryUpdate(oldDelivery, delivery)
+          if (!isDeepStrictEqual(oldSends, sends)) {
+            if (!record(sends) || !isDeepStrictEqual(Object.keys(oldSends ?? {}), Object.keys(sends))) throw new Error('A terminal task cannot add sends')
+            for (const [id, saved] of Object.entries(oldSends)) {
+              if (!isDeepStrictEqual(saved.args, sends[id].args)
+                || Object.keys(sends[id]).some(key => !['args', 'delivery'].includes(key))) throw new Error('A terminal task cannot change send identity')
+              validateDeliveryUpdate(saved.delivery, sends[id].delivery)
+            }
+          }
         }
         for (const [botId, participant] of Object.entries(previous.participants)) {
           if (!Object.hasOwn(next.participants, botId)) throw new Error('Task participants cannot be removed')

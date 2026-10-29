@@ -208,7 +208,7 @@ test('close delivers exactly one conclusion of at most 1000 Unicode code points'
   await assert.rejects(f.tool('close_work_branch', { status: 'done', conclusion: 'no' }, 'a'), /Only a work branch/)
 })
 
-test('closed but undelivered summary is recovered once on restart', async t => {
+test('closed legacy branch with an undelivered summary stays display-only on restart', async t => {
   const f = await setup(t)
   await f.send()
   const branch = f.branches()[0]
@@ -219,8 +219,8 @@ test('closed but undelivered summary is recovered once on restart', async t => {
   const restarted = await setup(t, { enabled: false, seed, logs: f.logs })
   await restarted.rt.resumeAll()
   await restarted.rt.resumeAll()
-  assert.equal(restarted.agentOf('a').calls.length, 1)
-  assert.equal(restarted.branches()[0].summaryDelivered, true)
+  assert.equal(restarted.agentOf('a').calls.length, 0)
+  assert.equal(restarted.branches()[0].summaryDelivered, false)
 })
 
 test('summary persisted in inbox before its flag is recovered without a second delivery', async t => {
@@ -232,7 +232,7 @@ test('summary persisted in inbox before its flag is recovered without a second d
   const restarted = await setup(t, { enabled: false, seed: structuredClone(f.rt.state), logs: f.logs })
   await restarted.rt.resumeAll()
   assert.equal(restarted.agentOf('a').calls.length, 0)
-  assert.equal(restarted.branches()[0].summaryDelivered, true)
+  assert.equal(restarted.branches()[0].summaryDelivered, false)
 })
 
 test('turn answer is persisted before delivery and closed only after flush, with restart recovery', async t => {
@@ -537,7 +537,7 @@ test('trunk: close once', async t => {
   assert.equal(f.agentOf('a-next').calls[0].source.exchangeId, branch.summaryId)
 })
 
-test('trunk: recover once', async t => {
+test('closed legacy summary is not sent to a rotated trunk during recovery', async t => {
   const f = await setup(t)
   await f.send()
   f.rt.deliver = async () => { throw new Error('offline') }
@@ -548,7 +548,7 @@ test('trunk: recover once', async t => {
   await restarted.rt.resumeAll()
   await restarted.rt.resumeAll()
   assert.equal(restarted.agentOf('a').calls.length, 0)
-  assert.equal(restarted.agentOf('a-next').calls.length, 1)
+  assert.equal(restarted.agentOf('a-next').calls.length, 0)
 })
 
 test('trunks: deduplicate', async t => {
@@ -572,7 +572,7 @@ test('trunks: deduplicate', async t => {
       const restarted = await setup(t, { enabled: false, seed: structuredClone(f.rt.state), logs: f.logs })
       await restarted.rt.resumeAll()
       assert.equal(restarted.agentOf('a').calls.length + restarted.agentOf('a-next').calls.length, 0)
-      assert.equal(restarted.branches()[0].summaryDelivered, true)
+      assert.equal(restarted.branches()[0].summaryDelivered, false)
     })
   }
 })
