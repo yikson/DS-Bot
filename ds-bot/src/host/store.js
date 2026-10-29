@@ -468,9 +468,9 @@ export function install(rt) {
   }
   // The Bot a Session speaks for: its own chat, one of its group Sessions, or an
   // earlier segment of either.
-  const selfOf = id => chatOwners.get(id) ?? branchOwners.get(id)?.botId ?? groupOwners.get(id)?.botId ?? pastOwners.get(id)?.botId
+  const selfOf = id => chatOwners.get(id) ?? taskOwners.get(id)?.botId ?? branchOwners.get(id)?.botId ?? groupOwners.get(id)?.botId ?? pastOwners.get(id)?.botId
   // A Session where the Bot speaks now, as opposed to an archived segment.
-  const isBotSession = id => chatOwners.has(id) || branchOwners.has(id) || groupOwners.has(id)
+  const isBotSession = id => chatOwners.has(id) || taskOwners.has(id) || branchOwners.has(id) || groupOwners.has(id)
   const groupSessionsOf = botId => Object.values(state.rooms).map(room => room.sessions?.[botId]).filter(Boolean)
   const dropGroupSession = (room, botId) => {
     const sessionId = room.sessions?.[botId]

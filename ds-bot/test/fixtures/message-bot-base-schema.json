@@ -1,0 +1,45 @@
+{
+  "name": "message_bot",
+  "description": "Send a message to another Bot on the team. It reads a private message at its next step only while working privately on the same task and work; otherwise the message queues for its next turn. If it is idle, it starts on it right away. Its reply arrives later as a new message to you; with reply_to \"user\" it answers the user in its own chat instead. In a group chat it reaches only members of that group, as writing \"@Name\" there does. With request_id you name the request yourself: a repeat of that name with the same message is not sent again, but gives the receipt of the first call back.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "to": {
+        "type": "string",
+        "description": "Exact Bot name from list_bots"
+      },
+      "message": {
+        "type": "string",
+        "description": "Self-contained message; the other Bot cannot see this conversation"
+      },
+      "reply_to": {
+        "type": "string",
+        "description": "\"me\" (default): the reply comes back to you and the user does not see it. \"user\": the Bot answers the user in its own chat, where the user reads it, and nothing comes back to you. Use \"user\" whenever the user wants to hear from that Bot directly or asks Bots to say something in their own chats.",
+        "enum": [
+          "me",
+          "user"
+        ]
+      },
+      "when": {
+        "type": "string",
+        "description": "\"now\" (default): reads your message at its next step only in a private turn of the same task and work; otherwise it queues. \"queue\": always reads your message after its current work, as a separate turn. With reply_to \"user\" the message always queues.",
+        "enum": [
+          "now",
+          "queue"
+        ]
+      },
+      "request_id": {
+        "type": "string",
+        "description": "Your own name for this request, up to 200 characters, so that a repeat of it is not sent twice. Send the same request_id with the same message when you repeat a call: the receipt of the first call comes back and nothing is sent again. A request_id names one request: with other content it is refused."
+      },
+      "work": {
+        "type": "string",
+        "description": "For a configured work-branch pair, use an open branch id from list_bots or the work-branch prompt, or \"new\" for a separate task. Outside that branch's turn, one open branch is reused by default; multiple open branches require a choice. Ignored for unconfigured pairs."
+      }
+    },
+    "required": [
+      "to",
+      "message"
+    ]
+  }
+}
