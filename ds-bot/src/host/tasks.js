@@ -14,7 +14,7 @@ function validateDeliveryUpdate(before, after) {
   require(text(after.summaryId) && (before?.summaryId === undefined || after.summaryId === before.summaryId), 'summaryId is immutable once recorded')
   require(stages.includes(after.state) && Array.isArray(after.targets), 'invalid state or target history')
   require(after.targets.every(target => record(target) && Object.keys(target).every(key => ['sessionId', 'state'].includes(key))
-    && text(target.sessionId) && stages.includes(target.state)), 'invalid target record')
+    && text(target.sessionId) && (stages.includes(target.state) || target.state === 'cleared')), 'invalid target record')
   require(new Set(after.targets.map(target => target.sessionId)).size === after.targets.length, 'target Sessions must be unique')
   if (after.targetSessionId === undefined) {
     require(after.targets.length === 0 && after.state === 'pending'
@@ -26,8 +26,11 @@ function validateDeliveryUpdate(before, after) {
   const oldTargets = before?.targets ?? []
   require(Array.isArray(oldTargets) && after.targets.length >= oldTargets.length, 'target history cannot be removed')
   for (const [index, target] of oldTargets.entries()) {
-    require(after.targets[index].sessionId === target.sessionId
-      && stages.indexOf(after.targets[index].state) >= stages.indexOf(target.state), 'saved targets cannot be replaced or lose confirmations')
+    const next = after.targets[index]
+    require(next.sessionId === target.sessionId
+      && (target.state === 'cleared' ? next.state === 'cleared'
+        : next.state === 'cleared' || stages.indexOf(next.state) >= stages.indexOf(target.state)),
+    'saved targets cannot be replaced, lose confirmations or revive a cleared part')
   }
   for (const key of ['enqueuedAt', 'deliveredAt']) {
     require((after[key] === undefined || Number.isFinite(after[key]))
@@ -68,6 +71,13 @@ export function validateTask(task, id) {
   require(task.closedAt === null || Number.isFinite(task.closedAt), 'invalid closedAt')
   require(task.conclusion === null || record(task.conclusion), 'invalid conclusion')
   require(record(task.creationIntents) && record(task.pendingSends), 'creationIntents and pendingSends must be maps')
+  require(task.sends === undefined || record(task.sends), 'send history must be a map')
+  for (const [deliveryId, send] of Object.entries(task.sends ?? {})) {
+    require(record(send) && record(send.args) && send.args.taskId === id && send.args.exchangeId === deliveryId
+      && Object.hasOwn(task.participants, send.args.toId), 'invalid saved send identity')
+    require(send.delivery?.summaryId === deliveryId, 'invalid saved delivery id')
+    validateDeliveryUpdate(undefined, send.delivery)
+  }
   for (const [requestId, intent] of Object.entries(task.creationIntents)) {
     require(record(intent) && text(requestId) && intent.requestId === requestId && intent.taskId === id, 'invalid creation request identity')
     require(text(intent.botId) && Object.hasOwn(task.participants, intent.botId)
@@ -148,8 +158,8 @@ export function install(rt) {
         if (previous.mode !== next.mode || previous.requester !== next.requester || previous.assignee !== next.assignee
           || JSON.stringify(previous.capabilityAtCreation) !== JSON.stringify(next.capabilityAtCreation)) throw new Error('Task creation identity is immutable')
         if (previous.state !== 'open') {
-          const { lateReplies: before, delivery: oldDelivery, ...closed } = previous
-          const { lateReplies: after, delivery, ...changed } = next
+          const { lateReplies: before, delivery: oldDelivery, sends: oldSends, ...closed } = previous
+          const { lateReplies: after, delivery, sends, ...changed } = next
           const { ids: oldIds, count: _oldCount, results: oldResults = [], ...oldExtra } = before
           const { ids, count: _count, results = [], ...extra } = after
           const added = ids.length - oldIds.length
@@ -163,6 +173,14 @@ export function install(rt) {
             throw new Error('A terminal task may only append late replies or update conclusion delivery')
           }
           validateDeliveryUpdate(oldDelivery, delivery)
+          if (!isDeepStrictEqual(oldSends, sends)) {
+            if (!record(sends) || !isDeepStrictEqual(Object.keys(oldSends ?? {}), Object.keys(sends))) throw new Error('A terminal task cannot add sends')
+            for (const [id, saved] of Object.entries(oldSends)) {
+              if (!isDeepStrictEqual(saved.args, sends[id].args)
+                || Object.keys(sends[id]).some(key => !['args', 'delivery'].includes(key))) throw new Error('A terminal task cannot change send identity')
+              validateDeliveryUpdate(saved.delivery, sends[id].delivery)
+            }
+          }
         }
         for (const [botId, participant] of Object.entries(previous.participants)) {
           if (!Object.hasOwn(next.participants, botId)) throw new Error('Task participants cannot be removed')
@@ -178,6 +196,7 @@ export function install(rt) {
       rt.indexSessions()
       rt.validateTaskSessions(next)
       Object.defineProperty(rt.state.tasks, id, { value: structuredClone(next), enumerable: true, writable: true, configurable: true })
+      rt.indexSessions()
       // Like the rest of the store, failed writes retain dirty state for a later save.
       // Rolling back here could erase a task already captured by another queued save.
       await rt.save({ required: true })

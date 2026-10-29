@@ -659,13 +659,15 @@ export function install(rt) {
         // round or sender gets the real answer; a second time, the text goes on without
         // the call.
         const wroteCall = failure === undefined && reason?.kind === 'completed' && lastCalled !== true && writesToolCall(lastText)
-        const retry = wroteCall && info?.retried !== true && !(info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))
+        const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
+        const terminalTask = taskId && rt.taskOf(taskId)?.state !== 'open'
+        const retry = !terminalTask && wroteCall && info?.retried !== true && !(info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))
         if (retry) safe.run('turns background job', () => retryWrittenCall(id, info).catch(error => rt.warn('ds-bot: asking %s to run its written tool call failed: %s', id, error)))
         // A model call that failed on a transient fault is run again on the same trigger,
         // so whoever waits keeps waiting instead of hearing that the Bot gave up. A group
         // member's turn is left as it is: its round has a failure path of its own.
         const resumes = info?.failureResumes ?? 0
-        const resumeFailure = failure !== undefined && !rt.groupOwners.has(id) && info?.role !== 'room'
+        const resumeFailure = !terminalTask && failure !== undefined && !rt.groupOwners.has(id) && info?.role !== 'room'
           && TRANSIENT_FAILURE_CODES.has(failure.code) && resumes < FAILURE_RESUME_MAX
         if (resumeFailure) resumeFailedTurn(id, info, failure)
         // What is still said about the failure, to whoever waits for the reply.

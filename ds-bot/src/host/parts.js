@@ -763,6 +763,10 @@ export function install(rt) {
     // A retry after a forward that stopped halfway must not deliver the same input twice.
     const pending = [...agent.inbox.nextStep, ...agent.inbox.nextTurn]
     for (const message of messages) {
+      if (message.source?.taskId && rt.forwardTaskMessage) {
+        await rt.forwardTaskMessage(owner, message)
+        continue
+      }
       const kind = message.source?.kind
       // DSH's notice of a folder change is about the Session it was queued in; the part
       // that goes on has its own folder, which its handoff names.

@@ -1,7 +1,7 @@
 import { call } from './api.js'
 import { isHex, inkText, paintCss } from './inks.js'
 import { DEFAULT_MASK, SHAPES, markupCache, maskOf } from './characters.js'
-import { createSource, EMPTY_ROSTER, indexRoster, isAgentSession } from './sources.js'
+import { createSource, EMPTY_ROSTER, indexRoster, isAgentSession, conversationTarget } from './sources.js'
 import { teamActions } from './team-actions.js'
 import { themeCss, shellTokens, registry, registerShape, registerTheme, allThemes, layoutOf, widthOf, flatWidthOf } from './themes.js'
 import { MENTION_ORIGIN, currentPart } from './text.js'
@@ -366,10 +366,7 @@ export function apply(ctx) {
 
   const after = promise => promise.then(async (value) => { await pull().catch(() => {}); return value })
   // A Bot id, or any part of its chat, opens the Bot's current part.
-  const partFor = (id) => {
-    const bot = roster.getSnapshot().byId[id]
-    return bot ? currentPart(bot) : id
-  }
+  const partFor = id => conversationTarget(roster.getSnapshot(), id)
   // Sessions owned by an Agent, including ones adopted before the roster caught up.
   const agentSessions = (agentId) => {
     const ids = [...(roster.getSnapshot().agentsById[agentId]?.sessions ?? [])]

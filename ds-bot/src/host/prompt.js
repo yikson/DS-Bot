@@ -61,6 +61,7 @@ export function install(rt) {
           '\n## Task Session',
           taskBrief(task),
           'Every message_bot call stays in this task. Omit task or use this id; do not start another task or use a legacy work selector. Replies return to the actual calling Session.',
+          ...(task.requester === self ? ['When the task is settled, call close_task with a concise conclusion. Done requires evidence and no other open work; only this requester Session can close the task.'] : []),
         ] : []),
         ...(rt.branchOf?.(id) ? [
           '\n## Work branch',

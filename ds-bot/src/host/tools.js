@@ -163,15 +163,15 @@ export function install(rt) {
       && ((rt.config.taskSessionsEnabled === true && rt.taskCapabilities().has(self))
         || [...rt.taskById.values()].some(task => Object.hasOwn(task.participants, self)))
     const dispose = taskToolAgents.get(agent)
-    if (eligible && !dispose) {
-      const list = agent.ctx.tools.register(listTasks)
-      const message = agent.ctx.tools.register(taskMessageBot)
-      taskToolAgents.set(agent, () => { message(); list() })
-    }
-    else if (!eligible && dispose) {
-      dispose()
-      taskToolAgents.set(agent, undefined)
-    }
+    const task = rt.taskForSession(agent.session?.id)
+    const closer = task?.requester === self && task !== undefined || rt.branchOf(agent.session?.id)
+    const mode = `${eligible ? 1 : 0}:${closer ? 1 : 0}`
+    if (dispose?.mode === mode) return
+    dispose?.()
+    const stops = []
+    if (eligible) stops.push(agent.ctx.tools.register(listTasks), agent.ctx.tools.register(taskMessageBot))
+    if (closer) stops.push(agent.ctx.tools.register(closeTaskTool))
+    taskToolAgents.set(agent, stops.length ? Object.assign(() => stops.forEach(stop => stop()), { mode }) : undefined)
   }
   rt.syncTaskTools = () => { for (const agent of taskToolAgents.keys()) syncTaskTool(agent) }
   safe.effect(() => () => {
@@ -183,7 +183,8 @@ export function install(rt) {
   const activeSessions = (botId) => {
     const branches = Object.values(rt.botOf(botId)?.workBranches ?? {})
       .filter(branch => branch.state === 'open').map(branch => branch.sessionId).filter(Boolean)
-    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId), ...branches])]
+    const tasks = [...rt.taskOwners].filter(([, owner]) => owner.botId === botId).map(([sessionId]) => sessionId)
+    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId), ...branches, ...tasks])]
       .filter(sessionId => rt.live.get(sessionId)?.turn !== undefined)
     return { running, idle: running.length === 0 }
   }
@@ -335,6 +336,7 @@ export function install(rt) {
           ? await rt.routeBranch(sender, target, exec.agent?.id, text, toUser, choice.inherited ? undefined : workChoice)
           : await rt.routeTask(choice, sender, target, exec.agent?.id, text, args)
         const taskId = route.task?.id
+        if (request && taskId) rt.bindRequestTask(request, taskId)
         const chat = route.sessionId ?? rt.chatOf(target.id)
         const agent = await rt.resolveAgent(chat)
         const status = rt.statusOf(target.id)
@@ -356,6 +358,10 @@ export function install(rt) {
         const merge = combined === undefined ? undefined : { ...candidate, ...combined, files: [...combined.files, ...before.files] }
         const steer = args.when !== 'queue' && !toUser
         const exchangeId = route.exchangeId ?? randomUUID()
+        if (route.task) {
+          rt.taskLifecycleCheck()
+          if (rt.taskOf(taskId)?.state !== 'open') throw new Error('This task is not open')
+        }
         if (route.replySessionId && route.branch && !route.branch.workIds.includes(exchangeId)) {
           route.branch.workIds.push(exchangeId)
           rt.indexSessions()
@@ -412,6 +418,19 @@ export function install(rt) {
         description: 'An open task id from list_tasks, or "new" from an eligible root trunk. Inside a task, omit this or use its current id; new or different tasks are refused. Takes precedence over work.',
       },
     },
+  })
+  const closeTaskTool = defineTool({
+    name: 'close_task',
+    description: 'Root requester task Session only. Close the task and deliver one concise conclusion to its requester main chat. Done requires evidence and no other open work. In a legacy work branch this is an alias for close_work_branch.',
+    parameters: {
+      task: { type: 'string', description: 'Current task id; omit only in this task Session or a legacy work branch.' },
+      status: { type: 'string', required: true, enum: ['done', 'blocked', 'cancelled', 'failed'] },
+      conclusion: { type: 'string', required: true, description: 'Concise conclusion; the complete rendered conclusion is at most 1000 Unicode code points.' },
+      evidence: { type: 'string', description: 'PR, commit, test or path evidence; required for done.' },
+      link: { type: 'string', description: 'One URL, absolute path or Session link.' },
+    },
+    output,
+    execute: (args, exec) => rt.closeTask(exec.agent?.id, args),
   })
 
   ctx.tools.register(defineTool({

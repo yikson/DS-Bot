@@ -268,6 +268,7 @@ export function install(rt) {
       if (link !== undefined && (typeof link !== 'string' || /[\r\n]/.test(link) || !/^(?:https?:\/\/\S+|[A-Za-z]:[\\/].+|\\\\.+|(?:dsh|session):\S+)$/.test(link))) throw new Error('Link must be one URL, absolute path or Session link')
       const text = `[Work branch closed] ${branch.title}\nBranch: ${branch.id}\nStatus: ${status}\nConclusion: ${conclusion.trim()}\nLink: ${link || 'none'}`
       if (Array.from(`${BRANCH_SUMMARY_HEADER}\n${text}`).length > 1000) throw new Error('The complete conclusion must be at most 1000 characters')
+      if (branch.state === 'closed' && !branch.summaryDelivered) throw new Error('Closed legacy branch delivery requires inspection; it is not replayed')
       if (branch.state !== 'closed') {
         if (branch.state !== 'open') throw new Error('This work branch is not open')
         branch.state = 'closed'

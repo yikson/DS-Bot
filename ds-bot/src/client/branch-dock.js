@@ -9,8 +9,22 @@ export function BranchDock({ sessionId, useRoster, useWork, actions }) {
   const bot = roster.byId[sessionId]
   if (!bot || sessionId !== (bot.sessionId ?? bot.id)) return null
   const branches = Object.values(bot.workBranches ?? {}).filter(branch => branch.state !== 'closed')
-  if (!branches.length) return null
-  return h('div', { className: 'bt-branch-dock', 'aria-label': t('Work branches') }, branches.map(branch => {
+  const tasks = (roster.tasks ?? []).filter(task => task.participants[bot.id] && (task.state === 'open' || task.lateReplies.count > 0))
+  if (!branches.length && !tasks.length) return null
+  return h('div', { className: 'bt-branch-dock', 'aria-label': t('Tasks') }, ...tasks.map(task => {
+    const participant = task.participants[bot.id]
+    const endpoint = participant.kind === 'trunk' ? bot.sessionId ?? bot.id : task.sessions[bot.id]
+    const status = work.tasks?.[task.id]?.status ?? (task.state === 'open' ? task.phase === 'ready' ? 'Needs close' : 'Creating' : task.state)
+    const target = roster.byId[task.requester === bot.id ? task.assignee : task.requester]
+    const suffix = participant.kind === 'trunk' ? t('Main chat') : t('Task Session')
+    return h('button', { key: task.id, type: 'button', className: 'bt-mw-pill', disabled: !endpoint || task.phase !== 'ready',
+      'aria-label': `${t('Open task')}: ${task.title}`, onClick: () => actions.openBranch(endpoint),
+      title: `${task.id}\n${task.title}\n${endpoint ?? t('Creating')}` },
+    h('span', { className: 'bt-mw-pill-in' },
+      target ? h(BotMark, { bot: target, size: 24 }) : null,
+      h('span', { className: 'bt-branch-label' }, `${task.title} · ${t(status)} · ${suffix}${task.lateReplies.count ? ` · ${t('Late results')}: ${task.lateReplies.count}` : ''}`),
+      h(Elapsed, { at: task.openedAt })))
+  }), ...branches.map(branch => {
     const target = roster.byId[branch.targetBotId]
     const status = branch.state === 'open' ? work.branches?.[branch.sessionId] ?? 'Needs close' : branch.state === 'failed' ? 'Failed' : 'Creating'
     return h('button', { key: branch.id, type: 'button', className: 'bt-mw-pill', disabled: !branch.sessionId,

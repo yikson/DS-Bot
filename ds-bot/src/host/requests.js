@@ -34,6 +34,7 @@ export function install(rt) {
   const identity = ({ caller, context, name, payload }) => ({
     key: `${caller}\u0000${context}\u0000${name}`,
     print: print(payload),
+    ...(context.startsWith('task:') ? { taskId: context.slice(5) } : {}),
   })
 
   // What a request that was admitted before means for the caller now: its receipt, a
@@ -88,7 +89,7 @@ export function install(rt) {
     }
     // A receipt that cannot be saved cannot stop a second delivery later.
     if (rt.readOnly() !== undefined) return { status: 'readonly' }
-    const fresh = { fingerprint: request.print, outcome: 'pending', at: Date.now(), run }
+    const fresh = { fingerprint: request.print, outcome: 'pending', at: Date.now(), run, ...(request.taskId ? { taskId: request.taskId } : {}) }
     receipts()[request.key] = fresh
     const promise = (async () => {
       try {
@@ -137,5 +138,9 @@ export function install(rt) {
     }
   }
 
-  Object.assign(rt, { requestIdentity: identity, knownRequest: known, admitRequest: admit })
+  Object.assign(rt, { requestIdentity: identity, knownRequest: known, admitRequest: admit,
+    bindRequestTask(request, taskId) {
+      const record = rt.own(receipts(), request.key)
+      if (record?.fingerprint === request.print) record.taskId = taskId
+    } })
 }

@@ -41,7 +41,7 @@ export function install(rt) {
   const taskContext = sessionId => {
     const info = rt.live.get(sessionId)?.info
     const work = rt.state.works?.[rt.workOf(info)]
-    const ids = [rt.taskForSession(sessionId)?.id, info?.taskId, work?.taskId].filter(Boolean)
+    const ids = [rt.taskForSession(sessionId)?.id, info?.role === 'task-conclusion' ? undefined : info?.taskId, work?.taskId].filter(Boolean)
     if (new Set(ids).size > 1) throw new Error('Conflicting inherited task context')
     return ids[0]
   }
@@ -360,7 +360,9 @@ export function install(rt) {
     const work = rt.state.works?.[source.exchangeId]
     const taskId = source.taskId ?? work?.taskId
     return withTask(taskId, async enqueue => {
-      const task = openTask(taskId)
+      const task = rt.taskOf(taskId)
+      if (!task) throw new Error(`Unknown task "${taskId}"`)
+      if (task.state !== 'open') return rt.recordTaskLateReply(taskId, sessionId, source.exchangeId, text)
       const fromId = rt.selfOf(sessionId)
       if (!Object.hasOwn(task.participants, fromId)
         || (task.participants[fromId].kind !== 'trunk' && task.sessions[fromId] !== sessionId)) throw new Error('Reply is not from the task endpoint')
@@ -387,17 +389,24 @@ export function install(rt) {
   async function recoverTaskCreations() {
     for (const task of Array.from(rt.taskById.values())) {
       if (creating.has(task.id) || task.state !== 'open' || task.phase !== 'creating') continue
-      await withTask(task.id, () => commit(task.id, task => {
-        // DSH cannot atomically apply a marker in fork/create. A missing id is
-        // not proof of non-creation, and an unmarked orphan cannot be excluded.
-        for (const intent of Object.values(task.creationIntents)) {
-          if (intent.state === 'creating') {
-            intent.state = 'unknown'
-            intent.diagnostic = 'Creation interrupted; atomic marker lookup is unavailable'
+      try {
+        await withTask(task.id, () => commit(task.id, task => {
+          // DSH cannot atomically apply a marker in fork/create. A missing id is
+          // not proof of non-creation, and an unmarked orphan cannot be excluded.
+          for (const intent of Object.values(task.creationIntents)) {
+            if (intent.state === 'creating') {
+              intent.state = 'unknown'
+              intent.diagnostic = 'Creation interrupted; atomic marker lookup is unavailable'
+            }
           }
-        }
-        return failedCreation(task, 'Interrupted Session setup requires inspection; atomic marker lookup is unavailable. No automatic recreation.')
-      }))
+          return failedCreation(task, 'Interrupted Session setup requires inspection; atomic marker lookup is unavailable. No automatic recreation.')
+        }))
+        checkGeneration()
+      } catch (error) {
+        checkGeneration()
+        if (rt.readOnly()) throw new Error(rt.readOnly())
+        rt.warn('ds-bot: recovering task %s creation failed; remains pending: %s', task.id, error)
+      }
     }
   }
   async function recoverTasks() {
@@ -408,14 +417,24 @@ export function install(rt) {
       for (const saved of Object.values(task.pendingSends)) {
         const args = { ...saved }
         delete args.state
-        await withTask(task.id, enqueue => dispatchTask(task.id, args, {}, true, enqueue))
+        try {
+          await withTask(task.id, enqueue => dispatchTask(task.id, args, {}, true, enqueue))
+          checkGeneration()
+        } catch (error) {
+          checkGeneration()
+          if (rt.readOnly()) throw new Error(rt.readOnly())
+          rt.warn('ds-bot: recovering task %s pending send %s failed; remains pending: %s', task.id, args.exchangeId, error)
+        }
       }
     }
+    await rt.recoverTaskLifecycle?.()
   }
   Object.assign(rt, { taskContext, selectTaskRoute, routeTask, withTask, sendTask, sendTaskAnswer,
     resumeTaskAnswer, checkTaskDelivery, prepareTaskDelivery, recoverTaskCreations, recoverTasks })
   const deliver = rt.deliver
-  rt.deliver = (args, receipt, lane) => args.taskId && lane !== deliveryLane
-    ? withTask(args.taskId, () => deliver(args, receipt))
-    : deliver(args, receipt)
+  rt.deliver = (args, receipt = {}, lane) => {
+    const send = () => args.taskId && rt.runTaskDelivery
+      ? rt.runTaskDelivery(args, receipt, deliveryArgs => deliver(deliveryArgs, receipt)) : deliver(args, receipt)
+    return args.taskId && lane !== deliveryLane ? withTask(args.taskId, send) : send()
+  }
 }
