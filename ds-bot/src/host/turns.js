@@ -2,7 +2,10 @@
 // triggered, the waiters and inboxes of group rounds, and routing a finished turn's reply.
 //
 // Turn tracking: which turns were triggered by another Bot, and what they said.
-import { HANDOFF_ACK, MESSAGE_INLINE_MAX, REFERENCE_KIND, REPLY_KIND, SOURCE_KIND } from './constants.js'
+import {
+  FAILURE_RESUME_MAX, HANDOFF_ACK, MESSAGE_INLINE_MAX, REFERENCE_KIND, REPLY_KIND, SOURCE_KIND,
+  TRANSIENT_FAILURE_CODES,
+} from './constants.js'
 import { absoluteLinks } from './links.js'
 import { textOf } from './text.js'
 import { reminderText } from './schedules.js'
@@ -69,6 +72,8 @@ const PROGRAM_TOOL = 'run_code'
 
 const RETRY_TEXT = 'Your last reply wrote a tool call as plain text (<tool_call>…), so it did not run and nothing happened. Call the tool through the tool interface now, then reply as you meant to.'
 
+const failureResumeText = code => `Your last turn stopped because the model connection failed (${code}). Check what is already done (files, commands, messages) before you repeat anything, then finish the task and give your reply.`
+
 export function install(rt) {
   const { ctx, state } = rt
 
@@ -92,6 +97,27 @@ export function install(rt) {
       retried: true,
       text: RETRY_TEXT,
     })
+  }
+
+  // The turn runs again on the trigger it failed on: a Bot that waits keeps its
+  // exchange, and a turn of the Bot's own chat starts a plain one there.
+  const resumeFailedTurn = (id, info, failure) => {
+    const keeps = info !== undefined && expectsReply(info)
+    const args = {
+      ...(keeps && info.senderSessionId ? { fromId: info.senderSessionId } : {}),
+      toId: rt.selfOf(id),
+      sessionId: id,
+      role: keeps ? info.role : 'retry',
+      ...(keeps && info.exchangeId ? { exchangeId: info.exchangeId } : {}),
+      ...(info?.work ? { work: info.work } : {}),
+      ...(keeps && info.audience ? { audience: info.audience } : {}),
+      ...(keeps && info.askedBy ? { askedBy: info.askedBy } : {}),
+      ...(keeps && info.senderRoomId ? { fromRoomId: info.senderRoomId } : {}),
+      ...(keeps && info.replySessionId ? { replySessionId: info.replySessionId } : {}),
+      failureResumes: (info?.failureResumes ?? 0) + 1,
+      text: failureResumeText(failure.code),
+    }
+    rt.scheduleFailureResume({ work: rt.workOf?.(info), args })
   }
 
   /** @type {Map<string, {turn?:number, pending?:any, info?:any, texts:string[], opened?:boolean, joined?:{info:any, from:number}[]}>} */
@@ -240,6 +266,8 @@ export function install(rt) {
   // package that only opens a part is acknowledged with a fixed line, also hidden.
   const claimTrigger = (sessionId, entry, info) => {
     entry.info = info
+    const work = rt.workOf?.(info)
+    if (work !== undefined) rt.cancelFailureResumes?.(work)
     // A turn that was stopped for a part switch brings its joined requests along.
     if (Array.isArray(info.joined) && info.joined.length > 0) {
       entry.joined = info.joined.filter(item => item?.info !== undefined && item.info !== null)
@@ -593,6 +621,15 @@ export function install(rt) {
         const wroteCall = failure === undefined && reason?.kind === 'completed' && lastCalled !== true && writesToolCall(lastText)
         const retry = wroteCall && info?.retried !== true && !(info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))
         if (retry) void retryWrittenCall(id, info).catch(error => rt.warn('ds-bot: asking %s to run its written tool call failed: %s', id, error))
+        // A model call that failed on a transient fault is run again on the same trigger,
+        // so whoever waits keeps waiting instead of hearing that the Bot gave up. A group
+        // member's turn is left as it is: its round has a failure path of its own.
+        const resumes = info?.failureResumes ?? 0
+        const resumeFailure = failure !== undefined && !rt.groupOwners.has(id) && info?.role !== 'room'
+          && TRANSIENT_FAILURE_CODES.has(failure.code) && resumes < FAILURE_RESUME_MAX
+        if (resumeFailure) resumeFailedTurn(id, info, failure)
+        // What is still said about the failure, to whoever waits for the reply.
+        const failed = failure !== undefined && !resumeFailure
         const replyText = () => {
           const reply = (wroteCall ? texts.map(stripWrittenCalls) : texts).join('\n\n').trim()
           return wroteCall && reply === '' ? 'Tried to run a tool but wrote the call as text, so it did not run.' : reply
@@ -603,9 +640,10 @@ export function install(rt) {
         const name = rt.botOf(rt.selfOf(id))?.name ?? 'The other Bot'
         const answer = (source, reply) => {
           if (!expectsReply(source) || answersUser(source)) return
-          if (failure !== undefined) {
+          if (failed) {
             // The sender was told a reply comes later; without this it would wait forever.
-            tellSender(id, source, `${name} could not answer your message: its model call failed (${failureLine(failure)}). Tell the user if it matters; do not retry right away.`)
+            const again = resumes > 0 ? ` after ${resumes} automatic ${resumes === 1 ? 'resume' : 'resumes'}` : ''
+            tellSender(id, source, `${name} could not answer your message: its model call failed (${failureLine(failure)})${again}. Tell the user if it matters; do not retry right away.`)
           } else if (reply !== '' || reason?.kind === 'aborted') {
             // A turn stopped before it could answer still owes the sender a line,
             // or it would wait forever for a reply that never comes.
@@ -619,7 +657,7 @@ export function install(rt) {
           const work = rt.workOf?.(source)
           if (!rt.ownsWork?.(rt.selfOf(id), work)) return answer(source, reply)
           const asker = rt.workAsker(work)
-          if (failure !== undefined || reason?.kind === 'aborted') return answer(asker, reply)
+          if (failed || reason?.kind === 'aborted') return answer(asker, reply)
           if (rt.waitsWork(work)) return rt.holdWork(work, reply)
           // With what came back, the answer may pass what one message carries.
           const text = rt.answerText(work, reply, name)
@@ -647,14 +685,15 @@ export function install(rt) {
           const inRound = failure !== undefined && info === undefined && rt.failRoomTurn?.(id, failure) === true
           if (failure !== undefined) { if (!inRound) void rt.lateRoomFailure?.(id, info ?? {}, failure) }
           else if (reason?.kind !== 'aborted') void rt.lateRoomReply?.(id, info ?? {}, groupReply(), { shown })
-        } else if (!retry && info !== undefined) {
+        } else if (!retry && !resumeFailure && info !== undefined) {
           finish(info, replyText())
         }
         for (const request of joined) {
           if (request.info.role === 'room' && stoppedRoomTurns.delete(request.info.exchangeId)) continue
           // A failed or stopped turn closes the request like any other; a finished
           // one hands it back to the Bot to answer next.
-          if (failure !== undefined || reason?.kind === 'aborted') {
+          // A turn that runs again answers these too, in the turn it runs again as.
+          if (failed || reason?.kind === 'aborted') {
             if (request.info.role === 'room') {
               if (failure !== undefined) void rt.lateRoomFailure?.(id, request.info, failure)
             } else answer(request.info, '')

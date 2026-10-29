@@ -8,6 +8,7 @@ import { answerSender } from '../src/host/turns.js'
 import { sourcesIn } from '../src/host/branches.js'
 import { answeredIn, install as installResume, LOG_RETRY_MS, RESUME_DELAY_MS } from '../src/host/resume.js'
 import { fakeContext } from './fake-ctx.js'
+import { FAILURE_RESUME_DELAY_MS } from '../src/host/constants.js'
 
 async function setup(t, { enabled = true, seed, logs = new Map(), notes } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-branches-'))
@@ -362,6 +363,115 @@ test('a written-tool retry keeps the branch request and its reply target', async
   assert.equal(f.agentOf('a').calls.length, 0)
 })
 
+const takeBranchTurn = (f, id, turn, message) => {
+  f.agentOf(id).inbox.remove(message.id)
+  f.emit(id, 'turn/start', { turn })
+  f.emit(id, 'user/message', message)
+}
+const finishBranchTurn = (f, id, turn) => {
+  f.emit(id, 'assistant/message', { message: { content: [{ type: 'text', text: 'Finished after recovery' }] } })
+  f.emit(id, 'turn/end', { turn, reason: { kind: 'completed' } })
+}
+
+for (const inbound of [true, false]) {
+  test(`a transient failure ${inbound ? 'inside a branch' : 'on its peer'} preserves the branch and reply address`, async t => {
+    const timers = controlledTimers(t, delay => delay === RESUME_DELAY_MS
+      || (delay > FAILURE_RESUME_DELAY_MS / 2 && delay <= FAILURE_RESUME_DELAY_MS))
+    const f = await setup(t)
+    await f.send('Review after a timeout', inbound ? 'b' : 'a')
+    const branch = f.branches()[0]
+    const target = inbound ? branch.sessionId : 'b'
+    const upstream = inbound ? 'b' : branch.sessionId
+    const request = f.agentOf(target).calls[0]
+    takeBranchTurn(f, target, 1, request)
+    f.emit(target, 'turn/end', { turn: 1, reason: { kind: 'error', error: { code: 'TIMEOUT' } } })
+    assert.equal(f.agentOf(upstream).calls.length, 0)
+    await timers.find(timer => timer.delay > RESUME_DELAY_MS).run()
+    await settle(() => f.agentOf(target).calls.length === 2)
+    const resume = f.agentOf(target).calls[1]
+    assert.deepEqual([resume.source.exchangeId, resume.source.failureResumes, resume.source.replySessionId],
+      [request.source.exchangeId, 1, request.source.replySessionId])
+    if (inbound) assert.match(resume.content[0].text, new RegExp(`\\[Work branch: ${branch.title}\\]\\nBranch: ${branch.id}\\n`))
+    takeBranchTurn(f, target, 2, resume)
+    finishBranchTurn(f, target, 2)
+    await settle(() => f.agentOf(upstream).calls.length === 1)
+    assert.equal(f.agentOf(upstream).calls[0].source.replyTo, request.source.exchangeId)
+    if (inbound) {
+      const reply = f.agentOf('b').calls[0]
+      assert.equal(reply.source.replySessionId, branch.sessionId)
+      takeBranchTurn(f, 'b', 1, reply)
+      await f.send('Follow up in the same branch', 'b')
+      assert.equal(f.agentOf(branch.sessionId).calls.length, 3)
+      assert.equal(f.forks.length, 1)
+    }
+    assert.equal(f.agentOf('a').calls.length, 0, 'the branch owner main chat stays separate')
+    assert.equal(f.rt.state.exchanges.filter(entry => entry.id === request.source.exchangeId).length, 1)
+  })
+}
+
+for (const phase of ['pending', 'resolving', 'continuation']) {
+  test(`branch failure recovery after reload has one owner while ${phase}`, async t => {
+    const timers = controlledTimers(t, delay => delay === 0 || delay === RESUME_DELAY_MS
+      || (delay > FAILURE_RESUME_DELAY_MS / 2 && delay <= FAILURE_RESUME_DELAY_MS))
+    const f = await setup(t)
+    await f.send('Review in the branch', 'b')
+    const branch = f.branches()[0]
+    const id = branch.sessionId
+    const request = f.agentOf(id).calls[0]
+    takeBranchTurn(f, id, 1, request)
+    f.emit(id, 'turn/end', { turn: 1, reason: { kind: 'error', error: { code: 'SERVER', status: 503 } } })
+    let pending
+    await settle(() => {
+      try {
+        pending = JSON.parse(readFileSync(join(f.home, 'inflight.json'), 'utf8')).pendingResumes?.[request.source.exchangeId]
+        return pending !== undefined
+      } catch { return false }
+    })
+    let release
+    let resolving = false
+    if (phase === 'resolving') {
+      const gate = new Promise(resolve => { release = resolve })
+      t.after(() => release())
+      const resolveAgent = f.ctx.sessionController.resolveAgent
+      f.ctx.sessionController.resolveAgent = async sessionId => {
+        if (sessionId === id) { resolving = true; await gate }
+        return resolveAgent(sessionId)
+      }
+      await timers.find(timer => timer.delay > RESUME_DELAY_MS).run()
+      await settle(() => resolving)
+    } else if (phase === 'continuation') {
+      takeBranchTurn(f, id, 2, { content: [{ type: 'text', text: 'child result' }],
+        source: { kind: 'bot', role: 'reply', exchangeId: 'child-result', work: request.source.exchangeId } })
+    }
+    await f.ctx.dispose()
+    release?.()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(f.agentOf(id).calls.length, 1)
+    const saved = JSON.parse(readFileSync(join(f.home, 'inflight.json'), 'utf8'))
+    if (phase !== 'resolving') saved.pendingResumes[request.source.exchangeId] = { ...pending, due: Date.now() - 1 }
+    const restarted = await setup(t, { enabled: false,
+      seed: JSON.parse(readFileSync(join(f.home, 'state.json'), 'utf8')), notes: saved, logs: f.logs })
+    if (phase === 'pending') {
+      await timers.findLast(timer => timer.delay === 0 && !timer.cleared).run()
+      await settle(() => restarted.agentOf(id).calls.length === 1)
+    }
+    await restarted.rt.resumeAll()
+    await restarted.rt.resumeAll()
+    const messages = restarted.agentOf(id).calls
+    assert.equal(messages.length, 1)
+    const resume = messages[0]
+    if (phase === 'continuation') assert.deepEqual([resume.source.role, resume.source.work], ['resume', request.source.exchangeId])
+    else assert.deepEqual([resume.source.exchangeId, resume.source.failureResumes], [request.source.exchangeId, 1])
+    takeBranchTurn(restarted, id, 3, resume)
+    finishBranchTurn(restarted, id, 3)
+    await settle(() => restarted.agentOf('b').calls.length === 1)
+    assert.equal(restarted.agentOf('b').calls[0].source.replyTo, request.source.exchangeId)
+    assert.equal(restarted.agentOf('b').calls[0].source.replySessionId, id)
+    assert.equal(restarted.agentOf('a').calls.length, 0)
+    assert.equal(restarted.forks.length, 0, 'recovery reuses the persisted branch Session')
+  })
+}
+
 test('branch Sessions bypass folder, overflow and idle part switching', async t => {
   const f = await setup(t)
   await f.send()
@@ -587,7 +697,7 @@ function controlledTimers(t, delays = [1000, 2000, 4000]) {
   const originalSet = globalThis.setTimeout
   const originalClear = globalThis.clearTimeout
   t.mock.method(globalThis, 'setTimeout', (run, delay, ...args) => {
-    if (!delays.includes(delay)) return originalSet(run, delay, ...args)
+    if (!(typeof delays === 'function' ? delays(delay) : delays.includes(delay))) return originalSet(run, delay, ...args)
     const timer = { run, delay, unreferenced: false, unref() { this.unreferenced = true } }
     timers.push(timer)
     return timer

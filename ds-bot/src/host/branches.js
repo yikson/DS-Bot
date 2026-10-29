@@ -146,12 +146,13 @@ export function install(rt) {
       : { branch, exchangeId: id, sessionId: branch.sessionId }
   }
 
-  async function delivered(sessionId, exchangeId, replyTo) {
+  async function delivered(sessionId, exchangeId, replyTo, failureResumes) {
     const agent = await rt.resolveAgent(sessionId)
     const pending = [...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])].map(message => message.source)
     const events = await ctx.sessionController.inspect(sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS))
     if (!Array.isArray(events?.events)) throw new Error('Cannot inspect delivery history')
     return [...pending, ...sourcesIn(events.events)].some(source => source &&
+      (failureResumes === undefined || source.failureResumes === failureResumes) &&
       (source.exchangeId === exchangeId || (replyTo !== undefined && source.replyTo === replyTo)))
   }
 

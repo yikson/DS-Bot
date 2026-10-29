@@ -74,6 +74,13 @@ export const TEAM_TOOLS = [
 // posts its reply when the work is done.
 export const ROOM_WORK_GRACE_MS = 15_000
 
+// A model request that failed on a transient fault is run again on the same trigger
+// after this wait, so whoever waits for the reply does not hear that the Bot gave up.
+// The codes are the ones a provider retry policy treats as safe to repeat.
+export const TRANSIENT_FAILURE_CODES = new Set(['TRANSPORT', 'TIMEOUT', 'SERVER', 'RATE_LIMIT', 'EMPTY_RESPONSE'])
+export const FAILURE_RESUME_DELAY_MS = 60_000
+export const FAILURE_RESUME_MAX = 2
+
 export const OWN_CHAT_LINE_MAX = 400
 // The message an anchor points at is shown whole (up to this), so a long draft takes
 // one read instead of many searches for its pieces.

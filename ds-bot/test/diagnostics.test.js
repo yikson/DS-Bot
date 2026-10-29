@@ -8,7 +8,8 @@ import { test } from 'node:test'
 import { cleanText, install as installDiagnostics, reportMarkdown } from '../src/host/diagnostics.js'
 import { failureLine, install as installTurns, turnFailure } from '../src/host/turns.js'
 import { errorCode } from '../src/host/channel.js'
-import { SOURCE_KIND } from '../src/host/constants.js'
+import { FAILURE_RESUME_MAX, SOURCE_KIND } from '../src/host/constants.js'
+import { fakeContext } from './fake-ctx.js'
 
 test('cleanText hides keys, tokens and the home folder', () => {
   const home = '/home/user'
@@ -210,7 +211,7 @@ function turnsHost() {
   const delivered = []
   const noted = []
   const rt = {
-    ctx: { on: (name, fn) => { if (name === 'session/event') listener = fn } },
+    ctx: { ...fakeContext(), on: (name, fn) => { if (name === 'session/event') listener = fn } },
     state: { exchangeTurns: {}, questions: {} },
     bots: { a: { id: 'a', name: 'Chief' }, b: { id: 'b', name: 'Writer' } },
     isBotSession: () => true,
@@ -237,14 +238,28 @@ const failed = { kind: 'error', error: { code: 'SERVER', message: 'upstream busy
 test('a failed reply to message_bot tells the sender instead of leaving it waiting', () => {
   const { emit, delivered, noted } = turnsHost()
   emit('b', 'turn/start', { turn: 1 })
-  emit('b', 'user/message', { content: [{ type: 'text', text: 'hi' }], source: { kind: SOURCE_KIND, role: 'request', senderSessionId: 'a', exchangeId: 'x1' } })
+  emit('b', 'user/message', { content: [{ type: 'text', text: 'hi' }], source: { kind: SOURCE_KIND, role: 'request', senderSessionId: 'a', exchangeId: 'x1', failureResumes: FAILURE_RESUME_MAX } })
   emit('b', 'turn/end', { turn: 1, reason: failed })
   assert.equal(delivered.length, 1)
   assert.equal(delivered[0].toId, 'a')
   assert.equal(delivered[0].role, 'reply')
   assert.equal(delivered[0].replyTo, 'x1')
-  assert.match(delivered[0].text, /^Writer could not answer your message: its model call failed \(SERVER 503: upstream busy\)/)
+  assert.match(delivered[0].text, /^Writer could not answer your message: its model call failed \(SERVER 503: upstream busy\) after 2 automatic resumes/)
   assert.deepEqual(noted.map(entry => [entry.source, entry.code, entry.bot, entry.where]), [['turn', 'SERVER', 'Writer', 'own chat']])
+})
+
+test('a transient failure runs the turn again before the sender is told anything', async () => {
+  const { rt, emit, delivered } = turnsHost()
+  const scheduled = []
+  rt.scheduleFailureResume = record => scheduled.push(record)
+  emit('b', 'turn/start', { turn: 1 })
+  emit('b', 'user/message', { content: [{ type: 'text', text: 'hi' }], source: { kind: SOURCE_KIND, role: 'request', senderSessionId: 'a', exchangeId: 'x1' } })
+  emit('b', 'turn/end', { turn: 1, reason: failed })
+  assert.deepEqual(delivered, [])
+  assert.equal(scheduled.length, 1)
+  const { args } = scheduled[0]
+  assert.deepEqual([args.toId, args.role, args.exchangeId, args.failureResumes], ['b', 'request', 'x1', 1])
+  assert.match(args.text, /^Your last turn stopped because the model connection failed \(SERVER\). Check what is already done/)
 })
 
 test('a failed group turn fails its waiter; a stopped one counts as no answer', () => {

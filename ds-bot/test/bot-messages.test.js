@@ -443,7 +443,7 @@ function turnsHost() {
   let listener
   const delivered = []
   const rt = {
-    ctx: { on: (name, fn) => { if (name === 'session/event') listener = fn } },
+    ctx: { ...fakeContext(), on: (name, fn) => { if (name === 'session/event') listener = fn } },
     state: { exchangeTurns: {}, questions: {} },
     bots: { a: { id: 'a', name: 'Chief' }, b: { id: 'b', name: 'Writer' } },
     isBotSession: () => true,
@@ -455,6 +455,7 @@ function turnsHost() {
     save: async () => {},
     deliver: async (args) => { delivered.push(args) },
     noteFailure() {},
+    scheduleFailureResume() {},
     warn() {},
     switchJobs: () => [],
     dropKickoff() {},
@@ -532,16 +533,27 @@ test('a joined request in a stopped turn tells its sender, and is not handed bac
   assert.match(delivered[0].text, /was stopped before it could answer/)
 })
 
-test('a joined request gets the failure notice when the model call fails', () => {
+test('a joined request gets the failure notice when the model call fails for good', () => {
   const { emit, delivered } = turnsHost()
   emit('b', 'turn/start', { turn: 1 })
   emit('b', 'user/message', { content: textBlock('write the letter'), source: { kind: 'user' } })
   emit('b', 'assistant/message', assistantText('first half'))
   emit('b', 'user/message', { content: textBlock('[Message from Chief]\nmore'), source: replySource('request', { exchangeId: 'e1' }) })
-  emit('b', 'turn/end', { turn: 1, reason: { kind: 'error', error: { code: 'SERVER', message: 'upstream busy', status: 503 } } })
+  emit('b', 'turn/end', { turn: 1, reason: { kind: 'error', error: { code: 'AUTH', message: 'the key was rejected' } } })
   assert.equal(delivered.length, 1)
   assert.equal(delivered[0].replyTo, 'e1')
-  assert.match(delivered[0].text, /^Writer could not answer your message: its model call failed \(SERVER 503: upstream busy\)/)
+  assert.match(delivered[0].text, /^Writer could not answer your message: its model call failed \(AUTH\)/)
+})
+
+test('a joined request waits for the turn that runs again after a transient failure', () => {
+  const { emit, delivered } = turnsHost()
+  emit('b', 'turn/start', { turn: 1 })
+  emit('b', 'user/message', { content: textBlock('write the letter'), source: { kind: 'user' } })
+  emit('b', 'assistant/message', assistantText('first half'))
+  emit('b', 'user/message', { content: textBlock('[Message from Chief]\nmore'), source: replySource('request', { exchangeId: 'e1' }) })
+  emit('b', 'turn/end', { turn: 1, reason: { kind: 'error', error: { code: 'TIMEOUT', message: 'the call timed out' } } })
+  // The turn runs again, so the request it took in is answered then, not failed now.
+  assert.deepEqual(delivered.map(job => [job.role, job.exchangeId, job.deferred]), [['request', 'e1', true]])
 })
 
 test('a joined request never claims the next turn', () => {
