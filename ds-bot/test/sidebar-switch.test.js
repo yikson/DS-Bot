@@ -6,6 +6,17 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
 import { build } from 'esbuild'
+import { indexRoster } from '../src/client/sources.js'
+
+test('client indexes branch Sessions without treating them as conversation parts', () => {
+  const bot = { id: 'a', sessionId: 'main', parts: ['a', 'main'], workBranches: {
+    open: { sessionId: 'branch-open', state: 'open' },
+    closed: { sessionId: 'branch-closed', state: 'closed' },
+  } }
+  const roster = indexRoster({ bots: [bot], rooms: [] })
+  for (const id of ['a', 'main', 'branch-open', 'branch-closed']) assert.equal(roster.byId[id], bot)
+  assert.deepEqual(bot.parts, ['a', 'main'])
+})
 
 // jsdom comes from the harness that test/harness-resolve.mjs found, like the dsh packages.
 const PLUGIN = dirname(dirname(fileURLToPath(import.meta.url)))
