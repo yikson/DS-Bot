@@ -386,12 +386,16 @@ export function install(rt) {
     return claims
   }
   const validateTaskSessions = (task, claims = taskSessionClaims()) => {
+    // Read persisted Agent claims directly: their live index rebuilds after task validation.
+    const agentSessions = new Set(Object.values(state.agents).flatMap(agent => agent.sessions ?? []))
     for (const [botId, sessionId] of Object.entries(task.sessions)) {
       const trunk = task.participants[botId].kind === 'trunk'
-      if (!trunk && (chatOwners.has(sessionId) || groupOwners.has(sessionId) || pastOwners.has(sessionId) || branchOwners.has(sessionId))) {
+      if (agentSessions.has(sessionId) || (!trunk && (own(state.bots, sessionId) || own(state.rooms, sessionId)
+        || chatOwners.has(sessionId) || groupOwners.has(sessionId) || pastOwners.has(sessionId) || branchOwners.has(sessionId)))) {
         throw new Error(`Task ${task.id}: Session is already owned`)
       }
-      if (trunk && (groupOwners.has(sessionId) || branchOwners.has(sessionId)
+      if (trunk && (own(state.rooms, sessionId) || (own(state.bots, sessionId) && sessionId !== botId)
+        || groupOwners.has(sessionId) || branchOwners.has(sessionId)
         || (chatOwners.has(sessionId) && chatOwners.get(sessionId) !== botId)
         || (pastOwners.has(sessionId) && (pastOwners.get(sessionId).botId !== botId || pastOwners.get(sessionId).roomId !== undefined)))) {
         throw new Error(`Task ${task.id}: endpoint is not this Bot's trunk`)
@@ -460,6 +464,7 @@ export function install(rt) {
     }
     // The agents module owns the DSH Agent session index; it installs after this.
     rt.indexAgents?.()
+    rt.syncTaskTools?.()
   }
   // The Bot a Session speaks for: its own chat, one of its group Sessions, or an
   // earlier segment of either.

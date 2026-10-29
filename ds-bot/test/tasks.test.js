@@ -3,6 +3,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { Context } from '@deepseek-ai/cordis'
+import { createScope } from '@deepseek-ai/dsh-scope'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { createRuntime } from '../index.js'
 import { validateTask } from '../src/host/tasks.js'
 import { fakeContext } from './fake-ctx.js'
@@ -36,15 +40,37 @@ async function setup(t, { seed = legacy(), config = {} } = {}) {
   const rt = createRuntime(ctx, { home, memory: false, ...config })
   rt.warn = (...args) => warnings.push(args)
   await rt.load()
-  const tool = (id = 'a') => ctx.registeredTools.get('list_tasks').execute({}, { agent: { id } })
+  const agents = new Map()
+  const agent = async id => {
+    if (agents.has(id)) return agents.get(id)
+    const scope = fakeContext()
+    scope.tools.register = tool => {
+      scope.registeredTools.set(tool.name, tool)
+      return () => scope.registeredTools.delete(tool.name)
+    }
+    const value = { id, session: { id }, ctx: scope }
+    agents.set(id, value)
+    t.after(() => scope.dispose())
+    for (const listener of ctx.listeners.get('agent/created') ?? []) await listener({ agent: value })
+    return value
+  }
+  const schemas = async id => {
+    const scope = (await agent(id)).ctx
+    return [...ctx.registeredTools.values(), ...scope.registeredTools.values()]
+      .map(({ name, description, parameters }) => ({ name, description, parameters }))
+  }
+  const tool = async (id = 'a') => {
+    const caller = await agent(id)
+    return caller.ctx.registeredTools.get('list_tasks').execute({}, { agent: caller })
+  }
   t.after(async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true, maxRetries: 5 }) })
-  return { rt, ctx, home, statePath, warnings, tool }
+  return { rt, ctx, home, statePath, warnings, tool, agent, schemas }
 }
 
 test('legacy main-shaped records stay separate, unchanged and routable without config', async t => {
   const seed = legacy()
   const original = structuredClone(seed.bots.a.workBranches)
-  const { rt, tool, statePath } = await setup(t, { seed })
+  const { rt, schemas, statePath } = await setup(t, { seed })
   assert.deepEqual(rt.state.tasks, {})
   assert.deepEqual(rt.state.bots.a.workBranches, original)
   assert.equal(rt.branchOf('sess-open').id, 'br-open')
@@ -54,7 +80,7 @@ test('legacy main-shaped records stay separate, unchanged and routable without c
   assert.equal(rt.taskBySession.size, 0)
   assert.equal(rt.taskOwners.size, 0)
   assert.equal(rt.taskById.size, 0)
-  assert.equal(await tool(), 'No open tasks.')
+  assert.equal((await schemas('a')).some(tool => tool.name === 'list_tasks'), false)
   const route = await rt.routeBranch(rt.botOf('b'), rt.botOf('a'), 'sess-open', 'follow up', false)
   assert.equal(route.branch.id, 'br-open')
   await rt.save({ required: true })
@@ -89,16 +115,110 @@ test('list_tasks shows only caller membership and open records, even after confi
   seed.tasks = { t1: task(), closed: { ...task('closed'), state: 'done', closedAt: 2000 } }
   delete seed.tasks.t1.participants.c
   delete seed.tasks.t1.sessions.c
-  const { rt, tool } = await setup(t, { seed, config: { taskSessionsEnabled: true, taskSessions: ['ADA', 'Cardpack'] } })
+  const { rt, tool, schemas } = await setup(t, { seed, config: { taskSessionsEnabled: true, taskSessions: ['ADA', 'Cardpack'] } })
   rt.config.taskSessionsEnabled = false
   rt.config.taskSessions = []
   assert.match(await tool('a'), /t1/)
   assert.match(await tool('t1-b'), /ADA: requester, fork, t1-a/)
   assert.doesNotMatch(await tool('b'), /closed/)
   assert.equal(await tool('c'), 'No open tasks.')
-  assert.equal(await tool('unmanaged'), 'No open tasks.')
+  assert.equal((await schemas('unmanaged')).some(tool => tool.name === 'list_tasks'), false)
   assert.equal(rt.taskOf('closed').state, 'done')
   assert.deepEqual(rt.taskOf('t1').capabilityAtCreation, { requester: true, initialAssignee: true })
+})
+
+test('flag-off tool list matches the base team with no task configuration or records', async t => {
+  const { ctx, schemas } = await setup(t)
+  const baseNames = [
+    'list_bots', 'message_bot', 'stop_bot', 'create_bot', 'update_bot', 'list_bot_models',
+    'create_group', 'update_group', 'delete_group', 'post_to_group', 'ask_user', 'show_view',
+    'list_capabilities', 'save_capability', 'delete_capability', 'attach_capability', 'detach_capability',
+    'close_work_branch', 'group_relay', 'read_own_chat', 'read_group_chat', 'request_secret', 'list_secrets',
+  ]
+  assert.deepEqual([...ctx.registeredTools.keys()], baseNames)
+  const global = [...ctx.registeredTools.values()]
+    .map(({ name, description, parameters }) => ({ name, description, parameters }))
+  for (const id of ['a', 'b', 'c', 'unmanaged']) assert.deepEqual(await schemas(id), global)
+})
+
+test('list_tasks is scoped to enabled Bots and follows saved membership after revocation', async t => {
+  const { rt, ctx, schemas, tool } = await setup(t, { config: { taskSessionsEnabled: true, taskSessions: ['ADA'] } })
+  const offered = async id => (await schemas(id)).some(tool => tool.name === 'list_tasks')
+  assert.equal(ctx.registeredTools.has('list_tasks'), false)
+  assert.equal(await offered('a'), true)
+  assert.equal(await tool('a'), 'No open tasks.')
+  for (const id of ['b', 'c', 'unmanaged']) assert.equal(await offered(id), false)
+  const value = task()
+  delete value.participants.c
+  delete value.sessions.c
+  await rt.commitTask('t1', () => value)
+  assert.equal(await offered('b'), true)
+  rt.config.taskSessionsEnabled = false
+  rt.config.taskSessions = []
+  await rt.save({ required: true })
+  for (const id of ['a', 'b', 't1-a', 't1-b']) {
+    assert.equal(await offered(id), true)
+    assert.match(await tool(id), /t1/)
+  }
+  assert.equal(await offered('c'), false)
+})
+
+test('gate-off capabilities alone never register list_tasks', async t => {
+  const { ctx, schemas } = await setup(t, { config: { taskSessions: ['ADA'], workBranches: [['ADA', 'Cardpack']] } })
+  assert.equal(ctx.registeredTools.has('list_tasks'), false)
+  for (const id of ['a', 'b', 'c']) assert.equal((await schemas(id)).some(tool => tool.name === 'list_tasks'), false)
+})
+
+test('revoking capability removes a scoped tool unless the Bot has a persisted task', async t => {
+  const { rt, schemas } = await setup(t, { config: { taskSessionsEnabled: true, taskSessions: ['ADA', 'Other'] } })
+  const offered = async id => (await schemas(id)).some(tool => tool.name === 'list_tasks')
+  assert.equal(await offered('a'), true)
+  assert.equal(await offered('c'), true)
+  rt.config.taskSessionsEnabled = false
+  await rt.save({ required: true })
+  assert.equal(await offered('a'), false)
+  assert.equal(await offered('c'), false)
+  const closed = { ...task(), state: 'done', closedAt: 2000 }
+  delete closed.participants.c
+  delete closed.sessions.c
+  await rt.commitTask('t1', () => closed)
+  assert.equal(await offered('a'), true)
+  assert.equal(await offered('b'), true)
+  assert.equal(await offered('c'), false)
+})
+
+test('DSH tool schemas isolate task registration and restore the base list on revocation', async t => {
+  const { rt, ctx: recorded, warnings } = await setup(t, { config: { taskSessionsEnabled: true, taskSessions: ['ADA'] } })
+  const ctx = new Context()
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  t.after(() => ctx.fiber.dispose())
+  for (const tool of recorded.registeredTools.values()) ctx.tools.register(tool)
+  const baseline = ctx.tools.schemas()
+  const agents = ['a', 'b', 'c', 'unmanaged', 't1-a'].map(id => ({ id, session: { id } }))
+  const mountScopes = inner => {
+    for (const agent of agents) agent.ctx = createScope(inner, agent).ctx
+  }
+  mountScopes.inject = ['tools']
+  await ctx.plugin(mountScopes)
+  for (const agent of agents) {
+    for (const listener of recorded.listeners.get('agent/created') ?? []) await listener({ agent })
+  }
+  const [a, b, c, unmanaged, requester] = agents
+  assert.equal(ctx.tools.get('list_tasks'), undefined)
+  assert.ok(ctx.tools.get('list_tasks', a), warnings.map(args => args.map(value => String(value)).join(' ')).join('\n'))
+  for (const agent of [b, c, unmanaged, requester]) assert.deepEqual(ctx.tools.schemas(agent), baseline)
+  rt.config.taskSessionsEnabled = false
+  await rt.save({ required: true })
+  for (const agent of agents) assert.deepEqual(ctx.tools.schemas(agent), baseline)
+  const value = task()
+  delete value.participants.c
+  delete value.sessions.c
+  await rt.commitTask('t1', () => value)
+  for (const agent of [a, b, requester]) assert.ok(ctx.tools.get('list_tasks', agent))
+  for (const agent of [c, unmanaged]) assert.deepEqual(ctx.tools.schemas(agent), baseline)
+  await recorded.dispose()
+  for (const agent of agents) assert.equal(ctx.tools.get('list_tasks', agent), undefined)
 })
 
 for (const enabled of [false, true]) {
@@ -261,14 +381,65 @@ test('stopped generations cannot commit queued mutations or start a new save', a
 })
 
 for (const state of ['done', 'blocked', 'cancelled', 'failed']) {
-  test(`terminal ${state} stays persisted and cannot reopen`, async t => {
-    const { rt } = await setup(t, { seed: { ...legacy(), tasks: { t1: { ...task(), state, closedAt: 2000,
+  test(`terminal ${state} rejects changes outside appended late replies`, async t => {
+    const { rt, statePath } = await setup(t, { seed: { ...legacy(), tasks: { t1: { ...task(), state, closedAt: 2000,
       conclusion: { status: state, text: 'Recorded outcome' },
       delivery: { summaryId: 't1:closed', state: 'pending', targets: [] },
     } } } })
-    await assert.rejects(rt.commitTask('t1', current => ({ ...current, state: 'open' })), /terminal task/)
+    const original = readFileSync(statePath, 'utf8')
+    const changes = [
+      value => { value.state = 'open' },
+      value => { value.state = state === 'done' ? 'failed' : 'done' },
+      value => { value.conclusion.text = 'Rewritten outcome' },
+      value => { value.conclusion = null },
+      value => { value.delivery.summaryId = 'replacement' },
+      value => { value.title = 'Rewritten title' },
+      value => { value.closedAt++ },
+      value => { value.updatedAt++ },
+      value => { value.pendingSends.new = { state: 'pending' } },
+      value => { value.sessions.c = 'another-trunk' },
+      value => { value.participants.d = { role: 'participant', kind: 'trunk' }; value.sessions.d = 'd' },
+    ]
+    for (const change of changes) {
+      await assert.rejects(rt.commitTask('t1', current => { change(current); return current }), /terminal task/)
+      assert.equal(readFileSync(statePath, 'utf8'), original)
+    }
     assert.equal(rt.openTasksOf('a').length, 0)
     assert.equal(rt.taskOf('t1').delivery.summaryId, 't1:closed')
+  })
+
+  test(`terminal ${state} only appends complete late records without rewriting history`, async t => {
+    const value = { ...task(), state, closedAt: 2000, conclusion: { status: state, text: 'Recorded outcome' },
+      lateReplies: { count: 1, ids: ['first:reply'],
+        results: [{ exchangeId: 'first', resultId: 'first:reply', sessionId: 't1-b', at: 2100 }] } }
+    const { rt, statePath } = await setup(t, { seed: { ...legacy(), tasks: { t1: value } } })
+    const append = current => {
+      const exchangeId = `late-${current.lateReplies.count + 1}`
+      current.lateReplies.ids.push(`${exchangeId}:reply`)
+      current.lateReplies.count++
+      current.lateReplies.results.push({ exchangeId, resultId: `${exchangeId}:reply`, sessionId: 'c', at: 2200 })
+      return current
+    }
+    await rt.commitTask('t1', append)
+    await rt.commitTask('t1', current => current)
+    const saved = JSON.parse(readFileSync(statePath, 'utf8')).tasks.t1
+    assert.deepEqual(saved, append(structuredClone(value)))
+    const changes = [
+      current => { current.lateReplies.ids[0] = 'replacement' },
+      current => { current.lateReplies.results[0].at++ },
+      current => { current.lateReplies.ids.pop(); current.lateReplies.count--; current.lateReplies.results.pop() },
+      current => { current.lateReplies.ids.push('missing:reply'); current.lateReplies.count++ },
+      current => { append(current); current.lateReplies.results.at(-1).resultId = 'mismatched' },
+      current => { append(current); delete current.lateReplies.results.at(-1).sessionId },
+      current => { append(current); delete current.lateReplies.results.at(-1).exchangeId },
+      current => { append(current); delete current.lateReplies.results.at(-1).at },
+      current => { current.lateReplies.rewritten = true },
+    ]
+    for (const change of changes) {
+      await assert.rejects(rt.commitTask('t1', current => { change(current); return current }), /terminal task|Invalid task/)
+      assert.deepEqual(rt.taskOf('t1'), saved)
+      assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')).tasks.t1, saved)
+    }
   })
 }
 
@@ -354,6 +525,52 @@ test('conflicting saved task endpoints fail closed regardless of record order', 
     assert.equal(rt.taskBySession.size, 0)
     assert.equal(rt.taskById.size, 0)
     assert.equal(rt.taskDiagnostics.size, 2)
+  }
+})
+
+test('DSH Agent endpoints are rejected on commit and load without depending on the Agent index', async t => {
+  const seed = legacy()
+  seed.agents = { ordinary: { id: 'ordinary', sessions: ['agent-session'] } }
+  const { rt, statePath } = await setup(t, { seed })
+  for (const botId of ['a', 'b', 'c']) {
+    const value = task()
+    value.sessions[botId] = 'agent-session'
+    await assert.rejects(rt.commitTask('t1', () => value), /already owned/)
+    assert.equal(rt.state.tasks.t1, undefined)
+    assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).tasks.t1, undefined)
+    const loaded = await setup(t, { seed: { ...seed, tasks: { t1: value } } })
+    assert.deepEqual(loaded.rt.state.tasks.t1, value)
+    assert.match(loaded.rt.taskDiagnostics.get('t1'), /already owned/)
+    assert.equal(loaded.rt.agentOf('agent-session').id, 'ordinary')
+    assert.equal(loaded.rt.taskById.size, 0)
+    assert.equal(loaded.rt.taskBySession.size, 0)
+    assert.equal(loaded.rt.taskOwners.size, 0)
+    await loaded.rt.save({ required: true })
+    assert.deepEqual(JSON.parse(readFileSync(loaded.statePath, 'utf8')).tasks.t1, value)
+  }
+  // An Agent can gain a Session before save/indexAgents runs.
+  rt.state.agents.ordinary.sessions.push('just-adopted')
+  await assert.rejects(rt.commitTask('t1', () => ({ ...task(), sessions: { ...task().sessions, a: 'just-adopted' } })), /already owned/)
+})
+
+test('loading rejects every existing Bot, group, part and legacy Session claim', async t => {
+  const seed = legacy()
+  seed.bots.a.sessionId = 'current-a'
+  seed.bots.a.segments = [{ sessionId: 'past-a' }]
+  seed.rooms.room = { id: 'room', name: 'Group', named: true, members: ['a'], mode: 'admin', admin: 'a',
+    sessions: { a: 'group-a' }, segments: { a: [{ sessionId: 'past-group-a' }] } }
+  for (const sessionId of ['a', 'current-a', 'past-a', 'room', 'group-a', 'past-group-a', 'sess-open', 'sess-other', 'sess-closed']) {
+    const value = { ...task(), sessions: { ...task().sessions, a: sessionId } }
+    const { rt, statePath } = await setup(t, { seed: { ...seed, tasks: { t1: value } } })
+    assert.match(rt.taskDiagnostics.get('t1'), /already owned/)
+    assert.equal(rt.taskById.size, 0)
+    assert.equal(rt.taskBySession.size, 0)
+    assert.equal(rt.taskOwners.size, 0)
+    assert.deepEqual(rt.state.tasks.t1, value)
+    await rt.save({ required: true })
+    assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')).tasks.t1, value)
+    await assert.rejects(rt.commitTask('other', () => ({ ...task('other'), sessions: { ...task('other').sessions, b: sessionId } })), /already owned/)
+    await assert.rejects(rt.commitTask('trunk', () => ({ ...task('trunk'), sessions: { ...task('trunk').sessions, c: sessionId } })), /not this Bot's trunk/)
   }
 })
 

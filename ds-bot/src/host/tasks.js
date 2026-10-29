@@ -1,4 +1,5 @@
 import { asyncScope } from './async.js'
+import { isDeepStrictEqual } from 'node:util'
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const text = value => typeof value === 'string' && value.trim().length > 0
@@ -116,7 +117,22 @@ export function install(rt) {
       if (previous) {
         if (previous.mode !== next.mode || previous.requester !== next.requester || previous.assignee !== next.assignee
           || JSON.stringify(previous.capabilityAtCreation) !== JSON.stringify(next.capabilityAtCreation)) throw new Error('Task creation identity is immutable')
-        if (previous.state !== 'open' && next.state !== previous.state) throw new Error('A terminal task cannot change state')
+        if (previous.state !== 'open') {
+          const { lateReplies: before, ...closed } = previous
+          const { lateReplies: after, ...changed } = next
+          const { ids: oldIds, count: _oldCount, results: oldResults = [], ...oldExtra } = before
+          const { ids, count: _count, results = [], ...extra } = after
+          const added = ids.length - oldIds.length
+          if (!isDeepStrictEqual(closed, changed) || !isDeepStrictEqual(oldExtra, extra)
+            || added < 0 || !isDeepStrictEqual(ids.slice(0, oldIds.length), oldIds)
+            || !Array.isArray(results) || results.length !== oldResults.length + added
+            || !isDeepStrictEqual(results.slice(0, oldResults.length), oldResults)
+            || results.slice(oldResults.length).some((result, index) => !record(result)
+              || result.resultId !== ids[oldIds.length + index] || !text(result.exchangeId)
+              || !text(result.sessionId) || !Number.isFinite(result.at))) {
+            throw new Error('A terminal task may only append late replies')
+          }
+        }
         for (const [botId, participant] of Object.entries(previous.participants)) {
           if (!Object.hasOwn(next.participants, botId)) throw new Error('Task participants cannot be removed')
           if (previous.sessions[botId] && (next.participants[botId].kind !== participant.kind
