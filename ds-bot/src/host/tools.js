@@ -137,6 +137,24 @@ export function install(rt) {
     },
   }))
 
+  ctx.tools.register(defineTool({
+    name: 'list_tasks',
+    description: 'List your open tasks with their ids, titles and participant endpoints.',
+    parameters: {},
+    output,
+    async execute(_args, exec) {
+      await rt.load()
+      const self = rt.taskOwners.get(exec.agent?.id)?.botId ?? rt.selfOf(exec.agent?.id)
+      const tasks = self === undefined ? [] : rt.openTasksOf(self)
+      if (tasks.length === 0) return 'No open tasks.'
+      return tasks.map(task => [
+        `- ${task.id} — ${task.title} (${task.state}; ${task.phase})`,
+        ...Object.entries(task.participants).map(([botId, participant]) =>
+          `  ${rt.botOf(botId)?.name ?? botId}: ${participant.role}, ${participant.kind}, ${task.sessions[botId] ?? 'not created'}`),
+      ].join('\n')).join('\n')
+    },
+  }))
+
   // Sessions a Bot is running in right now, including its open work branches.
   const activeSessions = (botId) => {
     const branches = Object.values(rt.botOf(botId)?.workBranches ?? {})
