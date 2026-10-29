@@ -6,6 +6,17 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
 import { build } from 'esbuild'
+import { indexRoster } from '../src/client/sources.js'
+
+test('client indexes branch Sessions without treating them as conversation parts', () => {
+  const bot = { id: 'a', sessionId: 'main', parts: ['a', 'main'], workBranches: {
+    open: { sessionId: 'branch-open', state: 'open' },
+    closed: { sessionId: 'branch-closed', state: 'closed' },
+  } }
+  const roster = indexRoster({ bots: [bot], rooms: [] })
+  for (const id of ['a', 'main', 'branch-open', 'branch-closed']) assert.equal(roster.byId[id], bot)
+  assert.deepEqual(bot.parts, ['a', 'main'])
+})
 
 // jsdom comes from the harness that test/harness-resolve.mjs found, like the dsh packages.
 const PLUGIN = dirname(dirname(fileURLToPath(import.meta.url)))
@@ -25,9 +36,10 @@ const { outputFiles } = await build({
 let renderRefs
 let refIndex = 0
 let layoutEffects
+let passiveEffects
 const react = {
   createElement: (type, props, ...children) => ({ type, props: { ...props, children } }), Fragment: Symbol('Fragment'),
-  useEffect() {}, useLayoutEffect: effect => layoutEffects?.push(effect), useState: initial => [initial, () => {}],
+  useEffect: effect => passiveEffects?.push(effect), useLayoutEffect: effect => layoutEffects?.push(effect), useState: initial => [initial, () => {}],
   useMemo: make => make(), useRef: current => renderRefs ? renderRefs[refIndex++] ??= { current } : { current }, useId: () => 'id',
 }
 const module = { exports: {} }
@@ -263,6 +275,28 @@ test('preparing sidebar navigation leaves actions elsewhere unchanged', () => {
   assert.deepEqual(calls, [])
   actions.openSession('from-another-surface')
   assert.deepEqual(calls, [['openSession', 'from-another-surface']])
+})
+
+test('the sidebar keeps work branch sessions open while redirecting earlier chat parts', () => {
+  const bot = { id: 'ada', name: 'ADA', sessionId: 'current', parts: ['earlier'], workBranches: {
+    task: { sessionId: 'branch', state: 'open' }, closed: { sessionId: 'closed-branch', state: 'closed' },
+  } }
+  const roster = { bots: [bot], rooms: [], agents: [], byId: { ada: bot, current: bot, earlier: bot, branch: bot, 'closed-branch': bot }, ready: true, mainBotId: bot.id }
+  for (const id of ['branch', 'closed-branch', 'current', 'earlier']) {
+    const calls = []
+    passiveEffects = []
+    try {
+      TeamSidebar({
+        wide: true, actions: { landOn: id => calls.push(id) },
+        useRoster: pick => pick(roster), useUi: pick => pick({ unread: {} }), useRegistry: pick => pick({}),
+        useSessions: pick => pick({ ids: [id], byId: { [id]: { id, retainedBy: { mainView: 1 } } } }),
+      })
+      passiveEffects.forEach(effect => effect())
+    } finally {
+      passiveEffects = undefined
+    }
+    assert.deepEqual(calls, id === 'earlier' ? [bot.id] : [], `navigation from ${id}`)
+  }
 })
 
 function rulesOf(css) {

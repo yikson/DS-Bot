@@ -1094,6 +1094,25 @@ test('a first chat review pages back to the user\'s latest line', async (t) => {
   assert.ok(requests[0].messages[0].content[0].text.includes('\nUser: I work on Linux\n'))
 })
 
+test('a branch memory review starts after its inherited boundary and keeps an independent cursor', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
+  const team = structuredClone(TEAM)
+  team.bots.b2.workBranches = { work: { id: 'work', sessionId: 'branch', trunkSessionId: 'b2', state: 'closed', inheritedThrough: 10, workIds: [], summaryDelivered: true } }
+  writeFileSync(join(home, 'state.json'), JSON.stringify(team))
+  const line = (seq, text) => ({ event: { seq, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } } })
+  const { ctx, call, read, requests, stop } = start({ home, replies: [JSON.stringify({ changes: [] })],
+    history: { branch: [line(10, 'Inherited preference'), line(11, 'New branch decision')] }, config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  ctx.emit('agent/status', { agent: { id: 'branch' }, status: 'idle' })
+  await reviewed(call)
+  assert.equal(requests.length, 1)
+  const text = requests[0].messages[0].content[0].text
+  assert.match(text, /New branch decision/)
+  assert.doesNotMatch(text, /Inherited preference/)
+  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:branch': 11 })
+})
+
 test('a chat review reads back to its cursor through every page', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
   mkdirSync(join(home, 'memory'), { recursive: true })

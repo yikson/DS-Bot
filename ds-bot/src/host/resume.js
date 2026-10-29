@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import { FAILURE_RESUME_DELAY_MS, HISTORY_TIMEOUT_MS, MESSAGE_INLINE_MAX, SOURCE_KIND } from './constants.js'
 import { answerSender, failureLine, turnFailure } from './turns.js'
 import { textOf } from './text.js'
+import { replyTarget, sourcesIn } from './branches.js'
 
 // Long enough for DSH to finish opening its workspaces after a start.
 export const RESUME_DELAY_MS = 3000
@@ -68,8 +69,9 @@ export function turnOf(events, exchangeId) {
 }
 
 // Whether a Session already holds the answer to an exchange.
-export function answeredIn(events, exchangeId) {
-  return events.some(event => event.type === 'user/message' && event.data?.source?.replyTo === exchangeId)
+export function answeredIn(events, exchangeId, branch = false) {
+  return sourcesIn(branch ? events : events.filter(event => event.type === 'user/message'))
+    .some(source => source.replyTo === exchangeId)
 }
 
 // The trigger fields a resumed turn needs to answer the same sender.
@@ -77,6 +79,7 @@ const triggerOf = info => ({
   role: info.role,
   ...(info.exchangeId ? { exchangeId: info.exchangeId } : {}),
   ...(info.senderSessionId ? { senderSessionId: info.senderSessionId } : {}),
+  ...(info.replySessionId ? { replySessionId: info.replySessionId } : {}),
   ...(info.roomId ? { roomId: info.roomId } : {}),
   ...(info.work ? { work: info.work } : {}),
   ...(info.audience ? { audience: info.audience } : {}),
@@ -207,7 +210,7 @@ export function install(rt) {
   rt.deliver = async (args) => {
     if (stopped) return args.exchangeId
     const noted = { ...args, exchangeId: args.exchangeId ?? randomUUID() }
-    const sessionId = noted.sessionId ?? rt.chatOf(noted.toId)
+    const sessionId = rt.deliverySession?.(noted) ?? noted.sessionId ?? rt.chatOf(noted.toId)
     const pending = pendingResumes[noted.exchangeId]
     // One snapshot moves a due resume into queued; a reload sees one or the other.
     if (pending !== undefined && noted.failureResumes === pending.args.failureResumes) forgetResume(noted.exchangeId)
@@ -259,7 +262,7 @@ export function install(rt) {
     switch (event.type) {
       case 'turn/start': {
         const owner = rt.groupOwners.get(id)
-        const botId = owner?.botId ?? rt.chatOwners.get(id)
+        const botId = rt.selfOf(id)
         update(id, () => ({ botId, ...(owner ? { roomId: owner.roomId } : {}), since: event.time ?? Date.now() }))
         break
       }
@@ -307,11 +310,11 @@ export function install(rt) {
       || [...rt.live.values()].some(entry => entry.turn !== undefined && rt.workOf(entry.info) === work))) return
     if ((trigger?.role === 'request' || trigger?.role === 'stopped') && trigger.senderSessionId && trigger.audience !== 'user' && rt.botOf(trigger.senderSessionId)) {
       // The sender still waits for this turn's answer, so it goes on under the same exchange.
-      await rt.deliver({ fromId: trigger.senderSessionId, toId: bot.id, role: trigger.role, ...(trigger.exchangeId ? { exchangeId: trigger.exchangeId } : {}), ...(trigger.senderRoomId ? { fromRoomId: trigger.senderRoomId } : {}), ...(trigger.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}), resumed: true, text })
+      await rt.deliver({ fromId: trigger.senderSessionId, toId: bot.id, ...(rt.branchOwners?.has(sessionId) ? { sessionId } : {}), role: trigger.role, ...(trigger.replySessionId ? { replySessionId: trigger.replySessionId } : {}), ...(trigger.exchangeId ? { exchangeId: trigger.exchangeId } : {}), ...(trigger.senderRoomId ? { fromRoomId: trigger.senderRoomId } : {}), ...(trigger.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}), resumed: true, text })
       return
     }
     // A turn that went on with work another Bot asked for still owes that Bot its answer.
-    await rt.deliver({ toId: bot.id, role: 'resume', resumed: true, text, ...(trigger?.work ? { work: trigger.work } : {}), ...(trigger?.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}) })
+    await rt.deliver({ toId: bot.id, ...(rt.branchOwners?.has(sessionId) ? { sessionId } : {}), role: 'resume', resumed: true, text, ...(trigger?.work ? { work: trigger.work } : {}), ...(trigger?.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}) })
   }
 
   // A hard stop keeps the inbox, which the Session runs once it wakes; only what DSH
@@ -330,6 +333,8 @@ export function install(rt) {
     const waiting = new Set([...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])].map(message => message.source?.exchangeId))
     for (const { args } of fresh) {
       if (waiting.has(args.exchangeId) || taken?.has(args.exchangeId) === true) continue
+      if ((rt.branchOf?.(current(args)) || rt.branchOf?.(args.replySessionId))
+        && await rt.branchDelivered(current(args), args.exchangeId, undefined, args.failureResumes)) continue
       await rt.deliver({ ...args, sessionId: current(args), steer: false, resent: true })
     }
   }
@@ -391,9 +396,9 @@ export function install(rt) {
     const said = turn.texts.join('\n\n')
     // The answer went up in another run: the work closes with what it said, and
     // nothing is sent twice.
-    const back = rt.roomOf(asker.senderRoomId)?.sessions?.[sender]
-    const sent = await logOf(back ?? rt.chatOf(sender))
-    if (sent !== undefined && answeredIn(sent, workId)) {
+    const sent = await logOf(replyTarget(rt, asker))
+    const branch = rt.branchOf?.(sessionId) || rt.branchForWork?.(workId) || rt.branchOf?.(asker.replySessionId)
+    if (sent !== undefined && answeredIn(sent, workId, !!branch)) {
       rt.closeWork?.(workId, name, rt.answerText(workId, said, name))
       return
     }
@@ -432,6 +437,38 @@ export function install(rt) {
   async function resumeAll() {
     await rt.load()
     if (stopped || rt.readOnly() !== undefined) return
+    for (const bot of Object.values(rt.state?.bots ?? {})) {
+      for (const branch of Object.values(bot.workBranches ?? {})) {
+        try {
+          if (rt.creatingBranches.has(branch.id)) continue
+          if (branch.state === 'creating') {
+            branch.state = 'failed'
+            await rt.save({ required: true })
+          }
+          if (branch.state === 'open') {
+            const readable = await logOf(branch.sessionId)
+            if (readable === undefined) {
+              branch.state = 'failed'
+              branch.closedAt = Date.now()
+              branch.summaryId = `${branch.id}:closed`
+              branch.conclusion = { status: 'blocked', text: `[Work branch closed] ${branch.title}\nBranch: ${branch.id}\nStatus: blocked\nConclusion: The branch Session cannot be read. Inspect it before retrying the task.\nLink: none` }
+              branch.summaryDelivered = false
+              await rt.save({ required: true })
+            }
+          }
+          if (branch.pendingDelivery) {
+            await rt.resumeBranchTask(branch)
+          }
+          if (branch.conclusion && !branch.summaryDelivered) await rt.sendBranchSummary(bot, branch)
+        } catch (error) { rt.warn('ds-bot: recovering branch %s failed: %s', branch.id, error) }
+      }
+    }
+    for (const [workId, work] of Object.entries(rt.state?.works ?? {})) {
+      if (!work.pendingAnswer) continue
+      try {
+        await rt.resumeBranchAnswer(workId)
+      } catch (error) { rt.warn('ds-bot: recovering reply %s failed: %s', workId, error) }
+    }
     const { turns: noted, queued: dropped } = interrupted
     const forgetTurn = (id) => {
       if (stopped) return
@@ -441,7 +478,7 @@ export function install(rt) {
     // Agents and inboxes are read before anything wakes their Sessions.
     const cut = []
     for (const [sessionId, record] of Object.entries(noted)) {
-      const first = firstTurn.get(sessionId)
+      const first = firstTurn?.get(sessionId)
       if (first?.type === 'turn/end') {
         // The turn ended while DS Bot was not watching it: what it did is settled from
         // the Session's durable log.
@@ -473,7 +510,7 @@ export function install(rt) {
   }
 
   ctx.effect(() => {
-    void rt.load().then(() => {
+    if (Object.keys(pendingResumes).length > 0) void rt.load().then(() => {
       if (stopped || rt.readOnly() !== undefined) return
       // An interrupted continuation owns its work. Older snapshots may still carry
       // the failure wait it superseded; do not arm both recovery paths.
@@ -483,9 +520,19 @@ export function install(rt) {
       }
       for (const [exchangeId, record] of Object.entries(pendingResumes)) armResume(exchangeId, record)
     }).catch(error => rt.warn('ds-bot: loading pending failure resumes failed: %s', error))
-    const pending = Object.keys(interrupted.turns).length > 0 || Object.keys(interrupted.queued).length > 0
-    const timer = pending ? setTimeout(() => void resumeAll().catch(error => rt.warn('ds-bot: picking up interrupted work failed: %s', error)), RESUME_DELAY_MS) : undefined
-    timer?.unref?.()
+    let timer
+    const hasBranches = bots => Object.values(bots ?? {}).some(bot => Object.keys(bot.workBranches ?? {}).length > 0)
+    let pending = Object.keys(interrupted.turns).length > 0 || Object.keys(interrupted.queued).length > 0
+      || hasBranches(rt.state?.bots)
+    // Preserve the baseline timer and lazy load; disabled pairs can still have
+    // persisted branches whose replies or conclusions need recovery.
+    if (!pending && rt.statePath) {
+      try { pending = hasBranches(JSON.parse(readFileSync(rt.statePath, 'utf8')).bots) } catch {}
+    }
+    if (pending) {
+      timer = setTimeout(() => void resumeAll().catch(error => rt.warn('ds-bot: picking up interrupted work failed: %s', error)), RESUME_DELAY_MS)
+      timer.unref?.()
+    }
     // What the turns stopped by this shutdown left stays as last noted.
     return () => {
       stopped = true
@@ -495,4 +542,5 @@ export function install(rt) {
       return writing
     }
   }, 'ds-bot: resume interrupted turns')
+  rt.resumeAll = resumeAll
 }

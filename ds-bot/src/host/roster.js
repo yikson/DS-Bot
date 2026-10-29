@@ -614,8 +614,9 @@ export function install(rt) {
     // Before the Bot and its group Sessions leave the state, which the archive reads.
     const archived = rt.archiveBotMemory(id)
     const current = rt.chatOf(id)
-    // Questions and exchange turns are kept per Session, so every part of the chat is cleared.
-    const parts = new Set([id, current, ...(bot.segments ?? []).map(segment => segment.sessionId)])
+    // Session state and armed tasks belong to branches too, including closed ones.
+    const parts = new Set([id, current, ...(bot.segments ?? []).map(segment => segment.sessionId),
+      ...Object.values(bot.workBranches ?? {}).map(branch => branch.sessionId).filter(Boolean)])
     await rt.releaseBot(id, [...parts, ...rt.groupSessionsOf(id)])
     delete state.bots[id]
     for (const part of parts) {

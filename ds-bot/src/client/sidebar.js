@@ -593,6 +593,9 @@ export function AccountLauncher({ seat = true, settingsOpen, openSettings, openO
           }, h(Icon), h('span', { className: 'bt-menu-label' }, label), hint ? h('span', { className: 'bt-menu-hint' }, hint) : null))))), document.body) : null)
 }
 
+// A work branch's Session belongs to its Bot, but it is not a part of the Bot's chat.
+const isWorkBranch = (bot, id) => Object.values(bot.workBranches ?? {}).some(branch => branch.sessionId === id)
+
 // Opens the Main Bot whenever the main view holds no Bot conversation, the way
 // The view always lands on a Bot rather than an empty New Session page.
 // When a Bot's chat moves on to a fresh part, the shell clears the view of the part
@@ -609,7 +612,8 @@ function useLandOnMainBot(roster, useSessions, actions) {
     const bot = id === '' ? undefined : roster.byId[id]
     if (bot !== undefined) {
       lastBot.current = { botId: bot.id, sessionId: id }
-      if (currentPart(bot) !== id) actions.landOn(bot.id)
+      // A work branch keeps the view: the dock opens it, and a closed branch stays readable.
+      if (currentPart(bot) !== id && !isWorkBranch(bot, id)) actions.landOn(bot.id)
       return undefined
     }
     // A DSH Agent Session, blank or not, is a real destination: it stays.
