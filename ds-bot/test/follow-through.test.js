@@ -619,7 +619,7 @@ test('in its own chat, a Bot that wrote a tool call as text is asked to make it'
 const failureOf = (code, message = 'the call failed') => ({ kind: 'error', error: { code, message } })
 
 test('a turn that failed on a transient fault runs again before the sender hears of it', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() })
   const home = freshHome(t)
   const host = await start(home)
   const request = await askWriter(host, home)
