@@ -624,3 +624,39 @@ for (const scenario of ['written-call', 'transient-failure', 'deferred-other-tas
     assert.equal(args.replySessionId, expected.sessions.a)
   })
 }
+
+test('direct deferred/retry delivery waits behind participant setup in the same async lane', async t => {
+  const f = await setup(t)
+  await f.send()
+  const task = f.tasks()[0]
+  await f.send(task.sessions.a, 'C')
+  const entered = Promise.withResolvers(), release = Promise.withResolvers()
+  const setupJob = f.rt.withTask(task.id, async () => {
+    await f.rt.commitTask(task.id, task => ({ ...task, phase: 'creating' }))
+    entered.resolve()
+    await release.promise
+    await f.rt.commitTask(task.id, task => ({ ...task, phase: 'ready' }))
+  })
+  await entered.promise
+  const before = f.agentOf('c').calls.length
+  const args = {
+    fromId: 'a', toId: 'c', taskId: task.id, sessionId: 'c', replySessionId: task.sessions.a,
+    exchangeId: 'deferred', role: 'request', text: 'deferred task work', deferred: true,
+  }
+  const send = f.rt.deliver(args)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(f.agentOf('c').calls.length, before)
+  release.resolve()
+  await Promise.all([setupJob, send])
+  assert.equal(f.agentOf('c').calls.length, before + 1)
+  assert.equal(f.incoming('c').taskId, task.id)
+})
+
+test('the lane enqueue callback cannot be retained and used after its action finishes', async t => {
+  const f = await setup(t)
+  await f.send()
+  const task = f.tasks()[0]
+  let expired
+  await f.rt.withTask(task.id, enqueue => { expired = enqueue })
+  assert.throws(() => expired({ taskId: task.id }), /outside its execution lane/)
+})

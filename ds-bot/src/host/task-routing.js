@@ -10,15 +10,23 @@ export const taskBrief = task => [
 export function install(rt) {
   const safe = asyncScope(rt)
   const lanes = new Map()
+  const deliveryLane = {}
   const creating = new Set()
   const checkGeneration = () => {
     if (safe.stopped || rt.isStopped?.()) throw new Error('Task operation stopped; its durable intent remains pending')
   }
   // Lifecycle side effects, including close in the next slice, share this lane.
   const withTask = (id, action) => {
-    const job = (lanes.get(id) ?? Promise.resolve()).catch(() => {}).then(() => {
+    const job = (lanes.get(id) ?? Promise.resolve()).catch(() => {}).then(async () => {
       checkGeneration()
-      return action()
+      let active = true
+      try {
+        return await action((args, receipt) => {
+          if (!active || args.taskId !== id) throw new Error('Task enqueue is outside its execution lane')
+          checkGeneration()
+          return rt.deliver(args, receipt, deliveryLane)
+        })
+      } finally { active = false }
     })
     lanes.set(id, job)
     return job.finally(() => { if (lanes.get(id) === job) lanes.delete(id) })
@@ -282,7 +290,7 @@ export function install(rt) {
     }
     args.sessionId = current
   }
-  async function dispatchTask(id, args, receipt = {}, inspect = false) {
+  async function dispatchTask(id, args, receipt, inspect, enqueue) {
     if (args.taskId !== id || typeof args.exchangeId !== 'string' || !args.exchangeId
       || !Object.hasOwn(openTask(id).participants, args.fromId)) throw new Error('Task send identity does not match its execution lane')
     const deliveryId = args.exchangeId
@@ -306,19 +314,19 @@ export function install(rt) {
       const agent = await rt.resolveAgent(args.sessionId)
       checkGeneration()
       await rt.ctx.sessions.flush(agent.session)
-    } else await rt.deliver(args, receipt)
+    } else await enqueue(args, receipt)
     checkGeneration()
     if (receipt.skipped) return false
     await commit(id, task => { delete task.pendingSends[deliveryId]; return task })
     return true
   }
-  const sendTask = (id, args, receipt) => withTask(id, () => dispatchTask(id, args, receipt))
+  const sendTask = (id, args, receipt = {}) => withTask(id, enqueue => dispatchTask(id, args, receipt, false, enqueue))
   const resumeTaskAnswer = workId => {
     const work = rt.state.works?.[workId]
     const pending = work?.pendingAnswer
     if (!pending?.args.taskId) return
-    return withTask(pending.args.taskId, async () => {
-      if (!await dispatchTask(pending.args.taskId, pending.args, {}, true)) return
+    return withTask(pending.args.taskId, async enqueue => {
+      if (!await dispatchTask(pending.args.taskId, pending.args, {}, true, enqueue)) return
       checkGeneration()
       rt.closeWork(workId, pending.name, pending.text)
       await rt.save({ required: true })
@@ -328,7 +336,7 @@ export function install(rt) {
   async function sendTaskAnswer(sessionId, source, text, long) {
     const work = rt.state.works?.[source.exchangeId]
     const taskId = source.taskId ?? work?.taskId
-    return withTask(taskId, async () => {
+    return withTask(taskId, async enqueue => {
       const task = openTask(taskId)
       const fromId = rt.selfOf(sessionId)
       if (!Object.hasOwn(task.participants, fromId)
@@ -347,7 +355,7 @@ export function install(rt) {
         await rt.save({ required: true })
         checkGeneration()
       }
-      if (!await dispatchTask(taskId, args, {}, true)) return
+      if (!await dispatchTask(taskId, args, {}, true, enqueue)) return
       rt.closeWork(source.exchangeId, name, text)
       await rt.save({ required: true })
       checkGeneration()
@@ -377,10 +385,14 @@ export function install(rt) {
       for (const saved of Object.values(task.pendingSends)) {
         const args = { ...saved }
         delete args.state
-        await withTask(task.id, () => dispatchTask(task.id, args, {}, true))
+        await withTask(task.id, enqueue => dispatchTask(task.id, args, {}, true, enqueue))
       }
     }
   }
   Object.assign(rt, { taskContext, selectTaskRoute, routeTask, withTask, sendTask, sendTaskAnswer,
     resumeTaskAnswer, checkTaskDelivery, prepareTaskDelivery, recoverTaskCreations, recoverTasks })
+  const deliver = rt.deliver
+  rt.deliver = (args, receipt, lane) => args.taskId && lane !== deliveryLane
+    ? withTask(args.taskId, () => deliver(args, receipt))
+    : deliver(args, receipt)
 }

@@ -210,7 +210,7 @@ export function install(rt) {
   }
 
   const deliver = rt.deliver
-  rt.deliver = async (args, receipt) => {
+  rt.deliver = async (args, receipt, lane) => {
     if (stopped || safe.stopped) {
       if (receipt) receipt.skipped = true
       return args.exchangeId
@@ -224,10 +224,10 @@ export function install(rt) {
     queued = { ...queued, [sessionId]: [...(queued[sessionId] ?? []), { at: Date.now(), args: noted }].slice(-QUEUED_MAX) }
     persist()
     try {
-      return await deliver(noted, receipt)
+      return await deliver(noted, receipt, lane)
     } catch (error) {
       // A stopped host leaves the durable queue for the next install.
-      if (stopped) throw error
+      if (stopped || safe.stopped) throw error
       forgetQueued(noted.exchangeId)
       if (pending !== undefined && openResume(pending) && !stopped) {
         pendingResumes[noted.exchangeId] = { ...pending, due: Date.now() + FAILURE_RESUME_DELAY_MS }
