@@ -207,9 +207,9 @@ export function install(rt) {
   }
 
   const deliver = rt.deliver
-  rt.deliver = async (args) => {
+  rt.deliver = async (args, receipt) => {
     if (stopped) return args.exchangeId
-    const noted = { ...args, exchangeId: args.exchangeId ?? randomUUID() }
+    const noted = args.exchangeId === undefined ? { ...args, exchangeId: randomUUID() } : args
     const sessionId = rt.deliverySession?.(noted) ?? noted.sessionId ?? rt.chatOf(noted.toId)
     const pending = pendingResumes[noted.exchangeId]
     // One snapshot moves a due resume into queued; a reload sees one or the other.
@@ -218,7 +218,7 @@ export function install(rt) {
     queued = { ...queued, [sessionId]: [...(queued[sessionId] ?? []), { at: Date.now(), args: noted }].slice(-QUEUED_MAX) }
     persist()
     try {
-      return await deliver(noted)
+      return await deliver(noted, receipt)
     } catch (error) {
       // A stopped host leaves the durable queue for the next install.
       if (stopped) throw error
@@ -235,6 +235,13 @@ export function install(rt) {
   // What a Session was sent and no turn has read yet.
   rt.unreadOf = sessionId => (queued[sessionId] ?? []).map(item => item.args)
   rt.forgetDelivery = forgetQueued
+  rt.replaceDelivery = (exchangeId, args) => {
+    forgetQueued(exchangeId)
+    forgetQueued(args.exchangeId)
+    const sessionId = rt.deliverySession?.(args) ?? args.sessionId ?? rt.chatOf(args.toId)
+    queued[sessionId] = [...(queued[sessionId] ?? []), { at: Date.now(), args }]
+    persist()
+  }
 
   // A message is done with once a turn takes it up, or once it leaves the inbox untaken
   // while DS Bot runs: the user stopped the Bot, or DS Bot moved or withdrew it.

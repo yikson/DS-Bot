@@ -212,6 +212,11 @@ export function install(rt) {
   // Roles whose turn owes the sender a reply: a 'stopped' notice asks the Bot to
   // acknowledge, exactly like a request.
   const expectsReply = info => info.role === 'request' || info.role === 'stopped'
+  const privateTurn = (sessionId) => {
+    const entry = live.get(sessionId)
+    return entry?.turn !== undefined && !entry.visible && !rt.groupOwners.has(sessionId)
+      && state.exchangeTurns[sessionId]?.includes(entry.turn) ? entry.info : undefined
+  }
   // A group Session speaks only in its group, so what its turns write goes there, also
   // for turns that a finished background job or a fresh part starts; a Bot's private
   // message to it is answered privately.
@@ -434,6 +439,7 @@ export function install(rt) {
         entry.shown = 0
         entry.step = undefined
         entry.info = undefined
+        entry.visible = false
         // A turn turned away before its first step may end without a turn/end.
         entry.switched = false
         entry.answers = false
@@ -448,6 +454,7 @@ export function install(rt) {
         break
       case 'user/message': {
         const source = event.data?.source
+        if (entry.turn !== undefined && (source?.kind !== SOURCE_KIND || source.audience === 'user' || source.role === 'room')) entry.visible = true
         // A result that came back counts as taken once a turn reads it.
         if (source?.kind === SOURCE_KIND && source.work !== undefined && source.replyTo !== undefined) rt.takenWork?.(source.work, source.replyTo)
         // A message that shares a step with a bare handoff package is what the turn
@@ -717,5 +724,5 @@ export function install(rt) {
     }
   })
 
-  Object.assign(rt, { live, liveOf, roomWaiters, roomProgress, roomInbox, activityView, workView, roomWorkView, turnsView, steeredView, callDetail, doingOf, stopRoomTurn, releaseBot })
+  Object.assign(rt, { live, liveOf, privateTurn, roomWaiters, roomProgress, roomInbox, activityView, workView, roomWorkView, turnsView, steeredView, callDetail, doingOf, stopRoomTurn, releaseBot })
 }
