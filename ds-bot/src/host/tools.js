@@ -82,15 +82,18 @@ export function install(rt) {
     },
   }))
 
-  // Sessions a Bot is running in right now: its own chat plus each group Session
-  // with a live turn. An idle Bot reports just its own chat.
+  // Sessions a Bot is running in right now, including its open work branches.
   const activeSessions = (botId) => {
-    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId)])]
+    const branches = Object.values(rt.botOf(botId)?.workBranches ?? {})
+      .filter(branch => branch.state === 'open').map(branch => branch.sessionId).filter(Boolean)
+    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId), ...branches])]
       .filter(sessionId => rt.live.get(sessionId)?.turn !== undefined)
     return { running, idle: running.length === 0 }
   }
   const whereOf = (sessionId) => {
     const room = rt.roomOf(rt.groupOwners.get(sessionId)?.roomId)
+    const branch = rt.branchOf?.(sessionId)
+    if (branch) return `work branch "${branch.title}"`
     return room ? `group "${room.name}"` : 'its own chat'
   }
   // A Bot request still in the inbox: no step or turn has taken it out yet.

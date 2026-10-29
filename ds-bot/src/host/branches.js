@@ -67,8 +67,12 @@ export function install(rt) {
   const workBranchChoices = senderId => {
     const sender = rt.botOf(senderId)
     if (!sender) return []
-    return Object.values(state.bots).flatMap(owner => pairOwner(sender, owner)?.id === owner.id
-      ? openBranches(owner, senderId).map(branch => `${owner.name}: ${branch.id} — ${branch.title}`) : [])
+    return Object.values(state.bots).flatMap(other => {
+      const owner = pairOwner(sender, other)
+      if (!owner) return []
+      const peer = owner.id === senderId ? other : sender
+      return openBranches(owner, peer.id).map(branch => `${other.name}: ${branch.id} — ${branch.title}`)
+    })
   }
 
   async function createBranch(bot, peer, text, id) {

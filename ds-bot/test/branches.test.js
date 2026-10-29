@@ -541,18 +541,22 @@ test('prompt: open choices', async t => {
   await f.send('Task one')
   await f.send('Task two')
   const prompt = id => f.ctx.sections.get('bot-identity').text({ agent: { id } })
-  const listed = await f.tool('list_bots', {}, 'b')
+  const listed = await Promise.all(['a', 'b'].map(id => f.tool('list_bots', {}, id)))
   for (const branch of f.branches()) {
-    for (const text of [prompt('b'), listed]) {
+    for (const text of [prompt('a'), prompt('b'), ...listed]) {
       assert.ok(text.includes(branch.id))
       assert.ok(text.includes(branch.title))
     }
+    assert.ok(f.rt.workBranchChoices('a').some(choice => choice.includes(`Cardpack: ${branch.id}`)))
+    assert.ok(f.rt.workBranchChoices('b').some(choice => choice.includes(`ADA: ${branch.id}`)))
     assert.ok(!prompt('c').includes(branch.id))
   }
   const closed = f.branches()[0]
   await f.rt.closeBranch(closed.sessionId, { status: 'done', conclusion: 'Accepted' })
-  assert.ok(!prompt('b').includes(closed.id))
-  assert.ok(!(await f.tool('list_bots', {}, 'b')).includes(closed.id))
+  for (const id of ['a', 'b']) {
+    assert.ok(!prompt(id).includes(closed.id))
+    assert.ok(!(await f.tool('list_bots', {}, id)).includes(closed.id))
+  }
 })
 
 test('tools: baseline/branch', async t => {
@@ -734,6 +738,50 @@ const persistedBranches = () => ({
   works: { 'br-open': { from: 'a', to: 'b', open: [], results: [], at: 1000 } },
 })
 
+test('stop_bot cancels a Bot running only in its open work branches', async t => {
+  const seed = persistedBranches()
+  seed.mainBotIds = ['b']
+  const f = await setup(t, { enabled: false, seed })
+  const cancelled = []
+  for (const id of ['sess-open', 'sess-closed']) {
+    f.rt.liveOf(id).turn = 1
+    f.agentOf(id).cancel = reason => cancelled.push([id, reason])
+  }
+  assert.equal(f.rt.live.get('a')?.turn, undefined)
+  const result = await f.tool('stop_bot', { bot: 'ADA', reason: 'Unsafe task' }, 'b')
+  assert.deepEqual(cancelled, [['sess-open', { kind: 'hook', reason: 'ds-bot/stopped' }]])
+  assert.match(result, /Stopped ADA in work branch "Check the pack"/)
+  assert.equal(f.agentOf('a').calls[0].source.role, 'stopped')
+  assert.match(f.agentOf('a').calls[0].content[0].text, /Unsafe task$/)
+})
+
+test('deleting a Bot releases and archives every work-branch Session', async t => {
+  const seed = persistedBranches()
+  seed.mainBotIds = ['b']
+  seed.bots.a.workBranches['br-failed'].sessionId = 'sess-failed'
+  const f = await setup(t, { enabled: false, seed })
+  const archived = []
+  f.ctx.workspaceRegistry.archiveSession = async (id, options) => {
+    assert.equal(f.rt.live.has(id), false, `${id} activity released before archive`)
+    archived.push([id, options])
+  }
+  for (const id of ['sess-open', 'sess-closed', 'sess-failed']) {
+    f.rt.liveOf(id).turn = 1
+    f.rt.state.questions[id] = { question: 'Keep?' }
+    ;(f.rt.state.views ??= {})[id] = { type: 'text', text: 'Old view' }
+    f.rt.state.exchangeTurns[id] = [1]
+    f.rt.state.switching[id] = { status: 'pending' }
+  }
+  await f.rt.deleteBot('a')
+  assert.equal(f.rt.state.bots.a, undefined)
+  assert.deepEqual(archived, ['a', 'sess-open', 'sess-closed', 'sess-failed'].map(id => [id, { stopActivity: true }]))
+  for (const id of ['sess-open', 'sess-closed', 'sess-failed']) {
+    assert.equal(f.rt.live.has(id), false)
+    assert.equal(f.rt.selfOf(id), undefined)
+    for (const key of ['questions', 'views', 'exchangeTurns', 'switching']) assert.equal(f.rt.state[key][id], undefined)
+  }
+})
+
 test('state written by the first work-branch build still routes and recovers', async t => {
   const f = await setup(t, { enabled: false, seed: persistedBranches() })
   const byId = Object.fromEntries(f.branches().map(branch => [branch.id, branch]))
@@ -755,10 +803,13 @@ test('state written by the first work-branch build still routes and recovers', a
   assert.match(f.agentOf('sess-open').calls[0].content[0].text, /Result$/)
   assert.equal(f.agentOf('a').calls.length, 0)
   assert.equal(f.rt.state.works['br-open'], undefined)
-  // The open branch closes once, the closed one refuses a second close.
+  // The open branch closes once; closing the old closed branch is idempotent.
   await f.tool('close_work_branch', { status: 'done', conclusion: 'Accepted' }, 'sess-open')
   assert.equal(f.agentOf('a').calls.length, 1)
   assert.equal(f.agentOf('a').calls[0].source.exchangeId, 'br-open:closed')
-  await assert.rejects(f.tool('close_work_branch', { status: 'done', conclusion: 'again' }, 'sess-closed').then(() => { throw new Error('closed again') }), /closed again|not open/)
+  const previous = structuredClone(byId['br-closed'])
+  assert.equal(await f.tool('close_work_branch', { status: 'done', conclusion: 'again' }, 'sess-closed'),
+    'Work branch closed; its conclusion is in the main chat.')
+  assert.deepEqual(byId['br-closed'], previous)
   assert.equal(f.agentOf('a').calls.length, 1)
 })
