@@ -29,6 +29,7 @@ const seed = () => ({
 // One DS Bot host on `home`; a second start on the same home is a restart.
 // Hosts by home: a home is removed only after its hosts stopped and their writes landed.
 const started = new Map()
+const clocks = new Map()
 
 // The durable logs DSH keeps, by Session: what a Session's turns did and said.
 // `inspect` stands in for DSH reading that log, when a test cannot read it.
@@ -70,16 +71,35 @@ async function start(home, logs, inspect) {
   const askApproval = sessionId => ctx.listeners.get('approval/request')[0]({ agent: { session: { id: sessionId } }, toolName: 'pwsh', reason: 'escalate sandbox' }, () => 'from-dsh')
   const call = async (endpoint, payload) => (await route.fetch(new Request('http://localhost/api/bot', { method: 'POST', body: JSON.stringify({ endpoint, payload }) }))).json()
   await tool('list_bots', {}, 'a')
-  const host = { ctx, agentOf, emit, tool, call, askApproval, stop: () => ctx.dispose() }
+  const stop = async () => {
+    let stopped = false
+    const disposing = ctx.dispose().finally(() => { stopped = true })
+    const until = performance.now() + 5000
+    // Windows replacement retries use the mocked clock while dispose waits for IO.
+    while (!stopped && performance.now() < until) {
+      await realDelay(10)
+      if (!stopped) {
+        try { clocks.get(home).tick(100) } catch (error) {
+          if (error.code !== 'ERR_INVALID_STATE') throw error
+        }
+      }
+    }
+    assert.ok(stopped, 'plugin disposal did not settle')
+    await disposing
+  }
+  const host = { ctx, agentOf, emit, tool, call, askApproval, stop }
   started.set(home, [...(started.get(home) ?? []), host])
   return host
 }
 
 const freshHome = (t, state = seed()) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-follow-'))
+  clocks.set(home, t.mock.timers)
   writeFileSync(join(home, 'state.json'), JSON.stringify(state))
   t.after(async () => {
     await Promise.all((started.get(home) ?? []).map(host => host.stop()))
+    t.mock.timers.reset()
+    clocks.delete(home)
     started.delete(home)
     rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
   })
@@ -97,8 +117,8 @@ const settleState = async (t, home, check) => {
   assert.ok(check(), 'condition not reached')
 }
 const settle = async (check) => {
-  const until = Date.now() + 3000
-  while (!check() && Date.now() < until) await new Promise(resolve => setImmediate(resolve))
+  const until = performance.now() + 3000
+  while (!check() && performance.now() < until) await new Promise(resolve => setImmediate(resolve))
   assert.ok(check(), 'condition not reached')
 }
 const text = message => message.content.map(block => block.text ?? '').join('\n')
@@ -683,6 +703,136 @@ test('disposing the plugin clears every pending transient failure resume', async
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(host.agentOf('a').calls.length, 0)
   assert.equal(host.agentOf('b').calls.length, 0)
+})
+
+for (const overdue of [false, true]) {
+  test(`a pending failure resume survives reload and runs once${overdue ? ' immediately when overdue' : ' at its original due time'}`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() })
+    const home = freshHome(t)
+    const first = await start(home)
+    const request = await askWriter(first, home)
+    const exchangeId = request.source.exchangeId
+    first.emit('b', 'turn/end', { turn: 1, reason: failureOf('TIMEOUT') })
+    await settle(() => notes(home).pendingResumes?.[exchangeId] !== undefined)
+    const pending = notes(home).pendingResumes[exchangeId]
+    assert.deepEqual([pending.work, pending.args.exchangeId, pending.args.failureResumes], [exchangeId, exchangeId, 1])
+    assert.equal(pending.due, Date.now() + FAILURE_RESUME_DELAY_MS)
+    await first.stop()
+    t.mock.timers.tick(overdue ? FAILURE_RESUME_DELAY_MS + 1000 : 20_000)
+    const second = await start(home)
+    if (!overdue) {
+      t.mock.timers.tick(pending.due - Date.now() - 1)
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(second.agentOf('b').calls.length, 0)
+    }
+    t.mock.timers.tick(overdue ? 0 : 1)
+    await settle(() => second.agentOf('b').calls.length === 1)
+    const resume = second.agentOf('b').calls[0]
+    assert.deepEqual([resume.source.exchangeId, resume.source.failureResumes], [exchangeId, 1])
+    run(second, 'b', 2, resume)
+    second.emit('b', 'assistant/message', { message: { content: [{ type: 'text', text: 'finished after reload' }] } })
+    second.emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+    await settle(() => second.agentOf('a').calls.length === 1)
+    t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(second.agentOf('b').calls.length, 1)
+    await settle(() => Object.keys(notes(home).pendingResumes ?? { writing: true }).length === 0)
+  })
+}
+
+test('the failure resume budget survives another reload', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() })
+  const home = freshHome(t)
+  const first = await start(home)
+  const request = await askWriter(first, home)
+  first.emit('b', 'turn/end', { turn: 1, reason: failureOf('SERVER') })
+  await first.stop()
+  const second = await start(home)
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await settle(() => second.agentOf('b').calls.length === 1)
+  run(second, 'b', 2, second.agentOf('b').calls[0])
+  second.emit('b', 'turn/end', { turn: 2, reason: failureOf('SERVER') })
+  await second.stop()
+  assert.equal(notes(home).pendingResumes[request.source.exchangeId].args.failureResumes, 2)
+  const third = await start(home)
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await settle(() => third.agentOf('b').calls.length === 1)
+  const last = third.agentOf('b').calls[0]
+  assert.equal(last.source.failureResumes, 2)
+  run(third, 'b', 3, last)
+  third.emit('b', 'turn/end', { turn: 3, reason: failureOf('SERVER') })
+  await settle(() => third.agentOf('a').calls.length === 1)
+  assert.match(text(third.agentOf('a').calls[0]), /after 2 automatic resumes/)
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(third.agentOf('b').calls.length, 1)
+})
+
+test('a child result that finishes the work cancels its pending failure resume', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const state = seed()
+  state.bots.c = { id: 'c', name: 'Reviewer', sessionId: 'c', createdAt: 3 }
+  const home = freshHome(t, state)
+  const host = await start(home)
+  const request = await askWriter(host, home)
+  await host.tool('message_bot', { to: 'Reviewer', message: 'Review the plan' }, 'b')
+  run(host, 'c', 1, host.agentOf('c').calls[0])
+  host.emit('b', 'turn/end', { turn: 1, reason: failureOf('TIMEOUT') })
+  host.emit('c', 'assistant/message', { message: { content: [{ type: 'text', text: 'the plan checks out' }] } })
+  host.emit('c', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  await settle(() => host.agentOf('b').calls.length === 2)
+  run(host, 'b', 2, host.agentOf('b').calls[1])
+  host.emit('b', 'assistant/message', { message: { content: [{ type: 'text', text: 'plan finished with review' }] } })
+  host.emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  await settle(() => host.agentOf('a').calls.length === 1)
+  await settleState(t, home, () => stateOf(home).works[request.source.exchangeId] === undefined)
+  await settle(() => Object.keys(notes(home).pendingResumes ?? { writing: true }).length === 0)
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(host.agentOf('b').calls.length, 2)
+  assert.equal(host.agentOf('a').calls.length, 1)
+})
+
+test('an overdue persisted resume rechecks that its work is still open', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() })
+  const home = freshHome(t)
+  writeFileSync(join(home, 'inflight.json'), JSON.stringify({
+    pendingResumes: {
+      x1: { work: 'x1', due: Date.now() - 1, args: { toId: 'b', sessionId: 'b', role: 'request', exchangeId: 'x1', fromId: 'a', failureResumes: 1, text: 'carry on' } },
+    },
+  }))
+  const host = await start(home)
+  t.mock.timers.tick(0)
+  await settle(() => Object.keys(notes(home).pendingResumes ?? { writing: true }).length === 0)
+  assert.equal(host.agentOf('b').calls.length, 0)
+  assert.equal(host.agentOf('a').calls.length, 0)
+})
+
+test('work that closes while the resume resolves its Session is not replayed', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const home = freshHome(t)
+  const host = await start(home)
+  const request = await askWriter(host, home)
+  host.emit('b', 'turn/end', { turn: 1, reason: failureOf('TIMEOUT') })
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  t.after(() => release())
+  let resolving = false
+  const resolveAgent = host.ctx.sessionController.resolveAgent
+  host.ctx.sessionController.resolveAgent = async (id) => {
+    if (id === 'b') { resolving = true; await gate }
+    return resolveAgent(id)
+  }
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await settle(() => resolving)
+  run(host, 'b', 2, request)
+  host.emit('b', 'assistant/message', { message: { content: [{ type: 'text', text: 'finished before the resume arrived' }] } })
+  host.emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  await settle(() => host.agentOf('a').calls.length === 1)
+  release()
+  await settle(() => notes(home).queued?.b === undefined)
+  assert.equal(host.agentOf('b').calls.length, 1)
+  assert.equal(host.agentOf('a').calls.length, 1)
 })
 
 test('input during the wait keeps its turn and the failed request resumes as a followup', async (t) => {

@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import { cleanText, install as installDiagnostics, reportMarkdown } from '../src/host/diagnostics.js'
 import { failureLine, install as installTurns, turnFailure } from '../src/host/turns.js'
 import { errorCode } from '../src/host/channel.js'
-import { FAILURE_RESUME_DELAY_MS, FAILURE_RESUME_MAX, SOURCE_KIND } from '../src/host/constants.js'
+import { FAILURE_RESUME_MAX, SOURCE_KIND } from '../src/host/constants.js'
 import { fakeContext } from './fake-ctx.js'
 
 test('cleanText hides keys, tokens and the home folder', () => {
@@ -250,17 +250,16 @@ test('a failed reply to message_bot tells the sender instead of leaving it waiti
 
 test('a transient failure runs the turn again before the sender is told anything', async () => {
   const { rt, emit, delivered } = turnsHost()
-  const waits = []
-  rt.after = (ms, run) => waits.push({ ms, run })
+  const scheduled = []
+  rt.scheduleFailureResume = record => scheduled.push(record)
   emit('b', 'turn/start', { turn: 1 })
   emit('b', 'user/message', { content: [{ type: 'text', text: 'hi' }], source: { kind: SOURCE_KIND, role: 'request', senderSessionId: 'a', exchangeId: 'x1' } })
   emit('b', 'turn/end', { turn: 1, reason: failed })
   assert.deepEqual(delivered, [])
-  assert.deepEqual(waits.map(wait => wait.ms), [FAILURE_RESUME_DELAY_MS])
-  // The turn runs again on the same trigger, and the sender keeps waiting.
-  await waits[0].run()
-  assert.deepEqual(delivered.map(job => [job.toId, job.role, job.exchangeId, job.failureResumes]), [['b', 'request', 'x1', 1]])
-  assert.match(delivered[0].text, /^Your last turn stopped because the model connection failed \(SERVER\). Check what is already done/)
+  assert.equal(scheduled.length, 1)
+  const { args } = scheduled[0]
+  assert.deepEqual([args.toId, args.role, args.exchangeId, args.failureResumes], ['b', 'request', 'x1', 1])
+  assert.match(args.text, /^Your last turn stopped because the model connection failed \(SERVER\). Check what is already done/)
 })
 
 test('a failed group turn fails its waiter; a stopped one counts as no answer', () => {

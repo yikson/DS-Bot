@@ -3,7 +3,7 @@
 //
 // Turn tracking: which turns were triggered by another Bot, and what they said.
 import {
-  FAILURE_RESUME_DELAY_MS, FAILURE_RESUME_MAX, HANDOFF_ACK, MESSAGE_INLINE_MAX, REFERENCE_KIND, REPLY_KIND, SOURCE_KIND,
+  FAILURE_RESUME_MAX, HANDOFF_ACK, MESSAGE_INLINE_MAX, REFERENCE_KIND, REPLY_KIND, SOURCE_KIND,
   TRANSIENT_FAILURE_CODES,
 } from './constants.js'
 import { absoluteLinks } from './links.js'
@@ -70,22 +70,8 @@ const RETRY_TEXT = 'Your last reply wrote a tool call as plain text (<tool_call>
 
 const failureResumeText = code => `Your last turn stopped because the model connection failed (${code}). Check what is already done (files, commands, messages) before you repeat anything, then finish the task and give your reply.`
 
-// The wait before a failed turn runs again; `rt.after` replaces it where a test drives
-// the clock itself, and an unreferenced timer never holds a shutdown open.
-const defaultAfter = (ms, run) => {
-  const timer = setTimeout(run, ms)
-  timer.unref?.()
-  return timer
-}
-
 export function install(rt) {
   const { ctx, state } = rt
-
-  const failureTimers = new Set()
-  ctx.effect(() => () => {
-    for (const timer of failureTimers) clearTimeout(timer)
-    failureTimers.clear()
-  }, 'ds-bot: transient failure resumes')
 
   // The retry goes where the turn's trigger came from: a group round's waiter or a
   // Bot's request keeps its exchange; anything else is a nudge in the Bot's own chat.
@@ -112,7 +98,7 @@ export function install(rt) {
   // exchange, and a turn of the Bot's own chat starts a plain one there.
   const resumeFailedTurn = (id, info, failure) => {
     const keeps = info !== undefined && expectsReply(info)
-    return rt.deliver({
+    const args = {
       ...(keeps && info.senderSessionId ? { fromId: info.senderSessionId } : {}),
       toId: rt.selfOf(id),
       sessionId: id,
@@ -124,7 +110,8 @@ export function install(rt) {
       ...(keeps && info.senderRoomId ? { fromRoomId: info.senderRoomId } : {}),
       failureResumes: (info?.failureResumes ?? 0) + 1,
       text: failureResumeText(failure.code),
-    })
+    }
+    rt.scheduleFailureResume({ work: rt.workOf?.(info), args })
   }
 
   /** @type {Map<string, {turn?:number, pending?:any, info?:any, texts:string[], opened?:boolean, joined?:{info:any, from:number}[]}>} */
@@ -628,15 +615,9 @@ export function install(rt) {
         // so whoever waits keeps waiting instead of hearing that the Bot gave up. A group
         // member's turn is left as it is: its round has a failure path of its own.
         const resumes = info?.failureResumes ?? 0
-        const resumeFailure = failure !== undefined && !rt.groupOwners.has(id)
+        const resumeFailure = failure !== undefined && !rt.groupOwners.has(id) && info?.role !== 'room'
           && TRANSIENT_FAILURE_CODES.has(failure.code) && resumes < FAILURE_RESUME_MAX
-        if (resumeFailure) {
-          const timer = (rt.after ?? defaultAfter)(FAILURE_RESUME_DELAY_MS, () => {
-            failureTimers.delete(timer)
-            void resumeFailedTurn(id, info, failure).catch(error => rt.warn('ds-bot: resuming the turn of %s failed: %s', id, error))
-          })
-          failureTimers.add(timer)
-        }
+        if (resumeFailure) resumeFailedTurn(id, info, failure)
         // What is still said about the failure, to whoever waits for the reply.
         const failed = failure !== undefined && !resumeFailure
         const replyText = () => {

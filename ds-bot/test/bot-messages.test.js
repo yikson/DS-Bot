@@ -455,6 +455,7 @@ function turnsHost() {
     save: async () => {},
     deliver: async (args) => { delivered.push(args) },
     noteFailure() {},
+    scheduleFailureResume() {},
     warn() {},
     switchJobs: () => [],
     dropKickoff() {},

@@ -109,6 +109,7 @@ export function install(rt) {
     const work = works()[id]
     if (work === undefined) return undefined
     delete works()[id]
+    rt.cancelFailureResumes?.(id)
     // What it still waits for comes back to it alone.
     for (const child of Object.values(works())) if (child.parent === id) delete child.parent
     const above = works()[work.parent]
@@ -131,6 +132,7 @@ export function install(rt) {
     if (work === undefined) return
     const { parent } = work
     delete works()[id]
+    rt.cancelFailureResumes?.(id)
     const above = works()[parent]
     if (above !== undefined) above.open = above.open.filter(other => other !== id)
     for (const result of work.results ?? []) whole.delete(result.id)

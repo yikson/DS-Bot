@@ -96,6 +96,12 @@ export function install(rt) {
     }
     await rt.ensureCapabilities(targetSessionId)
     const agent = await resolveAgent(targetSessionId)
+    // Work can finish while capabilities or the Session are being resolved.
+    const failureWork = work ?? (role === 'request' && audience !== 'user' ? exchangeId : undefined)
+    if (failureResumes !== undefined && failureWork !== undefined && !rt.ownsWork(toId, failureWork)) {
+      rt.forgetDelivery?.(exchangeId)
+      return exchangeId
+    }
     // A steered message cuts into a running turn at its next step; a follow-up
     // queues for the next turn (see turns.js for how each is routed).
     const message = createUserMessage({
