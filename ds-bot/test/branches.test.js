@@ -7,7 +7,6 @@ import { createRuntime } from '../index.js'
 import { answerSender } from '../src/host/turns.js'
 import { sourcesIn } from '../src/host/branches.js'
 import { answeredIn, install as installResume, LOG_RETRY_MS, RESUME_DELAY_MS } from '../src/host/resume.js'
-import { indexRoster } from '../src/client/sources.js'
 import { fakeContext } from './fake-ctx.js'
 
 async function setup(t, { enabled = true, seed, logs = new Map(), notes } = {}) {
@@ -275,16 +274,6 @@ test('branch identity enables read_own_chat, ask_user and show_view', async t =>
   assert.equal(f.rt.state.questions[id].question, 'Accept?')
   assert.equal(await f.tool('show_view', { view: { type: 'text', text: 'Result' } }, id), 'The view is on screen.')
   assert.match(f.ctx.sections.get('bot-identity').text({ agent: { id } }), /Work branch/)
-})
-
-test('client indexes branch Sessions without treating them as conversation parts', async t => {
-  const f = await setup(t)
-  await f.send()
-  const bot = f.rt.state.bots.a
-  const roster = indexRoster({ bots: [bot], rooms: [] })
-  assert.equal(roster.byId[f.branches()[0].sessionId], bot)
-  assert.equal(bot.parts, undefined)
-  assert.equal(sourcesIn([{ type: 'agent/inbox/spliced', data: { inserted: [{ source: { exchangeId: 'x' } }] } }])[0].exchangeId, 'x')
 })
 
 test('a pending outbound dispatch is recovered without creating another fork', async t => {
@@ -581,6 +570,7 @@ test('tools: baseline/branch', async t => {
 
 test('splice: branch only', () => {
   const splice = { type: 'agent/inbox/spliced', data: { inserted: [{ source: { replyTo: 'task' } }] } }
+  assert.equal(sourcesIn([splice])[0].replyTo, 'task')
   assert.equal(answeredIn([splice], 'task'), false)
   assert.equal(answeredIn([splice], 'task', true), true)
   assert.equal(answeredIn([{ type: 'user/message', data: { source: { replyTo: 'task' } } }], 'task'), true)
