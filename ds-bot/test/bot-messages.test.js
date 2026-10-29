@@ -4,11 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
-import { apply } from '../index.js'
+import { apply, createRuntime } from '../index.js'
 import { fakeAttachments, fakeContext } from './fake-ctx.js'
 import { install as installTurns } from '../src/host/turns.js'
 import { install as installParts } from '../src/host/parts.js'
-import { SOURCE_KIND } from '../src/host/constants.js'
+import { install as installDelivery } from '../src/host/delivery.js'
+import { install as installBranches } from '../src/host/branches.js'
+import { REFERENCE_KIND, REPLY_KIND, SOURCE_KIND } from '../src/host/constants.js'
 import { isHiddenTurn } from '../src/client/text.js'
 
 // A two-Bot team, optionally with b in a group Session 'gb' of room 'Ops'.
@@ -89,7 +91,7 @@ async function start(seed) {
     route = options
     return register(options)
   }
-  apply(ctx, { home })
+  const rt = createRuntime(ctx, { home })
   let seq = 0
   const emit = (id, type, data, extra) => {
     for (const listener of ctx.listeners.get('session/event') ?? []) {
@@ -109,27 +111,27 @@ async function start(seed) {
   }
   // Loading once fills the Session-owner indexes turns.js filters events by.
   await tool('list_bots', {}, 'a')
-  return { ctx, agents, agentOf, emit, fire, tool, call, exchanges, home, stop }
+  return { rt, ctx, agents, agentOf, emit, fire, tool, call, exchanges, home, stop }
 }
 
 const textOf = content => content.map(block => block.text ?? '').join('\n')
 
-test('message_bot steers by default; on an idle Bot it opens the next turn', async (t) => {
+test('message_bot follows up on an idle Bot or a turn with no known private work', async (t) => {
   const { agents, emit, tool, stop } = await start(team())
   t.after(stop)
 
   // Idle: the message goes to the Bot's own chat and starts its next turn.
   const idle = await tool('message_bot', { to: 'Writer', message: 'how are you' }, 'a')
   assert.equal(idle, 'Delivered to Writer. Its reply will arrive later as a new message; do not wait for it.')
-  assert.deepEqual(agents.get('b').calls.map(([kind]) => kind), ['steer'])
+  assert.deepEqual(agents.get('b').calls.map(([kind]) => kind), ['followup'])
   assert.match(textOf(agents.get('b').calls[0][1].content), /^\[Message from Chief\]/)
   assert.equal(agents.get('b').calls[0][1].source.role, 'request')
 
-  // Running: the message cuts into that turn instead of queuing.
+  // An unknown running turn cannot admit a private steer.
   emit('b', 'turn/start', { turn: 1 })
   const busy = await tool('message_bot', { to: 'Writer', message: 'watch out' }, 'a')
-  assert.equal(busy, 'Delivered to Writer while it is working: it reads your message at its next step and answers once that work is done. Its reply will arrive later as a new message; do not wait for it. Writer now: working in its own chat for less than a minute, for the user; not read yet: 1 from Chief.')
-  assert.deepEqual(agents.get('b').calls.map(([kind]) => kind), ['steer', 'steer'])
+  assert.equal(busy, 'Queued for Writer: it reads your message after its current work. Its reply will arrive later as a new message; do not wait for it. Writer now: working in its own chat for less than a minute, for the user; not read yet: 1 from Chief.')
+  assert.deepEqual(agents.get('b').calls.map(([kind]) => kind), ['followup', 'followup'])
 })
 
 test('message_bot when "queue" waits for the current work, and reply_to "user" always queues', async (t) => {
@@ -147,12 +149,7 @@ test('message_bot when "queue" waits for the current work, and reply_to "user" a
   assert.equal(agents.get('b').calls[1][1].source.audience, 'user')
 })
 
-// The path the report described: a scheduled task runs a turn the user can see, a
-// private request steers into it, the model answers while it runs, and the request is
-// then handed back to a turn of its own. This records the current routing and what is
-// visible; it does not say what a model writes in the open turn, so it does not prove
-// the reported display leak (it is not a reproduced regression).
-test('a request steered into a scheduled task is answered there and handed back to a hidden turn', async (t) => {
+test('a private request queues behind a scheduled task and answers only in a hidden turn', async (t) => {
   const { agents, emit, tool, call, exchanges, stop } = await start(team())
   t.after(stop)
   const hiddenIn = async (turn) => isHiddenTurn({ exchangeTurns: (await call('state', {})).value.exchangeTurns }, 'b', turn)
@@ -160,32 +157,23 @@ test('a request steered into a scheduled task is answered there and handed back 
   emit('b', 'turn/start', { turn: 1 })
   emit('b', 'user/message', { content: textBlock('routine check'), source: { kind: 'schedule' } })
   const out = await tool('message_bot', { to: 'Writer', message: 'which year is the data?' }, 'a')
-  const [kind, steered] = agents.get('b').calls[0]
-  // A scheduled turn hides nothing: the request steers into it like any running turn.
-  assert.equal(kind, 'steer')
-  assert.match(out, /^Delivered to Writer while it is working/)
+  const [kind, queued] = agents.get('b').calls[0]
+  assert.equal(kind, 'followup')
+  assert.match(out, /^Queued for Writer/)
   assert.equal(await hiddenIn(1), false)
 
-  // The model reads the request and answers it in the running turn.
-  emit('b', 'user/message', { content: steered.content, source: steered.source })
-  emit('b', 'assistant/message', assistantText('The data is from 2025.'))
+  emit('b', 'assistant/message', assistantText('Routine check complete.'))
   emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
-  await settled(() => agents.get('b').calls.length === 2)
-
-  // The turn's text was not routed back; the request is handed back to answer next.
-  const [next, deferred] = agents.get('b').calls[1]
-  assert.equal(next, 'followup')
-  assert.equal(deferred.source.deferred, true)
-  assert.equal(deferred.source.exchangeId, steered.source.exchangeId)
+  assert.equal(agents.get('b').calls.length, 1)
   assert.equal(agents.get('a')?.calls.length ?? 0, 0)
   assert.deepEqual((await exchanges()).map(entry => entry.role), ['request'])
   assert.equal((await call('state', {})).value.exchangeTurns.b, undefined)
   // The scheduled turn stays visible: its text is shown to the user.
   assert.equal(await hiddenIn(1), false)
 
-  // The handed-back turn is hidden, and its text is the reply the sender gets.
+  // The queued request starts its own hidden turn.
   emit('b', 'turn/start', { turn: 2 })
-  emit('b', 'user/message', { content: deferred.content, source: deferred.source })
+  emit('b', 'user/message', { content: queued.content, source: queued.source })
   assert.deepEqual((await call('state', {})).value.exchangeTurns.b, [2])
   assert.equal(await hiddenIn(2), true)
   emit('b', 'assistant/message', assistantText('2025'))
@@ -194,16 +182,14 @@ test('a request steered into a scheduled task is answered there and handed back 
 
   const reply = agents.get('a').calls[0][1]
   assert.equal(textOf(reply.content), '[Reply from Writer]\n2025')
-  assert.equal(reply.source.replyTo, steered.source.exchangeId)
+  assert.equal(reply.source.replyTo, queued.source.exchangeId)
   assert.deepEqual((await exchanges()).map(entry => entry.role), ['request', 'reply'])
   // One reply, once: the visible turn's text never went back to ADA.
   assert.equal(agents.get('a').calls.length, 1)
   assert.equal(await hiddenIn(1), false)
 })
 
-// The control: the user's own turn is never hidden, even when a private request steers
-// into it. Only the turn that answers the request is.
-test('a turn the user started stays visible when a private request steers into it', async (t) => {
+test('a private request queues behind a user turn, which stays visible', async (t) => {
   const { agents, emit, tool, call, stop } = await start(team())
   t.after(stop)
   const hiddenIn = async (turn) => isHiddenTurn({ exchangeTurns: (await call('state', {})).value.exchangeTurns }, 'b', turn)
@@ -211,19 +197,15 @@ test('a turn the user started stays visible when a private request steers into i
   emit('b', 'turn/start', { turn: 1 })
   emit('b', 'user/message', { content: textBlock('write the letter'), source: { kind: 'user' } })
   await tool('message_bot', { to: 'Writer', message: 'which year is the data?' }, 'a')
-  const steered = agents.get('b').calls[0][1]
-  emit('b', 'user/message', { content: steered.content, source: steered.source })
+  const [kind, queued] = agents.get('b').calls[0]
+  assert.equal(kind, 'followup')
   emit('b', 'assistant/message', assistantText('the letter, for the user'))
   assert.equal(await hiddenIn(1), false)
   emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
-  await settled(() => agents.get('b').calls.length === 2)
-
+  assert.equal(agents.get('b').calls.length, 1)
   assert.equal(await hiddenIn(1), false)
-  const [kind, deferred] = agents.get('b').calls[1]
-  assert.equal(kind, 'followup')
-  assert.equal(deferred.source.deferred, true)
   emit('b', 'turn/start', { turn: 2 })
-  emit('b', 'user/message', { content: deferred.content, source: deferred.source })
+  emit('b', 'user/message', { content: queued.content, source: queued.source })
   assert.equal(await hiddenIn(2), true)
   emit('b', 'assistant/message', assistantText('2025'))
   emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
@@ -258,7 +240,7 @@ test('a Bot busy in a group gets the message in its own chat, and the sender is 
   emit('gb', 'turn/start', { turn: 1 })
   const out = await tool('message_bot', { to: 'Writer', message: 'status?' }, 'a')
   assert.equal(out, 'Delivered to Writer. Its reply will arrive later as a new message; do not wait for it. Writer now: working in group "Ops" for less than a minute. Your message does not reach its work in group "Ops". If it must not go on there, use stop_bot.')
-  assert.deepEqual(agents.get('b').calls.map(([kind]) => kind), ['steer'])
+  assert.deepEqual(agents.get('b').calls.map(([kind]) => kind), ['followup'])
   assert.equal(agents.get('gb'), undefined)
 
   // A non-Main sender gets no stop_bot hint.
@@ -267,7 +249,8 @@ test('a Bot busy in a group gets the message in its own chat, and the sender is 
   assert.equal(back, 'Delivered to Chief. Its reply will arrive later as a new message; do not wait for it. Chief now: working in group "Ops" for less than a minute. Your message does not reach its work in group "Ops".')
 })
 
-test('a request steered into a running turn is recorded once and answered in a turn of its own', async (t) => {
+// Compatibility: a request already steered by an older generation is handed back.
+test('an already-steered request is recorded once and answered in a turn of its own', async (t) => {
   const { agents, emit, tool, exchanges, stop } = await start(team())
   t.after(stop)
 
@@ -351,16 +334,25 @@ test('a request from a name with brackets keeps its body when replayed after the
 })
 
 test('a message its recipient has not read yet takes in the next one, however many come', async (t) => {
-  const { ctx, agentOf, emit, tool, exchanges, stop } = await start(team())
+  const seed = threeBots()
+  seed.works = {
+    root: { from: 'c', to: 'a', open: ['running'], results: [], at: 1 },
+    running: { from: 'a', to: 'b', parent: 'root', open: [], results: [], at: 1 },
+  }
+  const { ctx, agentOf, emit, tool, exchanges, stop } = await start(seed)
   t.after(stop)
   // Writer's turn waits on something and never reaches its next step.
   const writer = agentOf('b')
   writer.steer = (message) => { writer.calls.push(['steer', message]); writer.inbox.nextStep.push(message) }
+  writer.followup = (message) => { writer.calls.push(['followup', message]); writer.inbox.nextTurn.push(message) }
+  emit('a', 'turn/start', { turn: 1 })
+  emit('a', 'user/message', { content: textBlock('work'), source: replySource('request', { exchangeId: 'root', senderSessionId: 'c' }) })
   emit('b', 'turn/start', { turn: 1 })
+  emit('b', 'user/message', { content: textBlock('work'), source: replySource('request', { exchangeId: 'running' }) })
 
   await tool('message_bot', { to: 'Writer', message: 'task 1' }, 'a')
   const second = await tool('message_bot', { to: 'Writer', message: 'task 2', when: 'queue' }, 'a')
-  assert.match(second, /Writer had not read your earlier message yet, so this one was added to it, and it answers both at once\. Writer now: working in its own chat for less than a minute, for the user; not read yet: 1 from Chief\.$/)
+  assert.match(second, /^Queued for Writer[^]*Writer had not read your earlier message yet, so this one was added to it, and it answers both at once\. Writer now: working in its own chat for less than a minute, for Chief; not read yet: 1 from Chief\./)
   for (let index = 3; index <= 12; index += 1) await tool('message_bot', { to: 'Writer', message: `task ${index}` }, 'a')
   // One message, still steered, under the first one's exchange.
   assert.equal(writer.inbox.nextStep.length, 1)
@@ -368,17 +360,17 @@ test('a message its recipient has not read yet takes in the next one, however ma
   assert.equal(textOf(waiting.content), `[Message from Chief]\n${Array.from({ length: 12 }, (_, index) => `task ${index + 1}`).join('\n\n')}`)
   assert.equal(waiting.source.exchangeId, writer.calls[0][1].source.exchangeId)
   assert.deepEqual((await exchanges()).map(entry => entry.text.split('\n\n').length), [12])
-  assert.match(await tool('list_bots', {}, 'a'), /- Writer \(Write\)\n {2}now: working in its own chat for less than a minute, for the user; not read yet: 1 from Chief\n/)
+  assert.match(await tool('list_bots', {}, 'a'), /- Writer \(Write\)\n {2}now: working in its own chat for less than a minute, for Chief; not read yet: 1 from Chief\n/)
 
   // Once a step takes it up, the next message is a new one.
   emit('b', 'user/message', { content: waiting.content, source: waiting.source })
   writer.inbox.nextStep.length = 0
-  assert.match(await tool('message_bot', { to: 'Writer', message: 'task 13' }, 'a'), /^Delivered to Writer while it is working[^]*Writer now: working in its own chat for less than a minute, for Chief\.$/)
+  assert.match(await tool('message_bot', { to: 'Writer', message: 'task 13' }, 'a'), /^Delivered to Writer while it is working[^]*Writer now: working in its own chat for less than a minute, for Chief\./)
   assert.equal((await exchanges()).length, 2)
 
   // An approval the Bot waits for shows in what the sender is told.
   for (const listener of ctx.listeners.get('approval/request')) void listener({ agent: { session: { id: 'b' } }, toolName: 'bash', reason: 'rm' }, () => new Promise(() => {}))
-  assert.match(await tool('message_bot', { to: 'Writer', message: 'task 14' }, 'a'), /Writer now: waiting for the user's approval to run bash in its own chat \(for less than a minute\); not read yet: 1 from Chief\.$/)
+  assert.match(await tool('message_bot', { to: 'Writer', message: 'task 14' }, 'a'), /Writer now: waiting for the user's approval to run bash in its own chat \(for less than a minute\); not read yet: 1 from Chief\./)
 })
 
 test('requests from two Bots, or for different work, stay apart', async (t) => {
@@ -387,7 +379,7 @@ test('requests from two Bots, or for different work, stay apart', async (t) => {
   const { agentOf, emit, tool, stop } = await start(seed)
   t.after(stop)
   const writer = agentOf('b')
-  writer.steer = (message) => { writer.calls.push(['steer', message]); writer.inbox.nextStep.push(message) }
+  writer.followup = (message) => { writer.calls.push(['followup', message]); writer.inbox.nextTurn.push(message) }
   emit('b', 'turn/start', { turn: 1 })
 
   await tool('message_bot', { to: 'Writer', message: 'from Chief' }, 'a')
@@ -398,16 +390,16 @@ test('requests from two Bots, or for different work, stay apart', async (t) => {
   emit('c', 'turn/start', { turn: 1 })
   emit('c', 'user/message', { content: ask.content, source: ask.source })
   assert.doesNotMatch(await tool('message_bot', { to: 'Writer', message: 'for that check' }, 'c'), /added to it/)
-  assert.equal(writer.inbox.nextStep.length, 3)
+  assert.equal(writer.inbox.nextTurn.length, 3)
 })
 
-test('a non-Main Bot can steer a message to a Main Bot', async (t) => {
+test('a non-Main Bot can queue a private message to a Main Bot', async (t) => {
   const { agents, tool, stop } = await start(team())
   t.after(stop)
 
   const out = await tool('message_bot', { to: 'Chief', message: 'heads up' }, 'b')
   assert.equal(out, 'Delivered to Chief. Its reply will arrive later as a new message; do not wait for it.')
-  assert.deepEqual(agents.get('a').calls.map(([kind]) => kind), ['steer'])
+  assert.deepEqual(agents.get('a').calls.map(([kind]) => kind), ['followup'])
   assert.equal(agents.get('a').calls[0][1].source.senderSessionId, 'b')
 })
 
@@ -469,6 +461,245 @@ function turnsHost() {
 const replySource = (role, extra = {}) => ({ kind: SOURCE_KIND, role, senderSessionId: 'a', senderName: 'Chief', exchangeId: 'x1', ...extra })
 const textBlock = (content) => [{ type: 'text', text: content }]
 const assistantText = text => ({ message: { content: textBlock(text) } })
+
+function deliveryHost() {
+  const { rt, emit } = turnsHost()
+  rt.config = {}
+  rt.branchOwners = new Map()
+  rt.branchByWork = new Map()
+  rt.state.exchanges = []
+  rt.state.works = {
+    root: { taskId: 'T1' },
+    other: { taskId: 'T1' },
+    running: { parent: 'root', taskId: 'T1' },
+    incoming: { parent: 'root', taskId: 'T1' },
+    earlier: { parent: 'root', taskId: 'T1' },
+  }
+  rt.workOf = source => source?.role === 'request' ? source.exchangeId : source?.work
+  rt.chatOf = id => id
+  rt.hideBotUnusedTools = () => {}
+  rt.ensureCapabilities = async () => {}
+  rt.dropWork = id => { delete rt.state.works[id] }
+  let stopped = false
+  rt.isStopped = () => stopped
+  const calls = []
+  const removed = []
+  const agent = {
+    session: { id: 'b' },
+    followup(message) { calls.push(['followup', message]) },
+    steer(message) { calls.push(['steer', message]) },
+    inbox: {
+      nextStep: [], nextTurn: [],
+      remove(id) {
+        removed.push(id)
+        for (const list of [this.nextStep, this.nextTurn]) {
+          const at = list.findIndex(message => message.id === id)
+          if (at !== -1) { list.splice(at, 1); return true }
+        }
+        return false
+      },
+    },
+  }
+  rt.ctx.sessionController = { resolveAgent: async () => ({ agent }) }
+  rt.ctx.sessions = { flush: async () => {} }
+  installDelivery(rt)
+  installBranches(rt)
+  const trigger = source => {
+    emit('b', 'turn/start', { turn: 1 })
+    if (source) emit('b', 'user/message', { content: textBlock('running'), source })
+  }
+  trigger(replySource('request', { exchangeId: 'running', taskId: 'T1' }))
+  const args = { fromId: 'a', toId: 'b', role: 'request', text: 'new', exchangeId: 'incoming', taskId: 'T1', steer: true }
+  const pause = where => {
+    const entered = Promise.withResolvers()
+    const release = Promise.withResolvers()
+    const wait = async () => { entered.resolve(); await release.promise }
+    if (where === 'capabilities') rt.ensureCapabilities = wait
+    if (where === 'resolve') rt.ctx.sessionController.resolveAgent = async () => { await wait(); return { agent } }
+    if (where === 'save') rt.save = wait
+    const send = where === 'save' ? () => rt.sendBranchTask({ id: 'legacy' }, args) : () => rt.deliver(args)
+    return { entered: entered.promise, release: release.resolve, send }
+  }
+  return { rt, emit, agent, calls, removed, args, trigger, pause, stop: () => { stopped = true } }
+}
+
+for (const where of ['capabilities', 'resolve', 'save']) {
+  for (const kind of ['user', 'schedule', 'group', 'unknown', 'bot-unknown-role', 'missing', 'missing-work', 'other-task', 'other-work', 'incoming-task', 'incoming-work', 'stopped']) {
+    test(`private enqueue rechecks ${kind} after awaiting ${where}`, async () => {
+      const host = deliveryHost()
+      const gate = host.pause(where)
+      const sending = gate.send()
+      await gate.entered
+      assert.equal(host.calls.length, 0)
+      if (kind === 'stopped') host.stop()
+      else if (kind === 'group') {
+        host.trigger(replySource('room', { exchangeId: 'running', taskId: 'T1' }))
+      } else if (kind === 'bot-unknown-role') {
+        host.trigger(replySource('unknown', { exchangeId: 'running', taskId: 'T1' }))
+      } else if (kind === 'missing-work') {
+        delete host.rt.state.works.running
+      } else if (kind === 'other-task') {
+        host.trigger(replySource('request', { exchangeId: 'running', taskId: 'T2' }))
+      } else if (kind === 'other-work') {
+        host.rt.state.works.running.parent = 'other'
+      } else if (kind === 'incoming-task') {
+        host.rt.state.works.incoming.taskId = 'T2'
+      } else if (kind === 'incoming-work') {
+        host.rt.state.works.incoming.parent = 'other'
+      } else host.trigger(kind === 'missing' ? undefined : { kind })
+      gate.release()
+      await sending
+      assert.deepEqual(host.calls.map(([method]) => method), kind === 'stopped' ? [] : ['followup'])
+    })
+  }
+  test(`matching known hidden task/work can still steer after awaiting ${where}`, async () => {
+    const host = deliveryHost()
+    const gate = host.pause(where)
+    const sending = gate.send()
+    await gate.entered
+    gate.release()
+    await sending
+    assert.deepEqual(host.calls.map(([method]) => method), ['steer'])
+  })
+}
+
+test('a visible or unknown message inside a hidden turn disables private steering', async () => {
+  for (const source of [{ kind: 'user' }, { kind: 'schedule' }, { kind: REPLY_KIND }, { kind: 'unknown' }, undefined]) {
+    const host = deliveryHost()
+    host.emit('b', 'user/message', { content: textBlock('visible'), source })
+    await host.rt.deliver(host.args)
+    assert.deepEqual(host.calls.map(([method]) => method), ['followup'])
+  }
+})
+
+for (const kind of ['runtime-context', 'agent-instructions', 'skill-catalog', 'time-context']) {
+  test(`DSH ${kind} does not make hidden private work visible`, async () => {
+    for (const deferred of [false, true]) {
+      const host = deliveryHost()
+      if (deferred) {
+        host.rt.state.works.deferred = { parent: 'root', taskId: 'T1' }
+        host.trigger(replySource('request', { exchangeId: 'deferred', taskId: 'T1', deferred: true }))
+      }
+      host.emit('b', 'user/message', { content: [], source: { kind } })
+      await host.rt.deliver(host.args)
+      assert.deepEqual(host.calls.map(([method]) => method), ['steer'], `${kind}, deferred=${String(deferred)}`)
+    }
+  })
+}
+
+for (const kind of ['compact-checkpoint', REFERENCE_KIND]) {
+  test(`DSH ${kind} context does not make hidden private work visible`, async () => {
+    const host = deliveryHost()
+    host.emit('b', 'user/message', { content: [], source: { kind } })
+    await host.rt.deliver(host.args)
+    assert.deepEqual(host.calls.map(([method]) => method), ['steer'])
+  })
+}
+
+test('non-task hidden turns require matching known private work', async () => {
+  for (const mode of ['matching', 'different', 'unknown']) {
+    const host = deliveryHost()
+    delete host.args.taskId
+    for (const work of Object.values(host.rt.state.works)) delete work.taskId
+    host.trigger(replySource('request', { exchangeId: 'running' }))
+    if (mode === 'different') host.rt.state.works.running.parent = 'other'
+    if (mode === 'unknown') host.rt.state.works = {}
+    await host.rt.deliver(host.args)
+    assert.deepEqual(host.calls.map(([method]) => method), [mode === 'matching' ? 'steer' : 'followup'])
+  }
+})
+
+test('private scope validation and enqueue run in the same synchronous step', async () => {
+  const host = deliveryHost()
+  const current = host.rt.privateTurn
+  host.rt.privateTurn = id => {
+    const source = current(id)
+    queueMicrotask(() => host.trigger({ kind: 'user' }))
+    return source
+  }
+  host.agent.steer = message => {
+    assert.equal(current('b')?.exchangeId, 'running')
+    host.calls.push(['steer', message])
+  }
+  await host.rt.deliver(host.args)
+  assert.deepEqual(host.calls.map(([method]) => method), ['steer'])
+})
+
+for (const where of ['capabilities', 'resolve', 'save']) {
+  for (const change of ['consume', 'replace', 'audience', 'task', 'work', 'incoming-task', 'incoming-work', 'text', 'matching']) {
+    test(`unread candidate ${change} is rechecked after awaiting ${where}`, async () => {
+      const host = deliveryHost()
+      const candidate = { id: 'old-message', source: replySource('request', { exchangeId: 'earlier', taskId: 'T1' }), content: textBlock('old') }
+      host.agent.inbox.nextTurn.push(candidate)
+      host.args.merge = { id: candidate.id, source: JSON.stringify(candidate.source), content: JSON.stringify(candidate.content), text: 'old\n\nnew', files: [] }
+      const gate = host.pause(where)
+      const sending = gate.send()
+      await gate.entered
+      if (change === 'consume') host.agent.inbox.nextTurn.length = 0
+      if (change === 'replace') host.agent.inbox.nextTurn[0] = { ...candidate, source: { kind: 'user' } }
+      if (change === 'audience') candidate.source.audience = 'user'
+      if (change === 'task') candidate.source.taskId = 'T2'
+      if (change === 'work') host.rt.state.works.earlier.parent = 'other'
+      if (change === 'incoming-task') host.rt.state.works.incoming.taskId = 'T2'
+      if (change === 'incoming-work') host.rt.state.works.incoming.parent = 'other'
+      if (change === 'text') candidate.content = textBlock('edited')
+      gate.release()
+      await sending
+      const delivered = host.calls[0][1]
+      assert.equal(delivered.source.exchangeId, change === 'matching' ? 'earlier' : 'incoming')
+      assert.equal(textOf(delivered.content), `[Message from Chief]\n${change === 'matching' ? 'old\n\nnew' : 'new'}`)
+      assert.deepEqual(host.removed, change === 'matching' ? ['old-message'] : [])
+      assert.equal(host.agent.inbox.nextTurn.length, ['consume', 'matching'].includes(change) ? 0 : 1)
+    })
+  }
+}
+
+test('different root private works do not merge even with no task id', async (t) => {
+  const { agentOf, tool, stop } = await start(team())
+  t.after(stop)
+  const writer = agentOf('b')
+  writer.followup = message => { writer.calls.push(['followup', message]); writer.inbox.nextTurn.push(message) }
+  await tool('message_bot', { to: 'Writer', message: 'first root' }, 'a')
+  const result = await tool('message_bot', { to: 'Writer', message: 'second root' }, 'a')
+  assert.doesNotMatch(result, /added to it/)
+  assert.equal(writer.inbox.nextTurn.length, 2)
+  assert.notEqual(writer.calls[0][1].source.exchangeId, writer.calls[1][1].source.exchangeId)
+})
+
+test('a candidate changed during attachment storage leaves the new request and file independent', async (t) => {
+  const seed = threeBots()
+  seed.works = { root: { from: 'c', to: 'a', open: [], results: [], at: 1 } }
+  const { rt, ctx, agentOf, emit, tool, stop } = await start(seed)
+  t.after(stop)
+  const store = fakeAttachments()
+  ctx.get = name => name === 'attachments' ? store : undefined
+  const writer = agentOf('b')
+  writer.followup = message => { writer.calls.push(['followup', message]); writer.inbox.nextTurn.push(message) }
+  emit('a', 'turn/start', { turn: 1 })
+  emit('a', 'user/message', { content: [], source: replySource('request', { exchangeId: 'root', senderSessionId: 'c', taskId: 'T1' }) })
+  await tool('message_bot', { to: 'Writer', message: 'first request' }, 'a')
+  const [earlier] = writer.inbox.nextTurn
+  const entered = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  const attachLong = rt.attachLong
+  rt.attachLong = async (...args) => { entered.resolve(); await release.promise; return attachLong(...args) }
+  const text = 'new request '.repeat(2000)
+  const sending = tool('message_bot', { to: 'Writer', message: text }, 'a')
+  await entered.promise
+  const changed = { ...earlier, source: { ...earlier.source, audience: 'user' } }
+  writer.inbox.nextTurn[0] = changed
+  release.resolve()
+  const result = await sending
+  assert.doesNotMatch(result, /added to it/)
+  assert.equal(writer.inbox.nextTurn.length, 2)
+  assert.equal(writer.inbox.nextTurn[0], changed)
+  const delivered = writer.inbox.nextTurn[1]
+  assert.equal(delivered.source.taskId, 'T1')
+  assert.doesNotMatch(textOf(delivered.content), /first request/)
+  const file = delivered.content.find(block => block.type === 'file').attachment
+  assert.equal(new TextDecoder().decode(store.files.get(file.attachmentId)), text)
+  assert.equal(rt.unreadOf('b').length, 2)
+})
 
 test('a stopped notice routes the acknowledgement back like a request', () => {
   const { rt, emit, delivered } = turnsHost()

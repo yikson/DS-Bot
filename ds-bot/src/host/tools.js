@@ -98,10 +98,10 @@ export function install(rt) {
   }
   // A Bot request still in the inbox: no step or turn has taken it out yet.
   const unreadRequest = (agent, senderId, toUser) => {
-    for (const [message, steered] of [...(agent.inbox?.nextStep ?? []).map(message => [message, true]), ...(agent.inbox?.nextTurn ?? []).map(message => [message, false])]) {
+    for (const message of [...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])]) {
       const source = message.source
       if (source?.kind === SOURCE_KIND && source.role === 'request' && source.senderSessionId === senderId
-        && (source.audience === 'user') === toUser && !source.deferred && !source.resumed) return { message, steered }
+        && (source.audience === 'user') === toUser && !source.deferred && !source.resumed) return { message }
     }
     return undefined
   }
@@ -144,7 +144,7 @@ export function install(rt) {
 
   ctx.tools.register(defineTool({
     name: 'message_bot',
-    description: 'Send a message to another Bot on the team. If that Bot is working, it reads your message at its next step and can change course, then answers once that work is done; if it is idle, it starts on it right away. Its reply arrives later as a new message to you; with reply_to "user" it answers the user in its own chat instead. In a group chat it reaches only members of that group, as writing "@Name" there does. With request_id you name the request yourself: a repeat of that name with the same message is not sent again, but gives the receipt of the first call back.',
+    description: 'Send a message to another Bot on the team. It reads a private message at its next step only while working privately on the same task and work; otherwise the message queues for its next turn. If it is idle, it starts on it right away. Its reply arrives later as a new message to you; with reply_to "user" it answers the user in its own chat instead. In a group chat it reaches only members of that group, as writing "@Name" there does. With request_id you name the request yourself: a repeat of that name with the same message is not sent again, but gives the receipt of the first call back.',
     parameters: {
       to: { type: 'string', required: true, description: 'Exact Bot name from list_bots' },
       message: { type: 'string', required: true, description: 'Self-contained message; the other Bot cannot see this conversation' },
@@ -156,7 +156,7 @@ export function install(rt) {
       when: {
         type: 'string',
         enum: ['now', 'queue'],
-        description: '"now" (default): a working Bot reads your message at its next step, between its current actions, and answers once its current work is done; use it for questions, information it needs, corrections and warnings. "queue": it reads your message only after its current work is done, as a separate task; use it only for a new task unrelated to what it is doing now. With reply_to "user" the message always queues.',
+        description: '"now" (default): reads your message at its next step only in a private turn of the same task and work; otherwise it queues. "queue": always reads your message after its current work, as a separate turn. With reply_to "user" the message always queues.',
       },
       request_id: {
         type: 'string',
@@ -230,6 +230,7 @@ export function install(rt) {
       const send = async () => {
         const toUser = args.reply_to === 'user'
         const work = toUser ? undefined : works[0]
+        const taskId = toUser ? undefined : rt.live.get(exec.agent?.id)?.info?.taskId
         const route = await rt.routeBranch?.(sender, target, exec.agent?.id, text, toUser, workChoice) ?? {}
         const chat = route.sessionId ?? rt.chatOf(target.id)
         const agent = await rt.resolveAgent(chat)
@@ -239,44 +240,46 @@ export function install(rt) {
         const earlier = unreadRequest(agent, sender.id, toUser)
         const joinable = earlier !== undefined && !route.exchangeId
           && earlier.message.source.replySessionId === route.replySessionId
-          && (toUser || rt.sameWork(earlier.message.source.exchangeId, work))
+          && (toUser || (work !== undefined && rt.samePrivateWork(earlier.message.source, { kind: SOURCE_KIND, role: 'reply', work, taskId })))
         const before = joinable ? bodyOf(earlier.message) : undefined
-        let long = await rt.attachLong(before ? `${before.text}\n\n${text}` : text, `Message from ${sender.name}.txt`)
+        const candidate = before === undefined ? undefined : {
+          id: earlier.message.id, source: JSON.stringify(earlier.message.source), content: JSON.stringify(earlier.message.content),
+        }
+        const long = await rt.attachLong(text, `Message from ${sender.name}.txt`)
         // Nothing went out, so a named request must not take this as a delivered
         // receipt: admitRequest drops the pending record instead, and a retry can send.
         if (long === undefined) { if (request !== undefined) request.unsent = true; return tooLong(text) }
-        const joins = before !== undefined && agent.inbox?.remove?.(earlier.message.id) === true
-        if (before !== undefined && !joins) long = await rt.attachLong(text, `Message from ${sender.name}.txt`) ?? long
-        const working = rt.live.get(chat)?.turn !== undefined
-        const steer = (args.when !== 'queue' && !toUser) || (joins && earlier.steered)
-        const exchangeId = joins ? earlier.message.source.exchangeId : route.exchangeId ?? randomUUID()
+        const combined = before === undefined ? undefined : await rt.attachLong(`${before.text}\n\n${text}`, `Message from ${sender.name}.txt`)
+        const merge = combined === undefined ? undefined : { ...candidate, ...combined, files: [...combined.files, ...before.files] }
+        const steer = args.when !== 'queue' && !toUser
+        const exchangeId = route.exchangeId ?? randomUUID()
         if (route.replySessionId && route.branch && !route.branch.workIds.includes(exchangeId)) {
           route.branch.workIds.push(exchangeId)
           rt.indexSessions()
         }
-        if (joins) rt.forgetDelivery?.(exchangeId)
-        else if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work })
+        if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work })
         if (route.branch && state.works[exchangeId]) {
           Object.assign(state.works[exchangeId], { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) })
         }
+        const receipt = {}
         try {
-          const delivery = { fromId: sender.id, toId: target.id, text: long.text, files: [...long.files, ...(joins ? before.files : [])], ...(long.length === undefined ? {} : { length: long.length }), role: 'request', steer, exchangeId, ...(route.branch ? { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) } : {}), ...(joins ? { merged: true } : {}), ...(toUser ? { audience: 'user' } : {}) }
-          if (route.branch) await rt.sendBranchTask(route.branch, delivery)
-          else await rt.deliver(delivery)
+          const delivery = { fromId: sender.id, toId: target.id, text: long.text, files: long.files, ...(long.length === undefined ? {} : { length: long.length }), role: 'request', steer, exchangeId, ...(taskId ? { taskId } : {}), ...(route.branch ? { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) } : {}), ...(merge ? { merge } : {}), ...(toUser ? { audience: 'user' } : {}) }
+          if (route.branch) await rt.sendBranchTask(route.branch, delivery, receipt)
+          else await rt.deliver(delivery, receipt)
         } catch (error) {
-          if (!joins && !route.branch) rt.dropWork(exchangeId)
+          if (!route.branch) rt.dropWork(exchangeId)
           throw error
         }
         const sent = toUser
           ? `Delivered to ${target.name}. It will answer the user in its own chat; nothing comes back to you, so point the user to ${target.name}'s chat instead of relaying.`
-          : working && steer
+          : receipt.working && receipt.steer
             ? `Delivered to ${target.name} while it is working: it reads your message at its next step and answers once that work is done. Its reply will arrive later as a new message; do not wait for it.`
-            : working
+            : receipt.working
               ? `Queued for ${target.name}: it reads your message after its current work. Its reply will arrive later as a new message; do not wait for it.`
               : `Delivered to ${target.name}. Its reply will arrive later as a new message; do not wait for it.`
         const asker = rt.ownsWork(sender.id, work) ? rt.botOf(state.works[work].from)?.name : undefined
         const notes = [
-          joins ? `${target.name} had not read your earlier message yet, so this one was added to it, and it answers both at once.` : '',
+          receipt.merged ? `${target.name} had not read your earlier message yet, so this one was added to it, and it answers both at once.` : '',
           status === 'idle' ? '' : `${target.name} now: ${status}.`,
           asker ? `When you have handed on everything, end your turn: each reply brings you back to this work, and your answer goes to ${asker} once all of it is back.` : '',
         ].filter(Boolean)
