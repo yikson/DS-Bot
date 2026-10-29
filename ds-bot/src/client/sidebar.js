@@ -329,7 +329,6 @@ function UpdateButton({ useUpdate, actions }) {
   const update = useUpdate(value => value)
   const [open, setOpen] = useState(false)
   const [box, setBox] = useState(null)
-  const [error, setError] = useState('')
   const [dshError, setDshError] = useState('')
   const button = useRef(null)
   useEffect(() => {
@@ -358,10 +357,6 @@ function UpdateButton({ useUpdate, actions }) {
   if (!update?.available && !dshRow && phase === 'idle' && dshPhase === 'idle') return null
   const cloudPhase = phase === 'installing' || dshPhase === 'installing' ? 'installing' : phase !== 'idle' ? phase : dshPhase
   const toggle = () => setOpen(value => !value)
-  const start = () => {
-    setError('')
-    void actions.installUpdate().catch(failure => setError(hostText(failure?.message ?? String(failure))))
-  }
   const startDsh = () => {
     setDshError('')
     void actions.installDshUpdate().catch(failure => setDshError(hostText(failure?.message ?? String(failure))))
@@ -373,7 +368,6 @@ function UpdateButton({ useUpdate, actions }) {
         : dshPhase === 'installed' ? t('Restart DSH to start using DSH {version}.', { version: dsh.installed ?? dsh.verified })
           : update?.available ? t('DS Bot {version} is available', { version: update.latest })
             : t('DSH {version} is available', { version: dsh?.verified })
-  const message = error || (phase === 'failed' ? update.error : '')
   const dshMessage = dshError || (dshPhase === 'failed' ? dsh?.error : '')
   const dshText = dshPhase === 'installed'
     ? t('Restart DSH to start using DSH {version}.', { version: dsh.installed ?? dsh.verified })
@@ -392,12 +386,9 @@ function UpdateButton({ useUpdate, actions }) {
           ? t('Restart DSH to start using DS Bot {version}.', { version: update.installed ?? update.latest })
           : phase === 'updated' ? t('DS Bot {version} is installed.', { version: update.installed ?? update.latest })
             : t('You have {version}.', { version: update.current })),
-        message ? h('div', { className: 'bt-update-error', role: 'alert' }, t('The update did not finish: {reason}', { reason: message })) : null,
+        h('div', { className: 'bt-update-text' }, t('Stop DSH and follow the out-of-band update procedure in the README.')),
         h('div', { className: 'bt-update-actions' },
-          update.notesUrl ? h('a', { className: 'bt-update-notes', href: update.notesUrl, target: '_blank', rel: 'noopener noreferrer' }, t("What's new")) : null,
-          phase === 'installed' || phase === 'updated' ? null : h('button', {
-            type: 'button', className: 'bt-update-go', disabled: phase === 'installing', onClick: start,
-          }, phase === 'installing' ? t('Updating…') : phase === 'failed' ? t('Try again') : t('Update')))) : null,
+          update.notesUrl ? h('a', { className: 'bt-update-notes', href: update.notesUrl, target: '_blank', rel: 'noopener noreferrer' }, t("What's new")) : null)) : null,
       dshRow ? h('div', { className: 'bt-update-dsh' },
         h('div', { className: 'bt-update-title' }, t('DSH {version}', { version: dsh.verified })),
         h('div', { className: 'bt-update-text' }, dshText),

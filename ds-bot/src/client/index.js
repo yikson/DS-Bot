@@ -601,12 +601,6 @@ export function apply(ctx) {
     return navigation ? () => navigation.openBundle(VOICE_BUNDLE) : null
   }
   actions.seatAccount = on => ui.set(state => (state.accountSeated === on ? state : { ...state, accountSeated: on }))
-  // The install runs on the host; the check loop follows it every two seconds.
-  actions.installUpdate = async () => {
-    const value = await call('update-install')
-    update.set(previous => ({ ...previous, ...value }))
-    wakeUpdate()
-  }
   // The DSH the newest released DS Bot verified installs the same way.
   actions.installDshUpdate = async () => {
     const dsh = await call('dsh-update-install')

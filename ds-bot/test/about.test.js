@@ -34,7 +34,7 @@ function page(update) {
   const actions = new Proxy({ repoStars: async () => null }, {
     get: (target, name) => target[name] ?? (() => calls.push(name)),
   })
-  const run = promise => promise
+  const run = promise => Promise.resolve(promise)
   const tree = AboutPage({ useUpdate: select => select(update), actions, run, Section: 'section', Row: 'row' })
   const find = (node, pick) => (Array.isArray(node) ? node.flatMap(one => find(one, pick))
     : node && typeof node === 'object' ? [...pick(node), ...find(node.children, pick)] : [])
@@ -98,4 +98,15 @@ test('ownAppRow maps each phase to its hint and button kind', () => {
   const downloaded = ownAppRow({ phase: 'downloaded', version: '0.2.2' })
   assert.equal(downloaded.hint, '0.2.2 is ready; it installs when you restart')
   assert.equal(downloaded.button, 'restart')
+})
+
+test('a plugin release notice offers a check and release notes without a self-install action', () => {
+  for (const phase of ['idle', 'failed', 'installing']) {
+    const view = page({ source: 'registry', available: true, latest: '9.0.0', phase })
+    assert.match(view.hint, /DS Bot 9\.0\.0 is available.*out-of-band update procedure/)
+    assert.equal(view.buttons.length, 1)
+    assert.equal(view.buttons[0].text, 'Check for updates')
+    view.buttons[0].click()
+    assert.deepEqual(view.calls, ['checkUpdate'])
+  }
 })

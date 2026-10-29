@@ -8,6 +8,7 @@ import { within } from './folders.js'
 import { absoluteLinks } from './links.js'
 import { NAME_MAX } from './requests.js'
 import { unquote } from './text.js'
+import { SELF_UPDATE_REFUSAL } from './update.js'
 import { mentionSpans } from '../shared/mentions.js'
 import { checkShownView } from '../shared/views.js'
 
@@ -32,6 +33,53 @@ const WORKING_DIRECTORY_TOOL = 'working_directory'
 
 export function install(rt) {
   const { ctx, state } = rt
+
+  const pluginChange = exec => exec.name === 'plugin_manager'
+    && ['set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle', 'set_version_exemption'].includes(exec.arguments?.action)
+  const managedSession = exec => rt.selfOf(exec.agent?.id) !== undefined || rt.agentOf?.(exec.agent?.id) !== undefined
+  const selfModule = name => typeof name === 'string' && /^ds-bot(?:\/|$)/.test(name)
+  const checkedSessions = new WeakSet()
+  const verifiedChanges = new WeakSet()
+  // Resolve dynamic entry ids and bundle aliases through public inventory APIs.
+  // The final guard fails closed if this policy was skipped or inventory failed.
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    if (!pluginChange(exec)) return next()
+    await rt.load()
+    checkedSessions.add(exec)
+    if (!managedSession(exec)) return next()
+    const { action, target } = exec.arguments
+    if (typeof target !== 'string') return next()
+    const spec = target.trim()
+    if (/^(?:ds-bot(?:[/@]|$)|.*@npm:ds-bot(?:@|$))/.test(spec)) return next()
+    try {
+      const manager = ctx.get('pluginManager')
+      if (action === 'set_plugin') {
+        const row = (await manager.listPlugins()).find(row => row.entryId === target)
+        if (row === undefined || selfModule(row.moduleName)) return next()
+      } else if (action === 'set_version_exemption') {
+        if (!/^(?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+@[^@\s]+$/.test(spec)) return next()
+      } else {
+        // Remote, tarball and local specs hide their package identity until
+        // installation. They must be installed outside the running plugin.
+        if (action === 'install_bundle' && !/^(?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+(?:@[^@:\s]+)?$/.test(spec)) return next()
+        const bundles = await manager.listBundles()
+        const name = action === 'install_bundle' ? /^(?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+/.exec(spec)[0] : target
+        const bundle = bundles.find(bundle => bundle.name === name)
+        if (bundle?.rows?.some(row => selfModule(row.moduleName))) return next()
+        if (bundle?.overrides?.length) {
+          const ownRows = (await manager.listPlugins()).filter(row => selfModule(row.moduleName))
+          if (ownRows.some(row => bundle.overrides.includes(row.patchId))) return next()
+        }
+      }
+      verifiedChanges.add(exec)
+    } catch (error) {
+      rt.warn('ds-bot: could not verify plugin management target: %s', error?.message ?? error)
+    }
+    return next()
+  })
+  ctx.tools.guard(exec => (pluginChange(exec) && (!checkedSessions.has(exec) || (managedSession(exec) && !verifiedChanges.has(exec)))
+    ? SELF_UPDATE_REFUSAL
+    : undefined))
 
   const callerBot = (exec) => rt.botOf(rt.selfOf(exec.agent?.id))
   const callerRoom = (exec) => {

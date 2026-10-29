@@ -916,6 +916,7 @@ const ZH = {
   '{version} is available': '{version} 已发布',
   'Installed from a local folder; update it there.': '从本地文件夹安装，请在那里更新。',
   'Updates are not offered for this install.': '这种安装方式不提供更新。',
+  'Stop DSH and follow the out-of-band update procedure in the README.': '请停止 DSH，再按 README 中的带外更新步骤操作。',
   'Updates come with the DeepSeek Bot app.': '随 DeepSeek Bot 应用一起更新。',
   Links: '链接',
   'Source code': '源代码',

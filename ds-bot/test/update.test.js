@@ -3,10 +3,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
-import { cleanVersion, install, newer, sourceOf } from '../src/host/update.js'
+import { cleanVersion, install, newer, SELF_UPDATE_REFUSAL, sourceOf } from '../src/host/update.js'
 
 const PKG = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-const flush = async () => { for (let index = 0; index < 14; index += 1) await Promise.resolve() }
 const realFetch = globalThis.fetch
 afterEach(() => { globalThis.fetch = realFetch })
 
@@ -66,7 +65,7 @@ test('the install source decides where a newer version is looked for', () => {
   assert.deepEqual(sourceOf(undefined), { kind: 'unknown' })
 })
 
-test('a registry install finds the newest version on the next registry and installs it from there', async () => {
+test('a registry check finds the newest version without installing it', async () => {
   const { rt, fetched, installs } = start({
     source: `${PKG.name}@^${PKG.version}`,
     answers: {
@@ -82,13 +81,10 @@ test('a registry install finds the newest version on the next registry and insta
   assert.equal(view.current, PKG.version)
   assert.equal(view.source, 'registry')
   assert.equal(view.notesUrl, 'https://github.com/Fei2411/DS-Bot/releases')
-  assert.equal(rt.updateStart().phase, 'installing')
-  await flush()
-  assert.deepEqual(installs, [[`${PKG.name}@9.0.0`, { registry: 'https://registry.npmmirror.com/' }]])
-  const done = await rt.updateCheck()
-  assert.equal(done.phase, 'installed')
-  assert.equal(done.installed, '9.0.0')
-  assert.equal(done.available, false)
+  assert.throws(() => rt.updateStart(), { message: SELF_UPDATE_REFUSAL })
+  assert.deepEqual(installs, [])
+  assert.equal(rt.updateView().phase, 'idle')
+  assert.equal(rt.updateView().available, true)
 })
 
 test('a private registry of pnpm\'s own is asked alone, and an answer stands for a while', async () => {
@@ -114,9 +110,8 @@ test('a versioned GitHub install follows the latest release tag and keeps its pa
   const view = await rt.updateCheck()
   assert.equal(view.available, true)
   assert.equal(view.latest, '9.1.0')
-  rt.updateStart()
-  await flush()
-  assert.deepEqual(installs, [['github:Fei2411/DS-Bot#v9.1.0&path:/ds-bot', {}]])
+  assert.throws(() => rt.updateStart(), { message: SELF_UPDATE_REFUSAL })
+  assert.deepEqual(installs, [])
 })
 
 test('a versioned GitHub install follows the release to the repository\'s current address', async () => {
@@ -132,9 +127,8 @@ test('a versioned GitHub install follows the release to the repository\'s curren
   const view = await rt.updateCheck()
   assert.equal(view.available, true)
   assert.equal(view.latest, '9.1.0')
-  rt.updateStart()
-  await flush()
-  assert.deepEqual(installs, [['github:Fei2411/DS-Bot#v9.1.0&path:/ds-bot', {}]])
+  assert.throws(() => rt.updateStart(), { message: SELF_UPDATE_REFUSAL })
+  assert.deepEqual(installs, [])
 })
 
 test('a linked checkout, an unversioned git install, or a disabled check never asks the network', async () => {
@@ -143,7 +137,7 @@ test('a linked checkout, an unversioned git install, or a disabled check never a
     const view = await rt.updateCheck()
     assert.equal(view.available, false)
     assert.deepEqual(fetched, [])
-    assert.throws(() => rt.updateStart(), /No DS Bot update/)
+    assert.throws(() => rt.updateStart(), /self-maintenance is disabled/)
   }
   const { rt, fetched } = start({ source: `${PKG.name}@^${PKG.version}`, config: { updateCheck: false } })
   assert.equal((await rt.updateCheck({ fresh: true })).available, false)
@@ -158,7 +152,7 @@ test('in the desktop app, which updates as a whole, it never asks the network an
   assert.equal(view.source, 'app')
   assert.equal(view.available, false)
   assert.deepEqual(fetched, [])
-  assert.throws(() => rt.updateStart(), /No DS Bot update/)
+  assert.throws(() => rt.updateStart(), /self-maintenance is disabled/)
 })
 
 test('the star count comes from the repository, is kept for an hour, and survives a failed answer', async () => {
@@ -204,7 +198,7 @@ test('a check that finds nothing clears the version a check before it found', as
   const linked = await rt.updateCheck({ fresh: true })
   assert.equal(linked.available, false)
   assert.equal(linked.latest, null)
-  assert.throws(() => rt.updateStart(), /No DS Bot update/)
+  assert.throws(() => rt.updateStart(), /self-maintenance is disabled/)
   // Back on the registry with no copy answering: the offer stays cleared.
   delete answers[latest]
   setSource(`^${PKG.version}`)
@@ -214,188 +208,21 @@ test('a check that finds nothing clears the version a check before it found', as
   rmSync(dir, { recursive: true, force: true, maxRetries: 5 })
 })
 
-test('a failed install reports why and can be tried again', async () => {
-  let attempt = 0
-  const { rt, installs } = start({
-    source: `${PKG.name}@^${PKG.version}`,
-    config: { updateRegistry: 'https://registry.example' },
-    answers: { [`https://registry.example/${PKG.name}/latest`]: { version: '9.0.0' } },
-    result: () => (++attempt === 1
-      ? { application: 'failed', error: { code: 'incompatible-version', diagnostic: 'needs a newer DSH' } }
-      : { application: 'restart-required', version: '9.0.0' }),
-  })
-  await rt.updateCheck()
-  rt.updateStart()
-  await flush()
-  const failed = await rt.updateCheck()
-  assert.equal(failed.phase, 'failed')
-  assert.equal(failed.error, 'needs a newer DSH')
-  assert.equal(failed.available, true)
-  rt.updateStart()
-  await flush()
-  assert.equal((await rt.updateCheck()).phase, 'installed')
-  assert.equal(installs.length, 2)
-  assert.deepEqual(installs[0][1], { registry: 'https://registry.example/' })
-})
-
-// Under HMR the manager refuses a spec the profile already depends on with
-// 'already-installed'; the update then removes the bundle and installs it again,
-// leaving a note at <home>/update.json for the start that reloads the new copy.
-const NOTE = `${PKG.name}@9.0.0`
-const newHome = () => mkdtempSync(join(tmpdir(), 'ds-bot-update-home-'))
-const noteIn = home => JSON.parse(readFileSync(join(home, 'update.json'), 'utf8'))
-
-test('a plain refusal or success needs no removal and writes no note', async () => {
-  const home = newHome()
-  const { rt, installs, removes } = start({
-    source: `${PKG.name}@^${PKG.version}`,
-    config: { updateRegistry: 'https://registry.example' },
-    answers: { [`https://registry.example/${PKG.name}/latest`]: { version: '9.0.0' } },
-    result: { application: 'restart-required', version: '9.0.0' },
-    home,
-  })
-  await rt.updateCheck()
-  rt.updateStart()
-  await flush()
-  assert.equal((await rt.updateCheck()).phase, 'installed')
-  assert.equal(installs.length, 1)
-  assert.deepEqual(removes, [])
-  assert.equal(existsSync(join(home, 'update.json')), false)
-  rmSync(home, { recursive: true, force: true, maxRetries: 5 })
-})
-
-test('an already-installed refusal removes the bundle, reinstalls and leaves a note', async () => {
-  const home = newHome()
-  const calls = []
-  const { rt, installs, removes } = start({
-    source: `${PKG.name}@^${PKG.version}`,
-    config: { updateRegistry: 'https://registry.example' },
-    answers: { [`https://registry.example/${PKG.name}/latest`]: { version: '9.0.0' } },
-    result: (count) => {
-      calls.push(`install${count}`)
-      return count === 1 ? { error: { code: 'already-installed' } } : { application: 'applied', version: '9.0.0' }
-    },
-    remove: { application: 'applied' },
-    home,
-  })
-  await rt.updateCheck()
-  rt.updateStart()
-  await flush()
-  assert.deepEqual(calls, ['install1', 'install2'])
-  assert.deepEqual(installs, [[NOTE, { registry: 'https://registry.example/' }], [NOTE, { registry: 'https://registry.example/' }]])
-  assert.deepEqual(removes, [PKG.name])
-  // The note was written before the removal — and still carries no error on success.
-  const note = noteIn(home)
-  assert.equal(note.from, PKG.version)
-  assert.equal(note.to, '9.0.0')
-  assert.equal(note.spec, NOTE)
-  assert.equal(typeof note.startedAt, 'string')
-  assert.equal(note.error, undefined)
-  assert.equal((await rt.updateCheck()).phase, 'installed')
-  rmSync(home, { recursive: true, force: true, maxRetries: 5 })
-})
-
-test('a failed removal fails the update without a second install', async () => {
-  const home = newHome()
-  const { rt, installs, removes } = start({
-    source: `${PKG.name}@^${PKG.version}`,
-    config: { updateRegistry: 'https://registry.example' },
-    answers: { [`https://registry.example/${PKG.name}/latest`]: { version: '9.0.0' } },
-    result: count => (count === 1 ? { error: { code: 'already-installed' } } : { application: 'applied', version: '9.0.0' }),
-    remove: { error: { code: 'bundle-in-use' } },
-    home,
-  })
-  await rt.updateCheck()
-  rt.updateStart()
-  await flush()
-  assert.equal(installs.length, 1)
-  assert.deepEqual(removes, [PKG.name])
-  const view = await rt.updateCheck()
-  assert.equal(view.phase, 'failed')
-  assert.equal(view.error, 'bundle-in-use')
-  assert.equal(existsSync(join(home, 'update.json')), false)
-  rmSync(home, { recursive: true, force: true, maxRetries: 5 })
-})
-
-test('a failed reinstall writes its reason into the note', async () => {
-  const home = newHome()
-  const { rt } = start({
-    source: `${PKG.name}@^${PKG.version}`,
-    config: { updateRegistry: 'https://registry.example' },
-    answers: { [`https://registry.example/${PKG.name}/latest`]: { version: '9.0.0' } },
-    result: count => (count === 1 ? { error: { code: 'already-installed' } } : { error: { code: 'operation-error', diagnostic: 'pnpm: tarball 500' } }),
-    home,
-  })
-  await rt.updateCheck()
-  rt.updateStart()
-  await flush()
-  assert.equal((await rt.updateCheck()).phase, 'failed')
-  const note = noteIn(home)
-  assert.equal(note.to, '9.0.0')
-  assert.equal(note.error, 'pnpm: tarball 500')
-  rmSync(home, { recursive: true, force: true, maxRetries: 5 })
-})
-
-test('a reinstall refused by an application state also puts the old version back', async () => {
-  const home = newHome()
-  const { rt, installs } = start({
-    source: `${PKG.name}@^${PKG.version}`,
-    config: { updateRegistry: 'https://registry.example' },
-    answers: { [`https://registry.example/${PKG.name}/latest`]: { version: '9.0.0' } },
-    result: count => (count === 1 ? { error: { code: 'already-installed' } } : count === 2 ? { application: 'failed' } : { application: 'applied', version: PKG.version }),
-    home,
-  })
-  await rt.updateCheck()
-  rt.updateStart()
-  await flush()
-  assert.equal(installs.length, 3)
-  assert.equal(installs[2][0], `${PKG.name}@${PKG.version}`)
-  const note = noteIn(home)
-  assert.equal(note.error, `install failed; ${PKG.name}@${PKG.version} was reinstalled`)
-  assert.equal((await rt.updateCheck()).phase, 'failed')
-  rmSync(home, { recursive: true, force: true, maxRetries: 5 })
-})
-
-test('the note for the version now running shows the update once and is consumed', async () => {
-  const home = newHome()
-  writeFileSync(join(home, 'update.json'), JSON.stringify({ from: '0.2.0', to: PKG.version, spec: `${PKG.name}@${PKG.version}`, startedAt: new Date().toISOString() }))
-  const { rt, warnings } = start({ home })
-  const view = rt.updateView()
-  assert.equal(view.phase, 'updated')
-  assert.equal(view.installed, PKG.version)
-  assert.equal(view.available, false)
-  assert.equal(existsSync(join(home, 'update.json')), false)
-  assert.deepEqual(warnings, [])
-  rmSync(home, { recursive: true, force: true, maxRetries: 5 })
-})
-
-test('a note for another version warns and is consumed', async () => {
-  const home = newHome()
-  writeFileSync(join(home, 'update.json'), JSON.stringify({ from: '0.2.0', to: '9.0.0', spec: NOTE, startedAt: new Date().toISOString(), error: 'pnpm: tarball 500' }))
-  const { rt, warnings } = start({ home })
-  assert.equal(rt.updateView().phase, 'idle')
-  assert.equal(warnings.length, 1)
-  assert.match(String(warnings[0][1] ?? warnings[0][0]), /9\.0\.0|pnpm/)
-  assert.equal(existsSync(join(home, 'update.json')), false)
-  rmSync(home, { recursive: true, force: true, maxRetries: 5 })
-})
-
-test('a clean note on the version that wrote it waits for a start that runs the target', async () => {
-  const home = newHome()
-  writeFileSync(join(home, 'update.json'), JSON.stringify({ from: PKG.version, to: '9.0.0', spec: NOTE, startedAt: new Date().toISOString() }))
-  const { rt, warnings } = start({ home })
-  assert.equal(rt.updateView().phase, 'idle')
-  assert.deepEqual(warnings, [])
-  assert.equal(existsSync(join(home, 'update.json')), true)
-  rmSync(home, { recursive: true, force: true, maxRetries: 5 })
-})
-
-test('a note that cannot be read is warned about and deleted', async () => {
-  const home = newHome()
-  writeFileSync(join(home, 'update.json'), 'not json {')
-  const { rt, warnings } = start({ home })
-  assert.equal(rt.updateView().phase, 'idle')
-  assert.equal(warnings.length, 1)
-  assert.equal(existsSync(join(home, 'update.json')), false)
-  rmSync(home, { recursive: true, force: true, maxRetries: 5 })
+test('all direct update starts refuse without calling the plugin manager or writing a note', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-update-'))
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5 }))
+  const marker = join(home, 'update.json')
+  const oldNote = JSON.stringify({ from: PKG.version, to: '9.0.0' })
+  writeFileSync(marker, oldNote)
+  for (const source of ['ds-bot@latest', 'github:yikson/DS-Bot#v0.1.0&path:/ds-bot', 'link:/work/ds-bot', undefined]) {
+    const { rt, installs, removes } = start({ source, home })
+    assert.throws(() => rt.updateStart(), { message: SELF_UPDATE_REFUSAL })
+    await rt.updateCheck()
+    assert.throws(() => rt.updateStart(), { message: SELF_UPDATE_REFUSAL })
+    assert.deepEqual(installs, [])
+    assert.deepEqual(removes, [])
+    assert.equal(readFileSync(marker, 'utf8'), oldNote)
+    assert.equal(rt.updateView().phase, 'idle')
+  }
+  assert.equal(existsSync(marker), true)
 })
