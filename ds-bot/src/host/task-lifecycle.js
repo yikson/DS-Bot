@@ -41,7 +41,7 @@ export function install(rt) {
     return task
   })
   async function prepare(args) {
-    let task = taskOf(args.taskId)
+    const task = taskOf(args.taskId)
     if (args.role !== 'task-conclusion' && task.state !== 'open'
       && !(args.deferred || args.resent)) throw new Error('This task is not open')
     const current = destination(task, args)
@@ -55,20 +55,16 @@ export function install(rt) {
         return task
       })
     }
-    task = taskOf(task.id)
-    if (!ledgerOf(task, args).targets.some(target => target.sessionId === current)
-      || ledgerOf(task, args).targetSessionId !== current
-      || (task.state === 'open' && task.participants[args.toId]?.kind === 'trunk' && task.sessions[args.toId] !== current)) {
-      await commit(task.id, task => {
-        const ledger = ledgerOf(task, args)
-        if (!ledger.targets.some(target => target.sessionId === current)) ledger.targets.push({ sessionId: current, state: 'pending' })
-        ledger.targetSessionId = current
-        if (args.role !== 'task-conclusion' && task.state === 'open' && task.participants[args.toId]?.kind === 'trunk') {
-          task.sessions[args.toId] = current
-        }
-        return task
-      })
-    }
+    // A failed save retains dirty targets in memory; every attempt must persist again.
+    await commit(task.id, task => {
+      const ledger = ledgerOf(task, args)
+      if (!ledger.targets.some(target => target.sessionId === current)) ledger.targets.push({ sessionId: current, state: 'pending' })
+      ledger.targetSessionId = current
+      if (args.role !== 'task-conclusion' && task.state === 'open' && task.participants[args.toId]?.kind === 'trunk') {
+        task.sessions[args.toId] = current
+      }
+      return task
+    })
     args.sessionId = current
   }
   function atBoundary(args, { forwarding = false } = {}) {
@@ -95,8 +91,8 @@ export function install(rt) {
     check()
     if (!Array.isArray(result?.events)) throw new Error('Task delivery history is unavailable; outcome remains unknown')
     const consumed = result.events.some(event => event.type === 'user/message' && matches(event.data?.source, args))
-    const admitted = result.events.some(event => event.type === 'agent/inbox/spliced'
-      && event.data?.inserted?.some(message => matches(message.source, args)))
+    const admitted = result.events.filter(event => event.type === 'agent/inbox/spliced')
+      .flatMap(event => event.data?.inserted ?? []).filter(message => matches(message.source, args))
     const pending = [...(agent.inbox?.nextTurn ?? []), ...(agent.inbox?.nextStep ?? [])].find(message => matches(message.source, args))
     return { agent, consumed, admitted, pending }
   }
@@ -112,38 +108,42 @@ export function install(rt) {
   async function forwardInLane(args, message) {
     for (;;) {
       check()
-      await prepare({ ...args, resent: true })
-      const current = destination(taskOf(args.taskId), args)
-      args = { ...args, sessionId: current, resent: true }
+      args = { ...args, resent: true }
+      await prepare(args)
+      const current = args.sessionId
+      if (destination(taskOf(args.taskId), args) !== current) continue
       await rt.ensureCapabilities(current)
       check()
-      const seen = await observe(current, args)
+      if (await alreadyPresent(args, message)) return
+      check()
+      const agent = await rt.resolveAgent(current)
       check()
       if (destination(taskOf(args.taskId), args) !== current) continue
-      if (seen.consumed || seen.admitted || seen.pending) {
-        await rt.ctx.sessions.flush(seen.agent.session)
-        check()
-        await acknowledge(args, current)
-        return
-      }
       atBoundary(args, { forwarding: true })
-      seen.agent.followup(createUserMessage({ content: message.content, source: message.source }))
-      await rt.ctx.sessions.flush(seen.agent.session)
+      agent.followup(createUserMessage({ content: message.content, source: message.source }))
+      await rt.ctx.sessions.flush(agent.session)
       check()
       await acknowledge(args, current)
       return
     }
   }
-  async function alreadyPresent(args) {
+  async function alreadyPresent(args, moving) {
     const ledger = ledgerOf(taskOf(args.taskId), args)
+    const observations = []
     for (const target of ledger.targets) {
       const seen = await observe(target.sessionId, args)
       check()
-      if (!seen.consumed && !seen.admitted && !seen.pending) continue
-      await rt.ctx.sessions.flush(seen.agent.session)
-      check()
-      const current = destination(taskOf(args.taskId), args)
-      if (seen.pending && target.sessionId !== current) {
+      observations.push({ ...seen, sessionId: target.sessionId })
+    }
+    // Old splice records survive migrations. Consumption anywhere wins over a stale
+    // pending source; otherwise follow the newest recorded copy.
+    const seen = observations.find(seen => seen.consumed)
+      ?? observations.findLast(seen => seen.pending || seen.admitted.length)
+    if (!seen) return false
+    const current = destination(taskOf(args.taskId), args)
+    if (!seen.consumed && seen.sessionId !== current) {
+      if (moving && (seen.pending || seen.admitted.every(message => message.id === moving.id))) return false
+      if (seen.pending) {
         await forwardInLane({ ...args, resent: true }, seen.pending)
         check()
         // Save the target acknowledgement before withdrawing the durable source.
@@ -151,10 +151,13 @@ export function install(rt) {
           await rt.ctx.sessions.flush(seen.agent.session)
           check()
         }
-      } else await acknowledge(args, target.sessionId)
-      return true
+        return true
+      }
     }
-    return false
+    await rt.ctx.sessions.flush(seen.agent.session)
+    check()
+    await acknowledge(args, seen.sessionId)
+    return true
   }
   async function runDelivery(args, receipt, enqueue) {
     check()
@@ -269,18 +272,29 @@ export function install(rt) {
   async function recover() {
     for (const task of Array.from(rt.taskById.values())) {
       check()
-      await rt.withTask(task.id, async enqueue => {
-        if (taskOf(task.id).state !== 'open') {
-          await settleTerminal(task.id, task.closedBy?.sessionId)
-          await concludeInLane(task.id, enqueue)
-          return
-        }
-        for (const saved of Object.values(task.sends ?? {})) {
-          if (saved.delivery.state === 'delivered' || saved.args.merge) continue
-          await enqueue({ ...saved.args, resent: true }, {})
-          check()
-        }
-      })
+      try {
+        await rt.withTask(task.id, async enqueue => {
+          if (taskOf(task.id).state !== 'open') {
+            await settleTerminal(task.id, task.closedBy?.sessionId)
+            await concludeInLane(task.id, enqueue)
+            return
+          }
+          for (const saved of Object.values(task.sends ?? {})) {
+            if (saved.delivery.state === 'delivered' || saved.args.merge) continue
+            try {
+              await enqueue({ ...saved.args, resent: true }, {})
+              check()
+            } catch (error) {
+              check()
+              rt.warn('ds-bot: recovering task %s delivery %s failed; remains pending: %s', task.id, saved.args.exchangeId, error)
+            }
+          }
+        })
+        check()
+      } catch (error) {
+        check()
+        rt.warn('ds-bot: recovering task %s failed; remains pending: %s', task.id, error)
+      }
     }
   }
   async function removeBot(botId) {

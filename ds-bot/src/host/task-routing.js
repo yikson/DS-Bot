@@ -389,17 +389,24 @@ export function install(rt) {
   async function recoverTaskCreations() {
     for (const task of Array.from(rt.taskById.values())) {
       if (creating.has(task.id) || task.state !== 'open' || task.phase !== 'creating') continue
-      await withTask(task.id, () => commit(task.id, task => {
-        // DSH cannot atomically apply a marker in fork/create. A missing id is
-        // not proof of non-creation, and an unmarked orphan cannot be excluded.
-        for (const intent of Object.values(task.creationIntents)) {
-          if (intent.state === 'creating') {
-            intent.state = 'unknown'
-            intent.diagnostic = 'Creation interrupted; atomic marker lookup is unavailable'
+      try {
+        await withTask(task.id, () => commit(task.id, task => {
+          // DSH cannot atomically apply a marker in fork/create. A missing id is
+          // not proof of non-creation, and an unmarked orphan cannot be excluded.
+          for (const intent of Object.values(task.creationIntents)) {
+            if (intent.state === 'creating') {
+              intent.state = 'unknown'
+              intent.diagnostic = 'Creation interrupted; atomic marker lookup is unavailable'
+            }
           }
-        }
-        return failedCreation(task, 'Interrupted Session setup requires inspection; atomic marker lookup is unavailable. No automatic recreation.')
-      }))
+          return failedCreation(task, 'Interrupted Session setup requires inspection; atomic marker lookup is unavailable. No automatic recreation.')
+        }))
+        checkGeneration()
+      } catch (error) {
+        checkGeneration()
+        if (rt.readOnly()) throw new Error(rt.readOnly())
+        rt.warn('ds-bot: recovering task %s creation failed; remains pending: %s', task.id, error)
+      }
     }
   }
   async function recoverTasks() {
@@ -410,7 +417,14 @@ export function install(rt) {
       for (const saved of Object.values(task.pendingSends)) {
         const args = { ...saved }
         delete args.state
-        await withTask(task.id, enqueue => dispatchTask(task.id, args, {}, true, enqueue))
+        try {
+          await withTask(task.id, enqueue => dispatchTask(task.id, args, {}, true, enqueue))
+          checkGeneration()
+        } catch (error) {
+          checkGeneration()
+          if (rt.readOnly()) throw new Error(rt.readOnly())
+          rt.warn('ds-bot: recovering task %s pending send %s failed; remains pending: %s', task.id, args.exchangeId, error)
+        }
       }
     }
     await rt.recoverTaskLifecycle?.()

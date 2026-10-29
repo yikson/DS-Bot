@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { createRuntime } from '../index.js'
 import { fakeContext } from './fake-ctx.js'
 
-export async function setup(t, config = {}, seed) {
+export async function setup(t, config = {}, seed, notes) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-task-routing-'))
   const statePath = join(home, 'state.json')
   writeFileSync(statePath, JSON.stringify(seed ?? {
@@ -13,6 +13,7 @@ export async function setup(t, config = {}, seed) {
       [id, { id, name: id.toUpperCase(), sessionId: id, createdAt: 1, permission: 'full' }])),
     rooms: {}, exchanges: [],
   }))
+  if (notes) writeFileSync(join(home, 'inflight.json'), JSON.stringify(notes))
   const agents = new Map(), logs = new Map()
   const forks = [], fresh = [], selections = [], permissions = [], capabilities = [], restores = [], titles = []
   const profile = { provider: 'profile', model: 'default', reasoningEffort: 'low' }
@@ -90,4 +91,3 @@ export async function setup(t, config = {}, seed) {
   t.after(async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true, maxRetries: 5 }) })
   return { rt, ctx, home, statePath, agentOf, logs, forks, fresh, selections, restores, permissions, capabilities, titles, tool, send, tasks, incoming, handling, saved, emit }
 }
-

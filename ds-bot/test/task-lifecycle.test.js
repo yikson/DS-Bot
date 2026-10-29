@@ -312,6 +312,247 @@ test('forwarding target-save failure keeps the source and retries only its stabl
   await f.rt.forwardTaskMessage({ botId: 'a' }, message)
   assert.equal(f.agentOf('a-next').calls.length, 1)
 })
+test('forward retry persists its dirty migration target before enqueue', async t => {
+  const f = await opened(t)
+  await f.settle()
+  await f.close()
+  const message = f.agentOf('a').calls[0][1]
+  f.rt.botOf('a').sessionId = 'a-1'
+  await f.rt.save({ required: true })
+  const save = f.rt.save
+  f.rt.save = async options => {
+    if (f.rt.state.tasks[f.task.id].delivery.targetSessionId === 'a-1') throw new Error('migration save')
+    return save(options)
+  }
+  await assert.rejects(f.rt.forwardTaskMessage({ botId: 'a' }, message), /migration save/)
+  assert.deepEqual(f.saved().tasks[f.task.id].delivery.targets.map(target => target.sessionId), ['a'])
+  f.rt.save = save
+  const target = f.agentOf('a-1')
+  const followup = target.followup.bind(target)
+  target.followup = message => {
+    assert.ok(f.saved().tasks[f.task.id].delivery.targets.some(target => target.sessionId === 'a-1'),
+      'the target must be on disk at the enqueue boundary')
+    followup(message)
+  }
+  await f.rt.forwardTaskMessage({ botId: 'a' }, message)
+  assert.equal(target.calls.length, 1)
+})
+test('migration save failure, retry, consumption before ack and restart never redeliver at a newer part', async t => {
+  const f = await opened(t)
+  await f.settle()
+  await f.close()
+  const message = f.agentOf('a').calls[0][1]
+  f.rt.botOf('a').sessionId = 'a-1'
+  await f.rt.save({ required: true })
+  const save = f.rt.save
+  f.rt.save = async options => {
+    if (f.rt.state.tasks[f.task.id].delivery.targetSessionId === 'a-1') throw new Error('migration save')
+    return save(options)
+  }
+  await assert.rejects(f.rt.forwardTaskMessage({ botId: 'a' }, message), /migration save/)
+  f.rt.save = save
+  f.ctx.sessions.flush = async session => {
+    if (session.id !== 'a-1') return
+    const agent = f.agentOf('a-1')
+    const copy = agent.inbox.nextTurn.shift()
+    f.logs.get('a-1').push({ type: 'user/message', data: copy })
+    asyncScope(f.rt).stop()
+  }
+  await assert.rejects(f.rt.forwardTaskMessage({ botId: 'a' }, message), /stopped/)
+  assert.equal(f.agentOf('a-1').calls.length, 1)
+  const g = await setup(t, {}, f.saved())
+  for (const [id, events] of f.logs) g.logs.set(id, structuredClone(events))
+  g.rt.botOf('a').sessionId = 'a-2'
+  await g.rt.save({ required: true })
+  await g.rt.forwardTaskMessage({ botId: 'a' }, message)
+  await g.rt.forwardTaskMessage({ botId: 'a' }, message)
+  await g.rt.recoverTasks()
+  assert.equal(g.agentOf('a-2').calls.length, 0, 'S1 consumed the summary before the crash')
+  assert.equal(g.rt.taskOf(f.task.id).delivery.targets.find(target => target.sessionId === 'a-1')?.state, 'delivered')
+})
+for (const proof of ['consumed', 'splice', 'inbox']) {
+  test(`forwarding checks every target's ${proof} even when an earlier source is still pending`, async t => {
+    const f = await opened(t)
+    await f.settle()
+    await f.close()
+    const message = f.agentOf('a').calls[0][1]
+    f.rt.botOf('a').sessionId = 'a-1'
+    await f.rt.save({ required: true })
+    await f.rt.forwardTaskMessage({ botId: 'a' }, message)
+    const copy = f.agentOf('a-1').inbox.nextTurn.shift()
+    if (proof === 'consumed') f.logs.get('a-1').push({ type: 'user/message', data: copy })
+    else if (proof === 'inbox') {
+      f.logs.set('a-1', [])
+      f.agentOf('a-1').inbox.nextTurn.push(copy)
+    }
+    f.rt.botOf('a').sessionId = 'a-2'
+    await f.rt.save({ required: true })
+    await f.rt.forwardTaskMessage({ botId: 'a' }, message)
+    await f.rt.forwardTaskMessage({ botId: 'a' }, message)
+    // A pending copy may migrate once; consumed or durably admitted input may not.
+    assert.equal(f.agentOf('a-2').calls.length, proof === 'inbox' ? 1 : 0)
+  })
+}
+test('an unreadable previous target prevents forwarding even when the current target is readable', async t => {
+  const f = await opened(t)
+  await f.settle()
+  await f.close()
+  const message = f.agentOf('a').calls[0][1]
+  f.rt.botOf('a').sessionId = 'a-next'
+  await f.rt.save({ required: true })
+  const inspect = f.ctx.sessionController.inspect
+  f.ctx.sessionController.inspect = async id => id === 'a' ? { error: {} } : inspect(id)
+  await assert.rejects(f.rt.forwardTaskMessage({ botId: 'a' }, message), /history/)
+  assert.equal(f.agentOf('a-next').calls.length, 0)
+  assert.equal(f.agentOf('a').inbox.nextTurn.length, 1)
+})
+test('forwarding persists each target again when the trunk rotates during its save', async t => {
+  const f = await opened(t)
+  await f.settle()
+  await f.close()
+  const message = f.agentOf('a').calls[0][1]
+  f.rt.botOf('a').sessionId = 'a-1'
+  const save = f.rt.save
+  let moved = false
+  f.rt.save = async options => {
+    await save(options)
+    if (!moved && f.rt.taskOf(f.task.id).delivery.targetSessionId === 'a-1') {
+      moved = true
+      f.rt.botOf('a').sessionId = 'a-2'
+      await save(options)
+    }
+  }
+  const target = f.agentOf('a-2')
+  const followup = target.followup.bind(target)
+  target.followup = message => {
+    assert.ok(f.saved().tasks[f.task.id].delivery.targets.some(target => target.sessionId === 'a-2'))
+    followup(message)
+  }
+  await f.rt.forwardTaskMessage({ botId: 'a' }, message)
+  assert.equal(f.agentOf('a-1').calls.length, 0)
+  assert.equal(target.calls.length, 1)
+})
+test('removed source inboxes and their old splice records still permit two successive migrations', async t => {
+  const f = await opened(t)
+  await f.settle()
+  await f.close()
+  let message = f.agentOf('a').inbox.nextTurn.shift()
+  for (const id of ['a-1', 'a-2']) {
+    f.rt.botOf('a').sessionId = id
+    await f.rt.save({ required: true })
+    await f.rt.forwardTaskMessage({ botId: 'a' }, message)
+    assert.equal(f.agentOf(id).calls.length, 1)
+    message = f.agentOf(id).inbox.nextTurn.shift()
+  }
+  f.logs.get('a-2').push({ type: 'user/message', data: message })
+  f.rt.botOf('a').sessionId = 'a-3'
+  await f.rt.save({ required: true })
+  await f.rt.forwardTaskMessage({ botId: 'a' }, message)
+  assert.equal(f.agentOf('a-3').calls.length, 0)
+})
+test('an unreadable task stays pending while an independent conclusion and interrupted user turn recover', async t => {
+  const f = await opened(t)
+  await f.settle()
+  await f.send('b', 'A')
+  const other = f.tasks().find(task => task.id !== f.task.id)
+  await answerSender(f.rt, other.sessions.a, f.incoming(other.sessions.a), 'Other result')
+  const deliver = f.rt.deliver
+  f.rt.deliver = async (...args) => {
+    if (args[0].role === 'task-conclusion') throw new Error('before enqueue')
+    return deliver(...args)
+  }
+  await assert.rejects(f.close(), /before enqueue/)
+  await assert.rejects(f.rt.closeTask(other.sessions.b, closeArgs), /before enqueue/)
+  const g = await setup(t, {}, f.saved(), { turns: { c: { botId: 'c', since: Date.now() } }, queued: {} })
+  const warnings = []
+  g.rt.warn = (...args) => warnings.push(args.map(String).join(' '))
+  const inspect = g.ctx.sessionController.inspect
+  g.ctx.sessionController.inspect = async id => id === 'a' ? { error: {} } : inspect(id)
+  await g.rt.resumeAll()
+  await g.rt.resumeAll()
+  assert.equal(g.rt.taskOf(f.task.id).delivery.state, 'pending')
+  assert.equal(g.agentOf('a').calls.length, 0)
+  assert.equal(g.rt.taskOf(other.id).delivery.state, 'delivered')
+  assert.equal(g.agentOf('b').calls.filter(([, message]) => message.source.role === 'task-conclusion').length, 1)
+  assert.equal(g.agentOf('c').calls.filter(([, message]) => message.source.role === 'resume').length, 1)
+  assert.ok(warnings.some(warning => warning.includes(f.task.id) && warning.includes('history')))
+})
+test('one unreadable saved send does not block another delivery in the same task', async t => {
+  const f = await opened(t)
+  await f.send(f.task.sessions.a, 'C')
+  await f.send(f.task.sessions.a, 'D')
+  const seed = f.saved()
+  const sends = Object.values(seed.tasks[f.task.id].sends)
+  for (const send of sends) if (['c', 'd'].includes(send.args.toId)) send.delivery.state = 'pending'
+  const g = await setup(t, {}, seed)
+  const warnings = []
+  g.rt.warn = (...args) => warnings.push(args.map(String).join(' '))
+  const inspect = g.ctx.sessionController.inspect
+  g.ctx.sessionController.inspect = async id => id === 'c' ? { error: {} } : inspect(id)
+  await g.rt.recoverTasks()
+  const recovered = Object.values(g.rt.taskOf(f.task.id).sends)
+  assert.equal(recovered.find(send => send.args.toId === 'c').delivery.state, 'pending')
+  assert.equal(recovered.find(send => send.args.toId === 'd').delivery.state, 'delivered')
+  assert.equal(g.agentOf('d').calls.length, 1)
+  assert.ok(warnings.some(warning => warning.includes(f.task.id) && warning.includes('history')))
+})
+test('an unreadable pending send does not abort routing recovery before other sends and ordinary turns', async t => {
+  const f = await opened(t)
+  await f.send(f.task.sessions.a, 'C')
+  await f.send(f.task.sessions.a, 'D')
+  const seed = f.saved()
+  const task = seed.tasks[f.task.id]
+  for (const send of Object.values(task.sends)) {
+    if (!['c', 'd'].includes(send.args.toId)) continue
+    send.delivery.state = 'pending'
+    task.pendingSends[send.args.exchangeId] = { ...send.args, state: 'pending' }
+  }
+  const g = await setup(t, {}, seed, { turns: { d: { botId: 'd', since: Date.now() } }, queued: {} })
+  const inspect = g.ctx.sessionController.inspect
+  g.ctx.sessionController.inspect = async id => id === 'c' ? { error: {} } : inspect(id)
+  await g.rt.resumeAll()
+  const recovered = g.rt.taskOf(task.id)
+  assert.deepEqual(Object.values(recovered.pendingSends).map(send => send.toId), ['c'])
+  assert.equal(Object.values(recovered.sends).find(send => send.args.toId === 'd').delivery.state, 'delivered')
+  assert.equal(g.agentOf('d').calls.filter(([, message]) => message.source.role === 'resume').length, 1)
+})
+test('a failed creation recovery commit does not block independent interrupted work', async t => {
+  const f = await opened(t)
+  const seed = f.saved()
+  seed.tasks[f.task.id].phase = 'creating'
+  const g = await setup(t, {}, seed, { turns: { c: { botId: 'c', since: Date.now() } }, queued: {} })
+  const warnings = []
+  g.rt.warn = (...args) => warnings.push(args.map(String).join(' '))
+  const commit = g.rt.commitTask
+  g.rt.commitTask = (id, update) => {
+    if (id === f.task.id) throw new Error('creation recovery save unavailable')
+    return commit(id, update)
+  }
+  await g.rt.resumeAll()
+  assert.equal(g.rt.taskOf(f.task.id).phase, 'creating')
+  assert.equal(g.agentOf('c').calls.filter(([, message]) => message.source.role === 'resume').length, 1)
+  assert.ok(warnings.some(warning => warning.includes(f.task.id) && warning.includes('creation recovery save')))
+  assert.equal(g.forks.length + g.fresh.length, 0)
+})
+for (const global of ['stopped', 'read-only']) {
+  test(`recovery still aborts for a global ${global} condition`, async t => {
+    const f = await opened(t)
+    await f.settle()
+    const inspect = f.ctx.sessionController.inspect
+    f.ctx.sessionController.inspect = async id => {
+      if (id === 'a') throw new Error('history temporarily unavailable')
+      return inspect(id)
+    }
+    await assert.rejects(f.close(), /unavailable/)
+    f.ctx.sessionController.inspect = async id => {
+      if (global === 'stopped') asyncScope(f.rt).stop()
+      else f.rt.readOnly = () => 'read-only test host'
+      throw new Error(`inspect ${id} failed`)
+    }
+    await assert.rejects(f.rt.recoverTasks(), global === 'stopped' ? /stopped/ : /read-only/)
+    assert.equal(f.agentOf('a').calls.length, 0)
+  })
+}
 test('a durably admitted conclusion removed from the inbox is never re-admitted on restart', async t => {
   const f = await opened(t)
   await f.settle()
