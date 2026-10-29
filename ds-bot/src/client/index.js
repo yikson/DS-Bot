@@ -202,8 +202,8 @@ export function apply(ctx) {
   }, 'ds-bot: roster poll')
 
   // Plugin updates: every window that opens asks the host once (the host keeps its
-  // answer for a while), again each hour, and every two seconds while installing.
-  const update = createSource({ available: false, phase: 'idle' })
+  // answer for a while), again each hour, and every two seconds while DSH installs.
+  const update = createSource({ available: false })
   let wakeUpdate = () => {}
   ctx.effect(() => {
     let stopped = false
@@ -214,7 +214,7 @@ export function apply(ctx) {
       const value = await call('update-check', { fresh: false }).catch(() => null)
       if (stopped) return
       if (value) update.set(previous => ({ ...value, app: previous.app, ownApp: previous.ownApp }))
-      timer = setTimeout(loop, value?.phase === 'installing' || value?.dsh?.phase === 'installing' ? 2000 : 60 * 60_000)
+      timer = setTimeout(loop, value?.dsh?.phase === 'installing' ? 2000 : 60 * 60_000)
     }
     wakeUpdate = loop
     void loop()
@@ -601,12 +601,6 @@ export function apply(ctx) {
     return navigation ? () => navigation.openBundle(VOICE_BUNDLE) : null
   }
   actions.seatAccount = on => ui.set(state => (state.accountSeated === on ? state : { ...state, accountSeated: on }))
-  // The install runs on the host; the check loop follows it every two seconds.
-  actions.installUpdate = async () => {
-    const value = await call('update-install')
-    update.set(previous => ({ ...previous, ...value }))
-    wakeUpdate()
-  }
   // The DSH the newest released DS Bot verified installs the same way.
   actions.installDshUpdate = async () => {
     const dsh = await call('dsh-update-install')

@@ -39,7 +39,16 @@ First install DSH and set up at least one model in it. DS Bot uses the models fr
 
 If npm is not reachable, in step 2 you can also enter the full path of `ds-bot-0.2.1.tgz` downloaded from [Releases](https://github.com/Fei2411/DS-Bot/releases), or `github:Fei2411/DS-Bot#v0.2.1&path:/ds-bot` (needs Git).
 
-DS Bot 0.2.1 and earlier cannot update themselves in DSH Desktop 0.2.1-rc.2 or later: on the Plugins page, remove `ds-bot` and add `ds-bot` again. The Bots, chats and memory stay.
+**Out-of-band updates (personal fork)**
+
+This fork checks for newer releases but never installs or removes its running plugin. Bot Sessions and DSH Agent Sessions managed by DS Bot cannot change `ds-bot` through `plugin_manager`. Plugin discovery and unrelated plugin changes remain available; Git, tarball and local install specs whose package identity cannot be verified must also be installed out of band.
+
+1. Record the current DSH version, profile, exact plugin install spec and known-good commit or package. Finish active work and pending deliveries, stop the target DSH profile completely, and back up its profile and Bot data.
+2. From a separate terminal, use the documented DSH CLI for that stopped profile: `dsh plugin --profile <profile> remove ds-bot`, then `dsh plugin --profile <profile> add <approved-spec>`. Use the approved personal-fork commit or package, not a floating upstream release. For a linked checkout, update and build that checkout while the profile is stopped instead of reinstalling it.
+3. Restart the same profile. Verify the loaded version and check the roster, a chat and pending delivery state before resuming work. A startup alone does not prove the update is healthy.
+4. If validation fails, stop the profile and restore the recorded known-good spec or checkout using the same external procedure. Roll back only when the previous version can read the current state; otherwise keep the profile stopped for recovery. Never automatically roll back across task-state schema changes or restore a snapshot that would discard new work.
+
+The desktop app continues to use its own app updater. Release checks and release-note links are informational; they do not authorize switching this fork to an upstream build.
 
 **DSH Web (Windows, macOS, Linux)**
 

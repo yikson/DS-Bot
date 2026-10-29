@@ -28,6 +28,21 @@ function start(state, { config = {}, services } = {}) {
   return { ctx, call, stop, applyResult }
 }
 
+test('a stale client update-install request cannot mutate the running bundle', async (t) => {
+  const changes = []
+  const { call, stop } = start(undefined, { services: {
+    pluginManager: {
+      installBundle: async () => { changes.push('install') },
+      removeBundle: async () => { changes.push('remove') },
+    },
+  } })
+  t.after(stop)
+  const result = await call('update-install')
+  assert.equal(result.ok, false)
+  assert.match(result.error.message, /self-maintenance is disabled.*out-of-band/)
+  assert.deepEqual(changes, [])
+})
+
 // Listeners run, and tools are listed, in the order they are registered.
 test('apply registers listeners, tools, and effects in a fixed order', (t) => {
   const { ctx, stop, applyResult } = start()
@@ -46,6 +61,8 @@ test('apply registers listeners, tools, and effects in a fixed order', (t) => {
     'effect ds-bot: identity section',
     'prompt bot-identity 640',
     'on agent/pre-step (prepend)',
+    'on tools/pre-execute',
+    'tools guard',
     'tool list_bots',
     'tool message_bot',
     'tool stop_bot',

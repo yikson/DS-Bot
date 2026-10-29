@@ -39,7 +39,16 @@ DS Bot 是一个基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepsee
 
 连不上 npm 时，第 2 步也可以填 [Releases](https://github.com/Fei2411/DS-Bot/releases) 里下载的 `ds-bot-0.2.1.tgz` 的完整路径，或者 `github:Fei2411/DS-Bot#v0.2.1&path:/ds-bot`（需要装 Git）。
 
-DS Bot 0.2.1 及更早的版本在 DSH Desktop 0.2.1-rc.2 及以后的版本里不能自己更新：在插件页移除 `ds-bot`，再添加 `ds-bot`。Bot、聊天和记忆都会保留。
+**带外更新（个人 fork）**
+
+此 fork 可以检查新版本，但不会安装或移除正在运行的自身插件。Bot 会话及 DS Bot 管理的 DSH Agent 会话不能通过 `plugin_manager` 修改 `ds-bot`。插件查询及其他插件的变更仍可使用；无法在执行前确认包身份的 Git、tarball 和本地安装 spec 也必须在带外安装。
+
+1. 记录当前 DSH 版本、profile、精确的插件安装 spec，以及已知可用的 commit 或安装包。完成进行中的工作和待投递消息，完全停止目标 DSH profile，再备份其 profile 和 Bot 数据。
+2. 在独立终端中，对已停止的 profile 使用 DSH 文档中的 CLI：先执行 `dsh plugin --profile <profile> remove ds-bot`，再执行 `dsh plugin --profile <profile> add <approved-spec>`。使用已批准的个人 fork commit 或安装包，不使用浮动的上游版本。如果链接的是本地 checkout，则在 profile 停止期间更新并构建该 checkout，无需重新安装。
+3. 重启同一 profile，核对实际加载的版本，并验证团队列表、一段聊天和待投递状态后再继续工作。能启动不等于更新健康。
+4. 验证失败时停止 profile，用同样的外部流程恢复记录中的已知可用 spec 或 checkout。只有旧版能读取当前状态时才回滚；否则保持停止并处理恢复。不要跨任务状态 schema 变更自动回滚，也不要恢复会丢失新增工作的快照。
+
+桌面 App 继续使用自己的应用更新器。版本查询及发布说明链接仅供参考，不授权将此 fork 切换到上游构建。
 
 **dsh Web（Windows、macOS、Linux）**
 
