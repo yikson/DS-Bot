@@ -206,11 +206,14 @@ test('task compaction keeps native pressure, overflow, manual and range paths an
   assert.equal(await compaction.summarize({}, target), 'summarize')
   const preStep = ctx.listeners.get('agent/pre-step').find(listener => listener.name === 'preparePart')
   assert.equal(await preStep({ agent: target, messages: [], step: 2 }, () => 'native'), 'native')
-  for (const failure of [{ code: 'CONTEXT_OVERFLOW' }, { code: 'INVALID_REQUEST' }]) {
+  const liveOf = rt.liveOf
+  rt.liveOf = () => assert.fail('Task errors must not start a DS Bot part switch')
+  for (const failure of [{ code: 'CONTEXT_WINDOW_EXCEEDED' }, { code: 'IMAGE_OFFLOAD_REQUIRED' }]) {
     for (const listener of ctx.listeners.get('agent/request-error')) {
-      assert.equal(await listener({ agent: target, failure }, () => 'native'), 'native')
+      assert.equal(await listener({ agent: target, failure }, () => undefined), undefined)
     }
   }
+  rt.liveOf = liveOf
   ctx.emit('agent/status', { agent: target, status: 'idle' })
   await settle()
   assert.equal(bench.requests.length, 0)
