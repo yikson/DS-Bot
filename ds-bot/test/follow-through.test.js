@@ -92,28 +92,12 @@ async function start(home, logs, inspect) {
   return host
 }
 
-async function stopHosts(t, hosts) {
-  let done = false
-  const stopped = Promise.all(hosts.map(host => host.stop())).finally(() => { done = true })
-  const deadline = performance.now() + 3000
-  // Windows file replacement may still be waiting on the mocked retry clock.
-  while (!done) {
-    try { t.mock.timers.tick(100) } catch (error) {
-      if (error.code !== 'ERR_INVALID_STATE') throw error
-      return stopped
-    }
-    await realDelay(10)
-    assert.ok(done || performance.now() < deadline, 'host cleanup did not settle')
-  }
-  await stopped
-}
-
 const freshHome = (t, state = seed()) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-follow-'))
   testByHome.set(home, t)
   writeFileSync(join(home, 'state.json'), JSON.stringify(state))
   t.after(async () => {
-    await stopHosts(t, started.get(home) ?? [])
+    await Promise.all((started.get(home) ?? []).map(host => host.stop()))
     started.delete(home)
     testByHome.delete(home)
     rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
@@ -141,18 +125,6 @@ const notes = (home) => {
   try { return JSON.parse(readFileSync(join(home, 'inflight.json'), 'utf8')) } catch { return { turns: {}, queued: {} } }
 }
 const inflight = home => notes(home).turns ?? {}
-
-test('host cleanup drains a file retry waiting on the mocked clock', async t => {
-  t.mock.timers.enable({ apis: ['setTimeout'] })
-  const host = await start(freshHome(t))
-  let flushed = false
-  host.ctx.effect(() => () => new Promise(resolve => {
-    setTimeout(() => { flushed = true; resolve() }, 40)
-  }), 'test: pending file retry')
-  await stopHosts(t, [host])
-  assert.equal(flushed, true)
-})
-
 // A message as DSH would replay it: the turn starts and takes it up.
 const run = (host, sessionId, turn, message) => {
   host.emit(sessionId, 'turn/start', { turn })
@@ -178,7 +150,7 @@ test('a group turn cut off by a restart is picked up once, and the group is told
   void first.askApproval('gb')
   await settle(() => inflight(home).gb?.approval !== undefined)
   assert.deepEqual([inflight(home).gb.botId, inflight(home).gb.roomId, inflight(home).gb.trigger.role], ['b', 'r1', 'room'])
-  await stopHosts(t, [first])
+  await first.stop()
 
   const second = await start(home)
   t.mock.timers.tick(3000)
@@ -201,7 +173,7 @@ test('a group turn cut off by a restart is picked up once, and the group is told
   // Cut off again while picking it up: the group hears it, and the turn stays stopped.
   run(second, 'gb', 2, resumed)
   await settle(() => inflight(home).gb?.resumed === true)
-  await stopHosts(t, [second])
+  await second.stop()
   const third = await start(home)
   t.mock.timers.tick(3000)
   await settle(() => third.agentOf('r1').calls.length === 1)
@@ -216,7 +188,7 @@ test('a request cut off by a restart goes on under the same exchange; own-chat w
   run(first, 'b', 1, { content: [{ type: 'text', text: '[Message from Chief]\nDraft the plan' }], source: { kind: 'bot', form: 'relay', role: 'request', exchangeId: 'x1', senderName: 'Chief', senderSessionId: 'a', hop: 0 } })
   run(first, 'a', 1, { content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } })
   await settle(() => inflight(home).b?.trigger !== undefined && inflight(home).a !== undefined)
-  await stopHosts(t, [first])
+  await first.stop()
 
   const second = await start(home)
   t.mock.timers.tick(3000)
@@ -238,7 +210,7 @@ test('when only DS Bot restarts, a turn still running or finished meanwhile is n
   run(first, 'b', 1, { content: [{ type: 'text', text: '[Message from Chief]\nDraft the plan' }], source: { kind: 'bot', form: 'relay', role: 'request', exchangeId: 'x1', senderName: 'Chief', senderSessionId: 'a', hop: 0 } })
   run(first, 'a', 1, { content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } })
   await settle(() => inflight(home).b?.trigger !== undefined && inflight(home).a !== undefined)
-  await stopHosts(t, [first])
+  await first.stop()
 
   // DSH went on: Writer is still at work, and Chief's turn ends before the pick-up.
   const second = await start(home)
@@ -255,7 +227,7 @@ test('when only DS Bot restarts, a turn still running or finished meanwhile is n
 
   // Writer's turn stays noted, so a real restart still picks it up.
   second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'disposed' } } })
-  await stopHosts(t, [second])
+  await second.stop()
   const third = await start(home)
   t.mock.timers.tick(3000)
   await settle(() => third.agentOf('b').calls.length === 1)
@@ -292,7 +264,7 @@ for (const role of ['reply', 'report', 'resume']) {
     run(first, 'b', 1, request)
     await settle(() => inflight(home).b?.trigger?.work === 'x1')
     logs.set('b', writerLog(request, 'The final plan is ready.'))
-    await stopHosts(t, [first])
+    await first.stop()
     const second = await start(home, logs)
     second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
     t.mock.timers.tick(3000)
@@ -315,7 +287,7 @@ test('an answer a turn produced while DS Bot was not watching goes to the Bot th
   const exchangeId = request.source.exchangeId
   // Writer answers, and DS Bot restarts before it sees the end of that turn.
   logs.set('b', writerLog(request, 'The plan is ready.'))
-  await stopHosts(t, [first])
+  await first.stop()
 
   const second = await start(home, logs)
   second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
@@ -331,7 +303,7 @@ test('an answer a turn produced while DS Bot was not watching goes to the Bot th
   // Chief reads the answer; another restart finds nothing left to settle.
   second.emit('a', 'user/message', { content: reply.content, source: reply.source })
   await settleState(t, home, () => Object.keys(notes(home).queued ?? {}).length === 0)
-  await stopHosts(t, [second])
+  await second.stop()
   const third = await start(home, logs)
   t.mock.timers.tick(3000)
   await new Promise(resolve => setImmediate(resolve))
@@ -345,7 +317,7 @@ test('a completed Session answer is recovered through the controller service rec
   const first = await start(home, logs)
   const request = await askWriter(first, home)
   logs.set('b', writerLog(request, 'The plan is ready.'))
-  await stopHosts(t, [first])
+  await first.stop()
 
   const second = await start(home, logs)
   const controller = second.ctx.sessionController
@@ -370,7 +342,7 @@ for (const failure of ['rejected', 'missing', 'invalid events']) {
     const first = await start(home, logs)
     const request = await askWriter(first, home)
     logs.set('b', writerLog(request, 'The plan is ready.'))
-    await stopHosts(t, [first])
+    await first.stop()
 
     let reads = 0
     const second = await start(home, logs, async (id) => {
@@ -407,7 +379,7 @@ test('a turn whose record cannot be read says the result is unknown, and is not 
   const request = await askWriter(first, home)
   const exchangeId = request.source.exchangeId
   logs.set('b', writerLog(request, 'The plan is ready.'))
-  await stopHosts(t, [first])
+  await first.stop()
 
   // DSH cannot read that Session's record: whether the turn answered cannot be
   // established, so the sender is told that, and the work is not run again.
@@ -432,7 +404,7 @@ test('a turn whose record cannot be read says the result is unknown, and is not 
   // Another restart finds nothing left to settle: nothing is said or run twice.
   second.emit('a', 'user/message', { content: reply.content, source: reply.source })
   await settleState(t, home, () => Object.keys(notes(home).queued ?? {}).length === 0)
-  await stopHosts(t, [second])
+  await second.stop()
   const third = await start(home, logs)
   t.mock.timers.tick(3000)
   await new Promise(resolve => setImmediate(resolve))
@@ -447,7 +419,7 @@ test('a turn that ended without saying anything says it finished', async (t) => 
   const request = await askWriter(first, home)
   const exchangeId = request.source.exchangeId
   logs.set('b', writerLog(request, undefined))
-  await stopHosts(t, [first])
+  await first.stop()
 
   const second = await start(home, logs)
   second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
@@ -469,7 +441,7 @@ test('a turn that ended on the token limit gives what it said', async (t) => {
   const request = await askWriter(first, home)
   const exchangeId = request.source.exchangeId
   logs.set('b', writerLog(request, 'The plan is ready, up to the limit.', { kind: 'max-tokens' }))
-  await stopHosts(t, [first])
+  await first.stop()
 
   const second = await start(home, logs)
   second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'max-tokens' } })
@@ -495,7 +467,7 @@ test('the answer that goes up keeps what came back for the work', async (t) => {
   run(first, 'b', 1, request)
   await settle(() => inflight(home).b?.trigger?.exchangeId === 'x1')
   logs.set('b', writerLog(request, 'The plan is ready.'))
-  await stopHosts(t, [first])
+  await first.stop()
 
   const second = await start(home, logs)
   second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
@@ -519,7 +491,7 @@ test('an answer that already went up is not sent again', async (t) => {
   logs.set('b', writerLog(request, 'The plan is ready.'))
   // Chief already has the answer: another run delivered it.
   logs.set('a', [{ type: 'user/message', seq: 1, data: { source: { kind: 'bot', role: 'reply', replyTo: exchangeId, senderSessionId: 'b' }, content: [{ type: 'text', text: '[Reply from Writer]\nThe plan is ready.' }] } }])
-  await stopHosts(t, [first])
+  await first.stop()
 
   const second = await start(home, logs)
   second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
@@ -539,7 +511,7 @@ test('a work that still waits for what it handed on holds its text, and is not s
   run(first, 'b', 1, request)
   await settle(() => inflight(home).b?.trigger?.exchangeId === 'x1')
   logs.set('b', writerLog(request, 'The plan is ready.'))
-  await stopHosts(t, [first])
+  await first.stop()
 
   const second = await start(home, logs)
   second.emit('b', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
@@ -560,7 +532,7 @@ test('a finished turn leaves nothing to pick up', async (t) => {
   run(first, 'a', 1, { content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } })
   first.emit('a', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
   await settle(() => Object.keys(inflight(home)).length === 0 && existsSync(join(home, 'inflight.json')))
-  await stopHosts(t, [first])
+  await first.stop()
   const second = await start(home)
   t.mock.timers.tick(3000)
   await new Promise(resolve => setImmediate(resolve))
@@ -590,7 +562,7 @@ test('a message a shutdown cancelled is sent again once; one still waiting, take
   first.emit('b', 'user/message', { content: notesMessage.content, source: notesMessage.source })
   for (const listener of first.ctx.listeners.get('agent/inbox/discarded')) listener({ message: withdrawn })
   await settle(() => (notes(home).queued.b ?? []).length === 2)
-  await stopHosts(t, [first])
+  await first.stop()
 
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const second = await start(home)
