@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { asyncScope } from './async.js'
 import { splitRef } from './text.js'
+import { HISTORY_TIMEOUT_MS } from './constants.js'
 
 export const taskBrief = task => [
   `[Task: ${task.id}]`, `Title: ${task.title}`, `Brief: ${task.brief}`,
@@ -120,13 +121,15 @@ export function install(rt) {
     checkGeneration()
     const requestId = randomUUID()
     const marker = `task:${id}:${botId}:${requestId}`
-    const sourceSessionId = operation === 'fork' ? rt.chatOf(botId) : undefined
+    const sourceSessionId = operation === 'fork' ? task.participants[botId].sourceSessionId : undefined
+    const atSeq = operation === 'fork' ? task.participants[botId].forkAtSeq : undefined
     task = await commit(id, task => {
       task.phase = 'creating'
       if (initialWorkdir) task.participants[botId].initialWorkdir = initialWorkdir
       task.creationIntents[requestId] = {
         taskId: id, requestId, botId, operation, marker, state: 'creating',
         ...(sourceSessionId ? { sourceSessionId } : {}),
+        ...(Number.isSafeInteger(atSeq) ? { atSeq } : {}),
       }
       return task
     })
@@ -143,7 +146,10 @@ export function install(rt) {
     try {
       if (operation === 'fork') {
         checkGeneration()
-        const result = await rt.ctx.sessionController.fork({ sessionId: sourceSessionId, allowMigration: false })
+        // A readable admission snapshot with no turn/end proves there is no
+        // completed prefix. Never let a later trunk turn choose a new boundary.
+        if (atSeq === null) throw Object.assign(new Error(`session "${sourceSessionId}" has no completed turn to fork from`), { code: 'session/fork-unavailable' })
+        const result = await rt.ctx.sessionController.fork({ sessionId: sourceSessionId, atSeq, allowMigration: false })
         checkGeneration()
         if (result.error) throw Object.assign(new Error(result.error.message), { code: result.error.code })
         sessionId = result.sessionId
@@ -172,7 +178,16 @@ export function install(rt) {
       const agent = await rt.resolveAgent(sessionId)
       checkGeneration()
       const boundary = operation === 'fork' ? agent.session.inheritedEventCount - 1 : null
-      if (operation === 'fork' && (!Number.isInteger(boundary) || boundary < 0)) throw new Error('Fork has no verified inherited boundary')
+      if (operation === 'fork') {
+        if (!Number.isSafeInteger(boundary) || boundary !== atSeq) throw new Error('Fork did not preserve its admitted inherited boundary')
+        if (agent.status !== 'idle') throw new Error('Fork started before its inherited input was isolated')
+        // An enqueue can precede turn/end while its consumption follows it.
+        // Only the explicit task brief may introduce work into this Session.
+        agent.inbox.clear()
+        await rt.ctx.sessions.flush(agent.session)
+        checkGeneration()
+        if (agent.inbox.nextStep.length || agent.inbox.nextTurn.length) throw new Error('Fork still has inherited pending input')
+      }
       await rt.ctx.sessionTitle.rename(agent.session, marker)
       checkGeneration()
       await rt.applyPermission(bot, sessionId)
@@ -230,13 +245,21 @@ export function install(rt) {
       if (choice.kind === 'new') {
         creating.add(id)
         try {
+          const observed = await rt.ctx.sessionController.inspect(sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS))
+          checkGeneration()
+          if (!Array.isArray(observed?.events)) throw new Error('Cannot inspect the requester fork boundary')
+          const end = observed.events.findLast(event => event.type === 'turn/end')
+          if (end && (!Number.isSafeInteger(end.seq) || end.seq < 0)) throw new Error('Invalid requester fork boundary')
           await commit(id, () => {
             if (selectTaskRoute(sender, target, sessionId, args).kind !== 'new') throw new Error('Task admission changed')
             return {
               id, mode: 'v2', title: Array.from(text.trim().split('\n')[0]).slice(0, 80).join(''), brief: text,
               requester: sender.id, assignee: target.id, state: 'open', phase: 'creating',
               capabilityAtCreation: rt.taskCapabilitySnapshot(sender.id, target.id),
-              participants: { [sender.id]: { role: 'requester', kind: 'fork' }, [target.id]: { role: 'assignee', kind: 'fresh' } },
+              participants: {
+                [sender.id]: { role: 'requester', kind: 'fork', sourceSessionId: sessionId, forkAtSeq: end?.seq ?? null },
+                [target.id]: { role: 'assignee', kind: 'fresh' },
+              },
               sessions: {}, creationIntents: {}, pendingSends: {}, lateReplies: { count: 0, ids: [] },
               openedAt: Date.now(), updatedAt: Date.now(), closedAt: null, conclusion: null,
             }

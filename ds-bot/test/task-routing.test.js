@@ -7,6 +7,7 @@ import { createRuntime } from '../index.js'
 import { answerSender } from '../src/host/turns.js'
 import { asyncScope } from '../src/host/async.js'
 import { SOURCE_KIND } from '../src/host/constants.js'
+import { buildForkSeed } from '@deepseek-ai/dsh-session/fork'
 import { fakeContext } from './fake-ctx.js'
 
 async function setup(t, config = {}, seed) {
@@ -21,16 +22,21 @@ async function setup(t, config = {}, seed) {
   const forks = [], fresh = [], selections = [], permissions = [], capabilities = [], restores = [], titles = []
   const profile = { provider: 'profile', model: 'default', reasoningEffort: 'low' }
   const ctx = fakeContext({ services: {
-    agentPresets: { list: async () => [{ id: 'standard' }] },
+    agentPresets: { list: async () => [{ id: 'standard' }], serviceFor: () => undefined },
     agentDefaultModel: { currentSelection: () => profile, saveSelection: async value => restores.push(value) },
     permissionPresets: { set: (session, preset) => permissions.push([session.id, preset]) },
   } })
   const agentOf = id => {
     if (agents.has(id)) return agents.get(id)
-    const events = logs.get(id) ?? []
+    const events = logs.get(id) ?? (/^[a-d]$/.test(id) ? [{ type: 'turn/end', seq: 13, data: { reason: { kind: 'completed' } } }] : [])
     logs.set(id, events)
+    const scope = fakeContext()
+    scope.tools.register = tool => {
+      scope.registeredTools.set(tool.name, tool)
+      return () => scope.registeredTools.delete(tool.name)
+    }
     const agent = {
-      id, status: 'idle', calls: [],
+      id, status: 'idle', calls: [], ctx: scope,
       session: { id, inheritedEventCount: 14, requestHeader: () => ({ config: profile }) },
       inbox: { nextStep: [], nextTurn: [], remove(messageId) {
         for (const list of [this.nextStep, this.nextTurn]) {
@@ -38,11 +44,12 @@ async function setup(t, config = {}, seed) {
           if (i >= 0) { list.splice(i, 1); return true }
         }
         return false
-      } },
+      }, clear() { this.nextStep.length = 0; this.nextTurn.length = 0 } },
       followup(message) { this.calls.push(['followup', message]); this.inbox.nextTurn.push(message); events.push({ type: 'agent/inbox/spliced', data: { inserted: [message] } }) },
       steer(message) { this.calls.push(['steer', message]); this.inbox.nextStep.push(message); events.push({ type: 'agent/inbox/spliced', data: { inserted: [message] } }) },
     }
     agents.set(id, agent)
+    t.after(() => scope.dispose())
     return agent
   }
   Object.assign(ctx, {
@@ -51,7 +58,7 @@ async function setup(t, config = {}, seed) {
       create: async args => { fresh.push(args); return { sessionId: `fresh-${fresh.length}` } },
       resolveAgent: async id => ({ agent: agentOf(id) }),
       selectModel: async args => { selections.push(args); return { selected: args } },
-      inspect: async id => ({ events: logs.get(id) ?? [] }),
+      inspect: async id => { agentOf(id); return { events: structuredClone(logs.get(id)) } },
       page: async () => ({ records: [], hasMore: false }),
     },
     sessionTitle: { rename: async (session, title) => titles.push([session.id, title]) },
@@ -64,7 +71,15 @@ async function setup(t, config = {}, seed) {
     assert.ok(rt.isBotSession(sessionId))
     capabilities.push(sessionId)
   }
-  const tool = (name, args, id = 'a') => ctx.registeredTools.get(name).execute(args, { agent: agentOf(id) })
+  const announced = new Set()
+  const tool = async (name, args, id = 'a') => {
+    const agent = agentOf(id)
+    if (!announced.has(id)) {
+      announced.add(id)
+      for (const listener of ctx.listeners.get('agent/created') ?? []) await listener({ agent })
+    }
+    return (agent.ctx.registeredTools.get(name) ?? ctx.registeredTools.get(name)).execute(args, { agent })
+  }
   const send = (id = 'a', to = 'B', extra = {}) => tool('message_bot', { to, message: 'Current delegation missing from the fork prefix', ...extra }, id)
   const tasks = () => Object.values(rt.state.tasks)
   const incoming = sessionId => agentOf(sessionId).calls.at(-1)?.[1].source
@@ -105,7 +120,7 @@ test('requester fork records actual boundary and explicit brief; assignee uses s
   f.rt.desiredEffort = async () => 'high'
   await f.send()
   const task = f.tasks()[0]
-  assert.deepEqual(f.forks, [{ sessionId: 'a', allowMigration: false }])
+  assert.deepEqual(f.forks, [{ sessionId: 'a', atSeq: 13, allowMigration: false }])
   assert.equal(task.participants.a.inheritedThrough, 13)
   assert.equal(task.participants.b.inheritedThrough, null)
   assert.equal(f.fresh[0].agentPreset, 'standard')
@@ -437,9 +452,10 @@ test('creation/setup/send lane can be acquired by terminal lifecycle before a la
   })
   await entered.promise
   const send = f.send(task.sessions.a, 'B')
+  const refused = assert.rejects(send, /not open/)
   release.resolve()
   await close
-  await assert.rejects(send, /not open/)
+  await refused
   assert.equal(f.agentOf(task.sessions.b).calls.length, 1)
 })
 
@@ -676,7 +692,7 @@ test('a running trunk and later trunk writes cannot change the fork boundary or 
   const task = f.tasks()[0]
   assert.equal(task.participants.a.inheritedThrough, 13)
   assert.ok(task.brief.includes('Current delegation'))
-  assert.deepEqual(f.forks[0], { sessionId: 'a', allowMigration: false })
+  assert.deepEqual(f.forks[0], { sessionId: 'a', atSeq: 13, allowMigration: false })
 })
 
 test('generation stopping after fresh create returns never creates that participant again', async t => {
@@ -704,4 +720,116 @@ test('equivalent implicit and explicit current-task selectors replay the same na
   assert.equal(await f.send(task.sessions.a, 'B', { task: task.id, request_id: 'follow' }), follow)
   assert.equal(f.tasks().length, 1)
   assert.equal(f.agentOf(task.sessions.b).calls.length, 2)
+})
+
+test('two delegations with a queued trunk instruction produce exactly two requests and two replies', async t => {
+  const f = await setup(t)
+  const queued = { id: 'queued-user', content: [{ type: 'text', text: 'Second root delegation' }],
+    source: { kind: 'user', rpcId: 'trunk-only' } }
+  const events = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'agent/inbox/spliced', data: { target: 'next-turn', start: 0, inserted: [queued] } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'session/title', data: { title: 'standalone event after turn/end' } },
+    { type: 'turn/start', data: { turn: 2 } },
+    { type: 'agent/inbox/spliced', data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] } },
+    { type: 'user/message', data: queued },
+  ].map((event, seq) => ({ ...event, seq, time: seq + 1 }))
+  f.logs.set('a', events)
+  f.ctx.sessionController.fork = async args => {
+    f.forks.push(args)
+    const seed = buildForkSeed(events, args.atSeq ?? 3)
+    const id = `fork-${f.forks.length}`
+    const child = f.agentOf(id)
+    child.session.inheritedEventCount = seed.find(event => event.type === 'session/end-seed').seq
+    for (const event of seed) {
+      if (event.type !== 'agent/inbox/spliced') continue
+      const { start, removedCount = 0, inserted } = event.data
+      child.inbox.nextTurn.splice(start, removedCount, ...inserted)
+    }
+    assert.equal(child.inbox.nextTurn[0].source.rpcId, 'trunk-only')
+    return { sessionId: id }
+  }
+  await f.send('a', 'B', { message: 'First root delegation' })
+  await f.send('a', 'B', { message: 'Second root delegation' })
+  for (const task of f.tasks()) {
+    const child = f.agentOf(task.sessions.a)
+    // Without isolation, waking the fork for its reply also runs the inherited command.
+    await answerSender(f.rt, task.sessions.b, f.incoming(task.sessions.b), `result-${task.id}`)
+    for (const message of child.inbox.nextTurn.splice(0)) {
+      if (message.source.kind === 'user') await f.send(child.id, 'B', { message: 'Duplicate from inherited input' })
+    }
+    assert.equal(task.participants.a.inheritedThrough, 2)
+    assert.equal(f.saved().tasks[task.id].creationIntents[Object.keys(task.creationIntents)[0]].atSeq, 2)
+  }
+  assert.equal(f.tasks().length, 2)
+  assert.equal(f.rt.state.exchanges.filter(entry => entry.role === 'request').length, 2)
+  assert.equal(f.rt.state.exchanges.filter(entry => entry.role === 'reply').length, 2)
+  assert.equal(f.forks.every(args => args.atSeq === 2 && args.allowMigration === false), true)
+  assert.deepEqual(f.logs.get('a'), events)
+})
+
+test('admitted fork boundary stays fixed when the trunk completes another turn before fork', async t => {
+  const f = await setup(t)
+  const clean = f.rt.cleanWorkDir
+  f.rt.cleanWorkDir = async (...args) => {
+    f.logs.get('a').push({ type: 'turn/end', seq: 99, data: { turn: 2 } })
+    return clean(...args)
+  }
+  await f.send()
+  assert.equal(f.forks[0].atSeq, 13)
+  assert.equal(f.tasks()[0].participants.a.forkAtSeq, 13)
+})
+
+test('a readable first-turn admission uses a fresh requester without a later default fork', async t => {
+  const f = await setup(t)
+  f.logs.set('a', [{ type: 'turn/start', seq: 0, data: { turn: 1 } }])
+  await f.send()
+  assert.equal(f.forks.length, 0)
+  assert.equal(f.fresh.length, 2)
+  assert.equal(f.tasks()[0].participants.a.kind, 'fresh')
+})
+
+test('an unreadable admission history cannot authorize a fork or fresh fallback', async t => {
+  const f = await setup(t)
+  f.ctx.sessionController.inspect = async () => ({ error: { message: 'unreadable' } })
+  await assert.rejects(f.send(), /Cannot inspect/)
+  assert.equal(f.forks.length + f.fresh.length, 0)
+})
+
+test('inherited inbox removal is flushed and failure prevents ready or task delivery', async t => {
+  const f = await setup(t)
+  const fork = f.ctx.sessionController.fork
+  f.ctx.sessionController.fork = async args => {
+    const result = await fork(args)
+    f.agentOf(result.sessionId).inbox.nextTurn.push({ id: 'queued', source: { kind: 'user' } })
+    return result
+  }
+  f.ctx.sessions.flush = async session => {
+    if (session.id.startsWith('fork')) throw new Error('isolation flush failed')
+  }
+  await assert.rejects(f.send(), /isolation flush failed/)
+  assert.equal(f.tasks()[0].state, 'failed')
+  assert.equal(f.fresh.length, 0)
+  assert.equal(f.rt.state.exchanges.length, 0)
+})
+
+test('discarding inherited Bot input never removes the original trunk delivery recovery record', async t => {
+  const f = await setup(t)
+  await f.send('c', 'A', { message: 'unrelated private request' })
+  const original = f.agentOf('a').inbox.nextTurn[0]
+  assert.equal(f.rt.unreadOf('a').length, 1)
+  const fork = f.ctx.sessionController.fork
+  f.ctx.sessionController.fork = async args => {
+    const result = await fork(args)
+    const child = f.agentOf(result.sessionId)
+    child.inbox.nextTurn.push(original)
+    child.inbox.clear = () => {
+      for (const message of child.inbox.nextTurn.splice(0)) f.ctx.emit('agent/inbox/discarded', { agent: child, message })
+    }
+    return result
+  }
+  await f.send()
+  assert.equal(f.rt.unreadOf('a').length, 1)
+  assert.equal(f.agentOf('a').inbox.nextTurn[0], original)
 })

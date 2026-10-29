@@ -251,7 +251,9 @@ export function install(rt) {
 
   // A message is done with once a turn takes it up, or once it leaves the inbox untaken
   // while DS Bot runs: the user stopped the Bot, or DS Bot moved or withdrew it.
-  safe.on('agent/inbox/discarded', ({ message } = {}) => {
+  safe.on('agent/inbox/discarded', ({ agent, message } = {}) => {
+    // Fork isolation discards inherited copies, not the trunk's delivery.
+    if (rt.taskForSession?.(agent?.id)?.phase === 'creating') return
     if (message?.source?.kind === SOURCE_KIND && message.source.exchangeId) forgetQueued(message.source.exchangeId)
   })
   // Exchanges a turn took up since this start, until the resends are done, so a resend
