@@ -295,7 +295,7 @@ export function install(rt) {
           reply_to: args.reply_to === 'user' ? 'user' : 'me',
           when: args.when === 'queue' ? 'queue' : 'now',
           ...(workChoice === undefined ? {} : { work: workChoice }),
-          ...(args.task === undefined ? {} : { task: args.task }),
+          ...(choice.id || choice.kind === 'new' ? { task: choice.id ?? 'new' } : {}),
         },
       })
       // What the caller gets for a request that was admitted before.

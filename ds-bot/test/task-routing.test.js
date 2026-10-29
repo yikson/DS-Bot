@@ -149,6 +149,8 @@ for (const error of [
     await assert.rejects(f.send(), err => err === error)
     const task = f.tasks()[0]
     assert.equal(task.state, 'failed')
+    assert.equal(task.conclusion.status, 'blocked')
+    assert.deepEqual(task.delivery, { summaryId: `${task.id}:closed`, targets: [], state: 'pending' })
     assert.equal(Object.values(task.creationIntents)[0].state, 'unknown')
     assert.equal(f.fresh.length, 0)
     assert.equal(f.agentOf('b').calls.length, 0)
@@ -659,4 +661,47 @@ test('the lane enqueue callback cannot be retained and used after its action fin
   let expired
   await f.rt.withTask(task.id, enqueue => { expired = enqueue })
   assert.throws(() => expired({ taskId: task.id }), /outside its execution lane/)
+})
+
+test('a running trunk and later trunk writes cannot change the fork boundary or delegation brief', async t => {
+  const f = await setup(t)
+  f.handling('a', { kind: 'user' })
+  const fork = f.ctx.sessionController.fork
+  f.ctx.sessionController.fork = async args => {
+    const result = await fork(args)
+    f.agentOf('a').session.inheritedEventCount = 1000
+    return result
+  }
+  await f.send()
+  const task = f.tasks()[0]
+  assert.equal(task.participants.a.inheritedThrough, 13)
+  assert.ok(task.brief.includes('Current delegation'))
+  assert.deepEqual(f.forks[0], { sessionId: 'a', allowMigration: false })
+})
+
+test('generation stopping after fresh create returns never creates that participant again', async t => {
+  const f = await setup(t)
+  const create = f.ctx.sessionController.create
+  f.ctx.sessionController.create = async args => {
+    const result = await create(args)
+    asyncScope(f.rt).stop()
+    return result
+  }
+  await assert.rejects(f.send(), /stopped/)
+  const g = await setup(t, {}, f.saved())
+  await g.rt.recoverTasks()
+  assert.equal(g.tasks()[0].state, 'failed')
+  assert.equal(Object.values(g.tasks()[0].creationIntents).at(-1).state, 'unknown')
+  assert.equal(g.fresh.length + g.forks.length, 0)
+})
+
+test('equivalent implicit and explicit current-task selectors replay the same named request', async t => {
+  const f = await setup(t)
+  const root = await f.send('a', 'B', { request_id: 'root' })
+  assert.equal(await f.send('a', 'B', { task: 'new', request_id: 'root' }), root)
+  const task = f.tasks()[0]
+  const follow = await f.send(task.sessions.a, 'B', { request_id: 'follow' })
+  assert.equal(await f.send(task.sessions.a, 'B', { task: task.id, request_id: 'follow' }), follow)
+  assert.equal(f.tasks().length, 1)
+  assert.equal(f.agentOf(task.sessions.b).calls.length, 2)
 })

@@ -228,18 +228,17 @@ export function install(rt) {
     const id = choice.id ?? randomUUID()
     return withTask(id, async () => {
       if (choice.kind === 'new') {
-        if (selectTaskRoute(sender, target, sessionId, args).kind !== 'new') throw new Error('Task admission changed')
         creating.add(id)
         try {
           await commit(id, () => {
             if (selectTaskRoute(sender, target, sessionId, args).kind !== 'new') throw new Error('Task admission changed')
             return {
-            id, mode: 'v2', title: Array.from(text.trim().split('\n')[0]).slice(0, 80).join(''), brief: text,
-            requester: sender.id, assignee: target.id, state: 'open', phase: 'creating',
-            capabilityAtCreation: rt.taskCapabilitySnapshot(sender.id, target.id),
-            participants: { [sender.id]: { role: 'requester', kind: 'fork' }, [target.id]: { role: 'assignee', kind: 'fresh' } },
-            sessions: {}, creationIntents: {}, pendingSends: {}, lateReplies: { count: 0, ids: [] },
-            openedAt: Date.now(), updatedAt: Date.now(), closedAt: null, conclusion: null,
+              id, mode: 'v2', title: Array.from(text.trim().split('\n')[0]).slice(0, 80).join(''), brief: text,
+              requester: sender.id, assignee: target.id, state: 'open', phase: 'creating',
+              capabilityAtCreation: rt.taskCapabilitySnapshot(sender.id, target.id),
+              participants: { [sender.id]: { role: 'requester', kind: 'fork' }, [target.id]: { role: 'assignee', kind: 'fresh' } },
+              sessions: {}, creationIntents: {}, pendingSends: {}, lateReplies: { count: 0, ids: [] },
+              openedAt: Date.now(), updatedAt: Date.now(), closedAt: null, conclusion: null,
             }
           })
           await createEndpoint(id, sender.id, 'fork')
