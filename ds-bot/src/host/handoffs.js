@@ -5,6 +5,7 @@
 // that came back, together with what came back. Results find their way up by
 // themselves, so no Bot needs to message one that waits for it, and that is the one
 // hand-off refused. The open works are kept in state.json so a restart waits on.
+import { asyncScope } from './async.js'
 import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -17,11 +18,12 @@ const minutes = since => {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { state } = rt
   const works = () => (state.works ??= {})
   // What came back, whole; state.json keeps the start of each.
   const whole = new Map()
-  const save = () => void rt.save().catch(() => {})
+  const save = () => safe.run('handoffs background job', () => rt.save())
   const nameOf = id => rt.botOf(id)?.name
 
   // The whole result of a work, in a file of its own: state.json is written whole on
@@ -122,9 +124,9 @@ export function install(rt) {
     for (const result of work.results ?? []) whole.delete(result.id)
     // Old state can still name these files until the replacement state lands.
     // A failed save must leave them available to the next host.
-    void rt.save().then(() => {
+    safe.run('handoffs background job', () => rt.save().then(() => {
       for (const result of work.results ?? []) dropResult(result.file)
-    }).catch(() => {})
+    }))
     return above === undefined ? undefined : work.parent
   }
   const dropWork = (id) => {
@@ -136,9 +138,9 @@ export function install(rt) {
     const above = works()[parent]
     if (above !== undefined) above.open = above.open.filter(other => other !== id)
     for (const result of work.results ?? []) whole.delete(result.id)
-    void rt.save().then(() => {
+    safe.run('handoffs background job', () => rt.save().then(() => {
       for (const result of work.results ?? []) dropResult(result.file)
-    }).catch(() => {})
+    }))
   }
 
   function taken(workId, id) {

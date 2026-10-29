@@ -4,6 +4,7 @@
 //   live      work changed without a new revision: ask for `state` again
 //   message   a new entry of a Bot's own chat, as the `chat` endpoint returns it
 //   stream    the reply a Bot is writing: a start, its text as it comes, an end
+import { asyncScope } from './async.js'
 import { ROUTE } from './constants.js'
 
 export const FEED_ROUTE = `${ROUTE}/feed`
@@ -16,6 +17,7 @@ const LIVE_DELAY_MS = 150
 const MAX_QUEUED = 512
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state } = rt
   const encoder = new TextEncoder()
   /** @type {Set<ReadableStreamDefaultController<Uint8Array>>} */
@@ -39,16 +41,16 @@ export function install(rt) {
   let liveTimer
   const live = () => {
     if (clients.size === 0 || liveTimer !== undefined) return
-    liveTimer = setTimeout(() => {
+    liveTimer = safe.setTimeout(() => {
       liveTimer = undefined
       publish('live', {})
     }, LIVE_DELAY_MS)
   }
-  ctx.on('agent/status', ({ agent }) => {
+  safe.on('agent/status', ({ agent }) => {
     if (rt.selfOf(agent.id) !== undefined) live()
   })
 
-  ctx.on('session/event', (session, event) => {
+  safe.on('session/event', (session, event) => {
     if (clients.size === 0) return
     const botId = rt.chatOwners.get(session.id)
     if (botId === undefined) return
@@ -59,7 +61,7 @@ export function install(rt) {
   // Attempts being streamed, by id. A turn that answers another Bot is hidden from the
   // chat (turns.js marks it before the model is called), so its text is not streamed.
   const writing = new Map()
-  ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+  safe.on('agent/assistant-stream', ({ agent, frame }) => {
     if (frame.type === 'start') {
       const botId = rt.chatOwners.get(agent.id)
       if (clients.size === 0 || botId === undefined || (state.exchangeTurns[agent.id] ?? []).includes(frame.turn)) return
@@ -82,7 +84,7 @@ export function install(rt) {
     try { controller.close() } catch { /* already closed or errored */ }
   }
 
-  ctx.effect(() => ctx.connection.fetch.register({
+  safe.effect(() => ctx.connection.fetch.register({
     path: FEED_ROUTE,
     methods: ['GET'],
     requestBody: 'buffered',
@@ -101,14 +103,14 @@ export function install(rt) {
     },
   }), 'ds-bot: live feed route')
 
-  ctx.effect(() => {
-    const keepalive = setInterval(() => {
+  safe.effect(() => {
+    const keepalive = safe.setInterval(() => {
       if (clients.size > 0) for (const controller of clients) send(controller, encoder.encode(': keepalive\n\n'))
     }, KEEPALIVE_MS)
-    keepalive.unref?.()
+    keepalive?.unref?.()
     return () => {
-      clearInterval(keepalive)
-      clearTimeout(liveTimer)
+      safe.clearInterval(keepalive)
+      safe.clearTimeout(liveTimer)
       for (const controller of clients) leave(controller)
     }
   }, 'ds-bot: live feed')

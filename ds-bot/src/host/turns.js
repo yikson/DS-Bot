@@ -2,6 +2,7 @@
 // triggered, the waiters and inboxes of group rounds, and routing a finished turn's reply.
 //
 // Turn tracking: which turns were triggered by another Bot, and what they said.
+import { asyncScope } from './async.js'
 import {
   FAILURE_RESUME_MAX, HANDOFF_ACK, MESSAGE_INLINE_MAX, REFERENCE_KIND, REPLY_KIND, SOURCE_KIND,
   TRANSIENT_FAILURE_CODES,
@@ -35,7 +36,7 @@ export function answerSender(rt, id, source, text, long) {
   }
   const back = replyTarget(rt, source)
   const work = rt.closeWork?.(source.exchangeId, rt.botOf(rt.selfOf(id))?.name ?? 'The other Bot', text)
-  void rt.deliver({
+  asyncScope(rt).run('turns background job', () => rt.deliver({
     fromId: rt.selfOf(id),
     toId: source.senderSessionId,
     ...(back ? { sessionId: back } : {}),
@@ -44,7 +45,7 @@ export function answerSender(rt, id, source, text, long) {
     role: 'reply',
     replyTo: source.exchangeId,
     ...(work ? { work } : {}),
-  }).catch(error => rt.warn('ds-bot: reply delivery failed: %s', error))
+  }).catch(error => rt.warn('ds-bot: reply delivery failed: %s', error)))
 }
 
 // A group's own Session never reaches a model, so the snapshot DSH prepared there
@@ -75,7 +76,8 @@ const RETRY_TEXT = 'Your last reply wrote a tool call as plain text (<tool_call>
 const failureResumeText = code => `Your last turn stopped because the model connection failed (${code}). Check what is already done (files, commands, messages) before you repeat anything, then finish the task and give your reply.`
 
 export function install(rt) {
-  const { ctx, state } = rt
+  const safe = asyncScope(rt)
+  const { state } = rt
 
   // The retry goes where the turn's trigger came from: a group round's waiter or a
   // Bot's request keeps its exchange; anything else is a nudge in the Bot's own chat.
@@ -196,14 +198,14 @@ export function install(rt) {
     if (!turns.includes(turn)) {
       turns.push(turn)
       if (turns.length > 400) turns.splice(0, turns.length - 400)
-      void rt.save().catch(() => {})
+      safe.run('turns background job', () => rt.save())
     }
   }
   const unmarkExchangeTurn = (sessionId, turn) => {
     const turns = state.exchangeTurns[sessionId] ?? []
     if (!turns.includes(turn)) return
     state.exchangeTurns[sessionId] = turns.filter(other => other !== turn)
-    void rt.save().catch(() => {})
+    safe.run('turns background job', () => rt.save())
   }
 
   // A request whose audience is the user is answered in the recipient's own chat: that
@@ -225,7 +227,7 @@ export function install(rt) {
     if (!speaksInGroup(id, info) || (info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))) return
     for (; entry.shown < upTo; entry.shown += 1) {
       const text = stripWrittenCalls(entry.texts[entry.shown])
-      if (text !== '') void rt.roomStepText?.(id, info, text, entry.shown === 0)?.catch(error => rt.warn('ds-bot: step text from %s not posted: %s', id, error))
+      if (text !== '') safe.run('turns background job', () => rt.roomStepText?.(id, info, text, entry.shown === 0)?.catch(error => rt.warn('ds-bot: step text from %s not posted: %s', id, error)))
     }
   }
 
@@ -396,7 +398,7 @@ export function install(rt) {
     })
   }
 
-  ctx.on('session/event', (session, event) => {
+  safe.on('session/event', (session, event) => {
     const id = session?.id
     if (id === undefined) return
     if (!rt.isBotSession(id) && !rt.roomOf(id)) {
@@ -543,7 +545,7 @@ export function install(rt) {
             delete state.views[id]
             dropped = true
           }
-          if (dropped) void rt.save().catch(() => {})
+          if (dropped) safe.run('turns background job', () => rt.save())
         }
         break
       }
@@ -595,7 +597,7 @@ export function install(rt) {
         const later = entry.later ?? []
         entry.later = []
         for (const result of later) {
-          void rt.deliver({
+          safe.run('turns background job', () => rt.deliver({
             fromId: result.info.senderSessionId,
             toId: rt.selfOf(id),
             sessionId: id,
@@ -607,7 +609,7 @@ export function install(rt) {
             ...(result.info.replySessionId ? { replySessionId: result.info.replySessionId } : {}),
             ...(result.info.roomId ? { roomId: result.info.roomId } : {}),
             deferred: true,
-          }).catch(error => rt.warn('ds-bot: handing back a result failed: %s', error))
+          }).catch(error => rt.warn('ds-bot: handing back a result failed: %s', error)))
         }
         const reason = event.data?.reason
         const failure = reason?.kind === 'error' && !switched ? turnFailure(reason.error) : undefined
@@ -620,7 +622,7 @@ export function install(rt) {
         // the call.
         const wroteCall = failure === undefined && reason?.kind === 'completed' && lastCalled !== true && writesToolCall(lastText)
         const retry = wroteCall && info?.retried !== true && !(info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))
-        if (retry) void retryWrittenCall(id, info).catch(error => rt.warn('ds-bot: asking %s to run its written tool call failed: %s', id, error))
+        if (retry) safe.run('turns background job', () => retryWrittenCall(id, info).catch(error => rt.warn('ds-bot: asking %s to run its written tool call failed: %s', id, error)))
         // A model call that failed on a transient fault is run again on the same trigger,
         // so whoever waits keeps waiting instead of hearing that the Bot gave up. A group
         // member's turn is left as it is: its round has a failure path of its own.
@@ -662,9 +664,9 @@ export function install(rt) {
           // With what came back, the answer may pass what one message carries.
           const text = rt.answerText(work, reply, name)
           if (text.length <= MESSAGE_INLINE_MAX) return tellSender(id, asker, text)
-          void rt.attachLong(text, `Answer from ${name}.txt`)
+          safe.run('turns background job', () => rt.attachLong(text, `Answer from ${name}.txt`)
             .then(long => tellSender(id, asker, text, long))
-            .catch(error => rt.warn('ds-bot: answer from %s not sent: %s', name, error))
+            .catch(error => rt.warn('ds-bot: answer from %s not sent: %s', name, error)))
         }
         // A retried turn answers the same waiter or sender, so this one passes nothing on.
         if (!retry && info?.role === 'room') {
@@ -676,15 +678,15 @@ export function install(rt) {
             else waiter.resolve(reason?.kind === 'aborted' ? null : groupReply())
           } else if (!stopped && reason?.kind !== 'aborted') {
             // The round moved on without this member; how its turn ends still reaches the group.
-            if (failure !== undefined) void rt.lateRoomFailure?.(id, info, failure)
-            else void rt.lateRoomReply?.(id, info, groupReply(), { shown })
+            if (failure !== undefined) safe.run('turns background job', () => rt.lateRoomFailure?.(id, info, failure))
+            else safe.run('turns background job', () => rt.lateRoomReply?.(id, info, groupReply(), { shown }))
           }
         } else if (!retry && speaksInGroup(id, info)) {
           // A turn that failed before it took any input (DSH can turn it down before its
           // first step) never names its call, so the call waiting on this Session fails.
           const inRound = failure !== undefined && info === undefined && rt.failRoomTurn?.(id, failure) === true
-          if (failure !== undefined) { if (!inRound) void rt.lateRoomFailure?.(id, info ?? {}, failure) }
-          else if (reason?.kind !== 'aborted') void rt.lateRoomReply?.(id, info ?? {}, groupReply(), { shown })
+          if (failure !== undefined) { if (!inRound) safe.run('turns background job', () => rt.lateRoomFailure?.(id, info ?? {}, failure)) }
+          else if (reason?.kind !== 'aborted') safe.run('turns background job', () => rt.lateRoomReply?.(id, info ?? {}, groupReply(), { shown }))
         } else if (!retry && !resumeFailure && info !== undefined) {
           finish(info, replyText())
         }
@@ -695,11 +697,11 @@ export function install(rt) {
           // A turn that runs again answers these too, in the turn it runs again as.
           if (failed || reason?.kind === 'aborted') {
             if (request.info.role === 'room') {
-              if (failure !== undefined) void rt.lateRoomFailure?.(id, request.info, failure)
+              if (failure !== undefined) safe.run('turns background job', () => rt.lateRoomFailure?.(id, request.info, failure))
             } else answer(request.info, '')
             continue
           }
-          void rt.deliver({
+          safe.run('turns background job', () => rt.deliver({
             fromId: request.info.senderSessionId,
             toId: rt.selfOf(id),
             sessionId: id,
@@ -710,7 +712,7 @@ export function install(rt) {
             ...(request.info.senderRoomId ? { fromRoomId: request.info.senderRoomId } : {}),
             ...(request.info.replySessionId ? { replySessionId: request.info.replySessionId } : {}),
             deferred: true,
-          }).catch(error => rt.warn('ds-bot: deferred request delivery failed: %s', error))
+          }).catch(error => rt.warn('ds-bot: deferred request delivery failed: %s', error)))
         }
         break
       }

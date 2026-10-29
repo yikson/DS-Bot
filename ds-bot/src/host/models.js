@@ -1,12 +1,14 @@
 // Models. Every Bot runs on one model of its own, fixed when it is created and changed
 // only in its settings or by a Main Bot. The team's first Main Bot has none until the
 // user picks one in its chat. The Session keeps the selection durably.
+import { asyncScope } from './async.js'
 import { normalize, splitRef } from './text.js'
 
 const CATALOG_TTL_MS = 10_000
 const ROUTE_WAIT_MS = 30_000
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state } = rt
 
   let modelsSynced = null
@@ -14,8 +16,8 @@ export function install(rt) {
   // A model's thinking levels, resolved once and kept for a short while: they change
   // only with the provider, which also drops the catalog cache.
   const reasoningCache = new Map()
-  ctx.on?.('llm/adapters-updated', () => { catalogCache = { at: 0, value: [] }; reasoningCache.clear() })
-  for (const name of ['credentials/reference-updated', 'settings/document-updated']) ctx.on?.(name, () => { catalogCache = { at: 0, value: [] } })
+  safe.on('llm/adapters-updated', () => { catalogCache = { at: 0, value: [] }; reasoningCache.clear() })
+  for (const name of ['credentials/reference-updated', 'settings/document-updated']) safe.on(name, () => { catalogCache = { at: 0, value: [] } })
 
   // The thinking levels a model serves: `{efforts: [{id, name, description?}],
   // defaultEffort?}`, or undefined when it has none or the provider cannot say.
@@ -182,15 +184,17 @@ export function install(rt) {
   async function waitForModel(bot, ms = ROUTE_WAIT_MS) {
     const deadline = Date.now() + ms
     for (;;) {
-      if (!bot.model) return undefined
+      if (safe.stopped || !bot.model) return undefined
       catalogCache = { at: 0, value: [] }
       const served = new Set((await catalog()).map(entry => entry.ref))
+      if (safe.stopped) return undefined
       if (served.has(bot.model) || Date.now() >= deadline) return desiredModel(bot)
-      await new Promise((resolve) => {
-        const timer = setTimeout(done, Math.min(2000, deadline - Date.now()))
-        const off = ctx.on?.('llm/adapters-updated', done)
-        function done() { clearTimeout(timer); off?.(); resolve() }
-      })
+      let off
+      try {
+        await safe.race(new Promise(resolve => { off = safe.on('llm/adapters-updated', resolve) }), Math.min(2000, deadline - Date.now()))
+      } finally {
+        off?.()
+      }
     }
   }
 

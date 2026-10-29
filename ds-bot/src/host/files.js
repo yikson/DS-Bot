@@ -12,13 +12,13 @@ const WAIT_MS = 40
  * `check` runs before each new try and throws to stop, as when the lock that allows the
  * write was lost in the meantime.
  */
-export async function replaceFile(temp, path, check = () => {}) {
+export async function replaceFile(temp, path, check = () => {}, wait = ms => new Promise(resolve => setTimeout(resolve, ms))) {
   for (let attempt = 1; ; attempt += 1) {
     try {
       return await rename(temp, path)
     } catch (error) {
       if (process.platform !== 'win32' || attempt >= TRIES || !BUSY.has(error?.code)) throw error
-      await new Promise(resolve => setTimeout(resolve, WAIT_MS * attempt))
+      if (await wait(WAIT_MS * attempt) === false) throw new Error('DS Bot stopped before the file could be replaced.')
       check()
     }
   }

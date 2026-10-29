@@ -4,6 +4,7 @@ import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { openBotBrowser } from './session.js'
 import { gateScope } from './gate.js'
+import { asyncScope } from '../async.js'
 
 export const browserOutput = {
   schema: {
@@ -67,13 +68,13 @@ async function saveShot(ctx, value) {
  * @param {any} ctx
  * @param {{ toolDefs: any[], defineTool: Function, keyOf: (exec: any) => Promise<string|undefined>, profileRoot: string, downloadRoot?: string, downloadRoots?: (botId: string) => Promise<string[]>, uploadRoots?: (botId: string) => Promise<string[]>, headless: boolean, playwrightUrl?: string, executablePath?: string, actionTimeout?: number, authorize?: (exec: any, botId: string, action: any) => Promise<void>, completeFor?: (exec: any) => Function, connect?: (botId: string, downloadRoots?: string[]) => Promise<string>, getHold?: (botId: string) => any, onHold?: (botId: string, hold: any) => void, subscribeHolds?: (listener: (botId: string, hold: any) => void) => (() => void) | undefined, openSession?: typeof openBotBrowser, api?: object }} options
  */
-export function mountBrowserPlugin(ctx, { toolDefs, defineTool, keyOf, profileRoot, downloadRoot, downloadRoots, uploadRoots, headless, playwrightUrl, executablePath, actionTimeout, authorize, completeFor, connect, getHold, onHold, subscribeHolds, openSession = openBotBrowser, api }) {
+export function mountBrowserPlugin(ctx, { toolDefs, defineTool, keyOf, profileRoot, downloadRoot, downloadRoots, uploadRoots, headless, playwrightUrl, executablePath, actionTimeout, authorize, completeFor, connect, getHold, onHold, subscribeHolds, openSession = openBotBrowser, api, lifecycle = asyncScope({ ctx }) }) {
   const sessions = new Map()
   const names = new Set(toolDefs.map(tool => tool.name))
   // Tool results persist their rendered blocks, so changing render() cannot fix
   // old screenshots. Replace only this plugin's malformed image blocks through
   // DSH's public surface API, keeping the original log for the transcript.
-  ctx.on?.('agent/pre-step', async ({ agent }, next) => {
+  lifecycle.on('agent/pre-step', async ({ agent }, next) => {
     const session = agent.session
     let changed = false
     for (const seq of session.surface?.nodes ?? []) {
@@ -104,9 +105,9 @@ export function mountBrowserPlugin(ctx, { toolDefs, defineTool, keyOf, profileRo
     const session = sessions.get(botId)
     if (!session) return
     sessions.delete(botId)
-    void Promise.resolve(session).then(s => s.close(), () => {}).catch(() => {})
+    lifecycle.run('browser hold close', () => Promise.resolve(session).then(s => s.close(), () => {}))
   })
-  ctx.effect(() => async () => {
+  lifecycle.effect(() => async () => {
     unsubscribeHolds?.()
     const open = [...sessions.values()]
     sessions.clear()
@@ -153,9 +154,9 @@ export function mountBrowserPlugin(ctx, { toolDefs, defineTool, keyOf, profileRo
             })
           })
           sessions.set(botId, opening)
-          opening.catch(() => {
+          lifecycle.run('browser opening cleanup', () => opening.catch(() => {
             if (sessions.get(botId) === opening) sessions.delete(botId)
-          })
+          }))
           session = opening
         }
         session = await session

@@ -6,6 +6,7 @@
 // the group like a message from the user (see reminderText). DSH 0.2.0 mounts the service only with its Automation tasks bundle on, so
 // the service is optional and every endpoint reports whether it is there.
 
+import { asyncScope } from './async.js'
 const MAX_TITLE = 120
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/
 
@@ -69,16 +70,17 @@ function selectorOf(when) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx } = rt
   let service = null
 
   const attach = (sub) => {
     const own = sub.schedule
     service = own
-    sub.effect(() => () => { if (service === own) service = null }, 'ds-bot: schedule service')
+    safe.effect(() => () => { if (service === own) service = null }, 'ds-bot: schedule service', sub)
   }
   if (typeof ctx.inject === 'function') ctx.inject(['schedule'], attach)
-  else if (ctx.get?.('schedule') !== undefined) attach({ schedule: ctx.get('schedule'), effect: (execute, label) => ctx.effect(execute, label) })
+  else if (ctx.get?.('schedule') !== undefined) attach({ schedule: ctx.get('schedule'), effect: (execute, label) => safe.effect(execute, label) })
 
   // The Bot (and group chat) a task's Session speaks for, the group chat for a group's
   // own Session, or nothing for a Session outside the team.

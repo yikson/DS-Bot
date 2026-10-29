@@ -10,6 +10,7 @@
 // A call belongs to a Bot (its own chat, its group Sessions, their earlier parts, and
 // any Session forked or spawned under them), to a group chat's own Session, or to the
 // rest of DSH ("other").
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { mkdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -226,6 +227,7 @@ async function eachLimited(items, limit, work) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, home, state } = rt
   const path = join(home, 'usage.sqlite')
 
@@ -271,7 +273,7 @@ export function install(rt) {
     })
     return job
   }
-  ctx.effect(() => () => {
+  safe.effect(() => () => {
     ledger?.close()
     ledger = undefined
     opening = undefined
@@ -437,9 +439,7 @@ export function install(rt) {
   // Tokens per hour, owner, model, and use, for the browser to sum by day, week, or month.
   async function usageView({ timeZone } = {}) {
     const job = scan().catch(error => rt.warn('ds-bot: usage scan failed: %s', error))
-    let timer
-    await Promise.race([job, new Promise((resolve) => { timer = setTimeout(resolve, VIEW_WAIT_MS) })])
-    clearTimeout(timer)
+    await safe.race(job, VIEW_WAIT_MS)
     const ledger = await openLedger()
     const stored = ledger.owners()
     const live = liveOwners(listed, stored)
@@ -554,12 +554,12 @@ export function install(rt) {
   // the request, and `journaled` keeps the repeat calls from writing again.
   const noteSession = (sessionId) => {
     if (typeof sessionId !== 'string' || sessionId === '') return
-    void (async () => {
+    safe.run('usage background job', () => (async () => {
       await rt.load()
       const book = ledger ?? await openLedger().catch(() => undefined)
       if (book === undefined) return
       try { journal(book, sessionId) } catch (error) { rt.warn('ds-bot: usage could not journal %s: %s', sessionId, error) }
-    })()
+    })())
   }
   function record({ sessionId, kind, provider, model, usage }) {
     noteSession(sessionId)
@@ -569,14 +569,14 @@ export function install(rt) {
       return
     }
     early.push(row)
-    void openLedger().catch(() => {})
+    safe.run('usage background job', () => openLedger())
   }
 
   // A request listener that rewrites a request starts it over, so the same usage chunk
   // can pass here twice; it counts once.
   const counted = new WeakSet()
   // A Session's own requests are in its log; every other request is metered here.
-  ctx.on('llm/stream', (options, next) => {
+  safe.on('llm/stream', function meterUsage(options, next) {
     const tag = tags.get(options.messages)
     if (tag === undefined && options.sessionId !== undefined && options.purpose === undefined) {
       noteSession(options.sessionId)

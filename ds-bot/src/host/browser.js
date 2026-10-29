@@ -3,6 +3,7 @@
 // the app window, not here, so `read_browser` reaches it through the window: the client
 // holds a long poll open (`browser-wait`) that reports which Bots have a page open and
 // carries read requests back; the client answers with `browser-result`.
+import { asyncScope } from './async.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { output } from './tools.js'
 
@@ -21,7 +22,7 @@ const ITEMS_MAX = 80
  * The window side of the channel, without dsh: clients come and go, reads wait for one.
  * @param {{ now?: () => number, waitMs?: number, staleMs?: number, readTimeoutMs?: number, resendMs?: number }} [options]
  */
-export function createBrowserChannel({ now = Date.now, waitMs = WAIT_MS, staleMs = CLIENT_STALE_MS, readTimeoutMs = READ_TIMEOUT_MS, resendMs = RESEND_MS } = {}) {
+export function createBrowserChannel({ now = Date.now, waitMs = WAIT_MS, staleMs = CLIENT_STALE_MS, readTimeoutMs = READ_TIMEOUT_MS, resendMs = RESEND_MS, timers = globalThis } = {}) {
   /** @type {Map<string, {open: Record<string, {url?:string, title?:string}>, seen:number, queue:{id:string, botId:string, sentAt?:number}[], wake?:() => void, end?:() => void}>} */
   const clients = new Map()
   /** @type {Map<string, {client:any, resolve:(value:any) => void, timer:any}>} */
@@ -30,6 +31,7 @@ export function createBrowserChannel({ now = Date.now, waitMs = WAIT_MS, staleMs
   const holdListeners = new Set()
   let nextId = 0
   let holdVersion = 0
+  let stopped = false
 
   const present = client => client.wake !== undefined || now() - client.seen < staleMs
   // The most recently seen window that shows this Bot's browser.
@@ -58,6 +60,7 @@ export function createBrowserChannel({ now = Date.now, waitMs = WAIT_MS, staleMs
    * `waitMs`. A newer poll from the same window ends the older one empty.
    */
   function wait(clientId, open) {
+    if (stopped) return Promise.resolve([])
     const client = clients.get(clientId) ?? { open: {}, seen: 0, queue: [], holdVersion: 0 }
     clients.set(clientId, client)
     client.open = open && typeof open === 'object' ? open : {}
@@ -73,14 +76,14 @@ export function createBrowserChannel({ now = Date.now, waitMs = WAIT_MS, staleMs
       : Math.max(0, Math.min(...client.queue.map(item => item.sentAt + resendMs - now())))
     return new Promise((resolve) => {
       const finish = (items) => {
-        clearTimeout(timer)
+        timers.clearTimeout(timer)
         if (client.end === end) client.wake = client.end = undefined
         client.seen = now()
         client.holdVersion = holdVersion
         resolve(items)
       }
       const end = () => finish([])
-      const timer = setTimeout(() => finish(due(client)), Math.min(waitMs, resend))
+      const timer = timers.setTimeout(() => finish(due(client)), Math.min(waitMs, resend))
       client.wake = () => finish(due(client))
       client.end = end
     })
@@ -90,7 +93,7 @@ export function createBrowserChannel({ now = Date.now, waitMs = WAIT_MS, staleMs
     const entry = pending.get(id)
     if (entry === undefined) return false
     pending.delete(id)
-    clearTimeout(entry.timer)
+    timers.clearTimeout(entry.timer)
     const at = entry.client.queue.findIndex(item => item.id === id)
     if (at !== -1) entry.client.queue.splice(at, 1)
     entry.resolve(value)
@@ -109,11 +112,12 @@ export function createBrowserChannel({ now = Date.now, waitMs = WAIT_MS, staleMs
    * @returns {Promise<{page?:any, error?:string, absent?:boolean}>}
    */
   function read(botId, request = {}) {
+    if (stopped) return Promise.resolve({ error: 'DS Bot stopped before the page was read.' })
     const client = clientFor(botId)
     if (client === undefined) return Promise.resolve({ absent: true })
     const id = `read-${++nextId}`
     return new Promise((resolve) => {
-      const timer = setTimeout(() => settle(id, { error: 'The Desktop app did not answer in time. Its window may be closed or busy.' }), readTimeoutMs)
+      const timer = timers.setTimeout(() => settle(id, { error: 'The Desktop app did not answer in time. Its window may be closed or busy.' }), readTimeoutMs)
       pending.set(id, { client, resolve, timer })
       client.queue.push({ ...request, id, botId })
       client.wake?.()
@@ -145,10 +149,12 @@ export function createBrowserChannel({ now = Date.now, waitMs = WAIT_MS, staleMs
   const holdSnapshot = () => Object.fromEntries(holds)
 
   function dispose() {
+    stopped = true
     for (const client of clients.values()) client.end?.()
     for (const id of [...pending.keys()]) settle(id, { error: 'DS Bot stopped before the page was read.' })
     clients.clear()
     holds.clear()
+    holdListeners.clear()
   }
 
   const subscribeHolds = listener => {
@@ -244,6 +250,7 @@ const OPEN_MAX = 64
  * under a running Session.
  */
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, config } = rt
   const enabled = typeof config.browser === 'boolean' ? config.browser
     : ctx.get?.('profileContext')?.name === 'desktop' || process.env.DS_BOT_APP === '1'
@@ -251,8 +258,8 @@ export function install(rt) {
     Object.assign(rt, { browserEnabled: false, browserChannel: undefined, browserOpen: () => ({}) })
     return
   }
-  const channel = createBrowserChannel()
-  ctx.effect(() => () => channel.dispose(), 'ds-bot: browser channel')
+  const channel = createBrowserChannel({ timers: safe })
+  safe.effect(() => () => channel.dispose(), 'ds-bot: browser channel')
 
   ctx.tools.register(defineTool({
     name: 'read_browser',

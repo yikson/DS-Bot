@@ -96,7 +96,7 @@ function start() {
     workspaceRegistry: { archiveSession: async () => {} },
   })
   const rt = createRuntime(ctx, { home })
-  const hook = pattern => ctx.listeners.get('llm/stream').find(listener => pattern.test(String(listener)))
+  const hook = name => ctx.listeners.get('llm/stream').find(listener => listener.name === name)
   const stop = async () => {
     await ctx.dispose()
     // A reading is cached on disk in the background.
@@ -115,7 +115,7 @@ for (const sessionId of ['b2', 'g3']) {
     bench.tokens = 95_000
     bench.respond = () => '{"action":"compact"}'
     const session = { id: sessionId, seq: 2, requestHeader: () => ({ config: { provider: 'deepseek', model: 'v4' } }), deriveMessages: () => [], toolHistory: () => [] }
-    const preStep = ctx.listeners.get('agent/pre-step').find(listener => /adoptCompaction/.test(String(listener)))
+    const preStep = ctx.listeners.get('agent/pre-step').find(listener => listener.name === 'preparePart')
     const next = { kind: 'continue' }
     const result = await preStep({ agent: { id: sessionId, session }, messages: [], step: 2, signal: new AbortController().signal }, () => next)
     assert.equal(result, next)
@@ -158,17 +158,17 @@ test('the Session hooks pass DS Bot\'s own requests through, and still act on a 
   const passed = (async function* () {})()
   const pass = () => passed
 
-  const relay = hook(/relayOrPass/)
+  const relay = hook('relayGroup')
   assert.equal(relay(own('r1', [userText('Read this')]), pass), passed)
   assert.ok((await drain(relay(round('r1', [userText('Read this')]), pass))).some(chunk => chunk.name === 'group_relay'))
 
   const handoff = [{ role: 'user', source: { kind: 'bot', handoff: true }, content: [{ type: 'text', text: 'Handoff note' }] }]
-  const acknowledge = hook(/acknowledge/)
+  const acknowledge = hook('acknowledgeHandoff')
   assert.equal(acknowledge(own('b2', handoff), pass), passed)
   assert.ok((await drain(acknowledge(round('b2', handoff), pass))).some(chunk => chunk.type === 'text-delta'))
 
   const picture = [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'image', attachment }] }]
-  const images = hook(/imagesAsTextOrPass/)
+  const images = hook('readImages')
   assert.equal(images(own('b2', picture), pass), passed)
   assert.notEqual(images(round('b2', picture), pass), passed)
 })

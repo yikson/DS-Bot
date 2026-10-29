@@ -1,10 +1,12 @@
 // Delivery: how one Bot, the user, or DS Bot itself puts a message into a Bot Session.
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { BRANCH_SUMMARY_HEADER, HISTORY_TIMEOUT_MS, LONG_HEAD, MESSAGE_INLINE_MAX, READ_LINE_MAX, SOURCE_KIND, TEXT_KEPT, TEXT_SHOW_MAX } from './constants.js'
 import { headOf, textOf } from './text.js'
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state } = rt
 
   const resolveAgent = async (sessionId) => {
@@ -95,7 +97,7 @@ export function install(rt) {
       const earlier = merged ? state.exchanges.findIndex(other => other.id === exchangeId) : -1
       if (earlier === -1) state.exchanges.push(entry)
       else state.exchanges[earlier] = entry
-      void rt.save().catch(() => {})
+      safe.run('delivery background job', () => rt.save())
     }
     await rt.ensureCapabilities(targetSessionId)
     if (rt.isStopped?.()) return exchangeId

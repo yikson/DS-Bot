@@ -1,4 +1,5 @@
 // Client channel: the team view the browser renders, and the POST /api/bot endpoints.
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { install as installBtw } from './btw.js'
@@ -22,6 +23,7 @@ export function errorCode(error) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   installBtw(rt)
   installSide(rt)
   const { ctx, state } = rt
@@ -557,7 +559,7 @@ export function install(rt) {
   }
 
   // An exact Fetch route on the shared /api channel; the browser authenticates with its session cookie.
-  ctx.effect(() => ctx.connection.fetch.register({
+  safe.effect(() => ctx.connection.fetch.register({
     path: ROUTE,
     methods: ['POST'],
     requestBody: 'buffered',
@@ -569,8 +571,8 @@ export function install(rt) {
     },
   }), 'ds-bot: api route')
 
-  ctx.effect(() => {
-    void rt.load()
+  safe.effect(() => {
+    safe.run('channel background job', () => rt.load())
     // Registered last, so this disposer runs before the state lock is released.
     // In-flight side questions abort here; their entries stay answering for the
     // next owner.

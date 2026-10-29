@@ -2,6 +2,7 @@
 // installed from (the npm registry, or a GitHub tag for a versioned git install)
 // and, when the user asks, reinstall it through DSH's plugin manager. A new version
 // runs from the next DSH start. A linked or local checkout is never offered one.
+import { asyncScope } from './async.js'
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -111,6 +112,7 @@ const releasesUrl = () => {
 export const STARS_TTL_MS = 60 * 60_000
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, config } = rt
   const enabled = config.updateCheck !== false
   const manager = () => ctx.get?.('pluginManager')
@@ -250,7 +252,7 @@ export function install(rt) {
     }
     // A refused removal leaves this version running, with nothing for a later start to report.
     const unmark = () => { if (markerPath !== null) try { unlinkSync(markerPath) } catch { /* already gone */ } }
-    void Promise.resolve(service.installBundle(chosen.spec, options))
+    safe.run('update background job', () => Promise.resolve(service.installBundle(chosen.spec, options))
       .then(async (result) => {
         if (result?.error?.code !== 'already-installed') return result
         // With HMR the plugin manager refuses to install a package the profile already
@@ -298,16 +300,16 @@ export function install(rt) {
       .catch((error) => {
         note('ds-bot: update to %s failed: %s', chosen.spec, error?.message ?? error)
         Object.assign(status, { phase: 'failed', error: String(error?.message ?? error).slice(0, 600) })
-      })
+      }))
     return view()
   }
 
   if (enabled) {
-    ctx.effect(() => {
-      const timer = setTimeout(() => { void check() }, STARTUP_DELAY_MS)
+    safe.effect(() => {
+      const timer = safe.setTimeout(() => { safe.run('update background job', () => check()) }, STARTUP_DELAY_MS)
       // A pending first check never keeps the process alive.
-      timer.unref?.()
-      return () => clearTimeout(timer)
+      timer?.unref?.()
+      return () => safe.clearTimeout(timer)
     }, 'ds-bot: update check')
   }
 

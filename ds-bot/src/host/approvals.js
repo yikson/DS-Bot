@@ -2,17 +2,18 @@
 // there and the turn would wait forever: DS Bot answers those requests itself, from
 // the group chat. A Bot's own chat keeps DSH's card; its requests are only noted, so
 // the team view can say who is waiting.
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 
 const OUTCOMES = { allow: 'allowed-once', reject: 'rejected' }
 
 export function install(rt) {
-  const { ctx } = rt
+  const safe = asyncScope(rt)
   /** @type {Map<string, {id:string, sessionId:string, botId:string, roomId?:string, tool:string, reason:string, detail:{text?:string, code?:string}, at:number, answer?:(outcome:string)=>void}>} */
   const pending = new Map()
 
   // Ahead of DSH's own answerer, which would hold a hidden Session's request unseen.
-  ctx.on('approval/request', (request, next) => {
+  safe.on('approval/request', (request, next) => {
     const sessionId = request.agent?.session?.id ?? request.agent?.id
     const owner = sessionId === undefined ? undefined : rt.groupOwners.get(sessionId)
     const botId = owner?.botId ?? (sessionId === undefined ? undefined : rt.chatOwners.get(sessionId))

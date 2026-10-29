@@ -1,3 +1,4 @@
+import { asyncScope } from './async.js'
 import { createHash } from 'node:crypto'
 import { encodeUrlComponent } from './secrets.js'
 import { own } from './store.js'
@@ -49,6 +50,7 @@ const stringMap = (value, label) => {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state } = rt
   const agents = new Map()
   // Mounted fibers live in each Agent's own context, so they outlive this plugin unless
@@ -174,7 +176,7 @@ export function install(rt) {
     await rt.save()
     if (wasEmpty && bot.capabilities.length > 0) {
       await trackBotAgents(bot)
-      void scheduleReconcile()
+      safe.run('capabilities background job', () => scheduleReconcile())
     }
     return bot.capabilities
   }
@@ -380,7 +382,7 @@ export function install(rt) {
     if (!scheduled) {
       scheduled = new Promise(resolve => queueMicrotask(() => {
         scheduled = null
-        resolve(reconcile().catch(error => rt.warn('ds-bot: capability reconcile failed: %s', error)))
+        resolve(safe.run('capability reconcile', () => reconcile()))
       }))
     }
     return scheduled
@@ -395,12 +397,11 @@ export function install(rt) {
     })
     if (stalled.has(agent)) return
     const timeoutMs = rt.capabilityEnsureTimeoutMs ?? ENSURE_TIMEOUT_MS
-    let timer
-    const completed = await Promise.race([run, new Promise(resolve => { timer = setTimeout(resolve, timeoutMs, false) })])
-    clearTimeout(timer)
+    const completed = await safe.race(run, timeoutMs, false)
+    if (safe.stopped) return
     if (completed) return
     stalled.add(agent)
-    void run.then(() => stalled.delete(agent))
+    safe.run('capabilities background job', () => run.then(() => stalled.delete(agent)))
     rt.warn('ds-bot: capability mount for %s did not finish within %dms; continuing', sessionId, timeoutMs)
   }
   async function ensureCapabilities(sessionId) {
@@ -423,12 +424,13 @@ export function install(rt) {
     if (typeof sessionId !== 'string' || !agent.ctx) return
     if (agents.get(sessionId)?.deref() === agent) return
     agents.set(sessionId, new WeakRef(agent))
-    agent.ctx.effect(() => () => {
+    safe.effect(() => async () => {
       if (agents.get(sessionId)?.deref() === agent) agents.delete(sessionId)
       clearSession(sessionId)
-      for (const mount of mounts.get(agent)?.values() ?? []) void disposeMount(mount)
+      const live = [...mounts.get(agent)?.values() ?? []]
       mounts.delete(agent)
-    }, `ds-bot: capabilities ${sessionId}`)
+      await Promise.all(live.map(disposeMount))
+    }, `ds-bot: capabilities ${sessionId}`, agent.ctx)
   }
   const trackBotAgents = async bot => {
     const sessionIds = new Set()
@@ -481,12 +483,12 @@ export function install(rt) {
   const secretsChanged = rt.secretsChanged
   rt.secretsChanged = () => {
     secretsChanged?.()
-    if (loadingSecrets === 0) void scheduleReconcile()
+    if (loadingSecrets === 0) safe.run('capabilities background job', () => scheduleReconcile())
   }
-  rt.capabilitiesStateSaved = () => { void scheduleReconcile() }
+  rt.capabilitiesStateSaved = () => { safe.run('capabilities background job', () => scheduleReconcile()) }
   // Creation waits for these listeners, so a new Agent's first request already has its
   // tools and skill catalog. agent/pre-step is too late: a step assembles its tools first.
-  ctx.on('agent/created', async function prepareCapabilities({ agent }) {
+  safe.on('agent/created', async function prepareCapabilities({ agent }) {
     trackAgent(agent)
     try {
       await rt.load()
@@ -496,13 +498,13 @@ export function install(rt) {
       rt.warn('ds-bot: capability load failed: %s', error)
     }
   })
-  ctx.effect(() => {
-    void rt.load().then(async () => {
+  safe.effect(() => {
+    safe.run('capabilities background job', () => rt.load().then(async () => {
       for (const bot of Object.values(state.bots)) {
         if ((bot.capabilities ?? []).length > 0) await trackBotAgents(bot)
       }
       await scheduleReconcile()
-    }).catch(error => rt.warn('ds-bot: capability startup failed: %s', error))
+    }).catch(error => rt.warn('ds-bot: capability startup failed: %s', error)))
     return async () => {
       stopped = true
       const live = [...mounts.values()]

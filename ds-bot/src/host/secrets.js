@@ -2,6 +2,7 @@
 // secrets.json (mode 600) and in this process; Bots use it as $DSH_SECRET_<NAME> in
 // their shell, tool results lose it before they are saved, and every model request
 // has it replaced by [secret:<NAME>] before it leaves.
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { chmod, copyFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -87,6 +88,7 @@ export function redactDeep(value, redact) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, home, state } = rt
   const path = join(home, 'secrets.json')
 
@@ -187,7 +189,7 @@ export function install(rt) {
       try {
         await writeFile(temp, snapshot, { encoding: 'utf8', mode: 0o600 })
         await chmod(temp, 0o600)
-        await replaceFile(temp, path)
+        await replaceFile(temp, path, undefined, safe.delay)
       } catch (error) {
         await unlink(temp).catch(() => {})
         throw error
@@ -200,12 +202,12 @@ export function install(rt) {
   let usedTimer = null
   const noteUsed = () => {
     if (usedTimer !== null) return
-    usedTimer = setTimeout(() => {
+    usedTimer = safe.setTimeout(() => {
       usedTimer = null
       if (loadedReadOnly || rt.readOnly() !== undefined || blocked !== undefined) return
-      void persist().then(() => rt.save()).catch(() => {})
+      safe.run('secrets background job', () => persist().then(() => rt.save()))
     }, USED_SAVE_MS)
-    usedTimer.unref?.()
+    usedTimer?.unref?.()
   }
 
   // A Bot's pending secret cards, keyed by its id. A key that is not a real Bot (and
@@ -486,7 +488,7 @@ export function install(rt) {
   // Tool results lose the values before the registry renders and saves them: a fresh
   // result object is re-rendered from its value, so the model content, the saved
   // `tool/result`, and the tool card's presentation all come from the redacted value.
-  ctx.on('tools/execute', async (exec, next) => {
+  safe.on('tools/execute', async (exec, next) => {
     const result = await next()
     if (secrets.size === 0 || result === null || typeof result !== 'object') return result
     if (result.isError) {
@@ -507,7 +509,7 @@ export function install(rt) {
   // A value that is part of its own label would be replaced again on every pass, so a
   // request this listener rewrote passes straight through.
   const rewritten = new WeakSet()
-  ctx.on('llm/stream', (options, next) => {
+  safe.on('llm/stream', (options, next) => {
     if (secrets.size === 0 || rewritten.has(options.messages)) return next()
     const messages = redactDeep(options.messages, redact)
     const system = redactDeep(options.system, redact)
@@ -561,22 +563,22 @@ export function install(rt) {
       }
     }
     refreshEnv()
-    sub.effect(() => () => {
+    safe.effect(() => () => {
       unregister?.()
       unregister = null
       declared = ''
       refreshEnv = () => {}
-    }, 'ds-bot: secrets shell env')
+    }, 'ds-bot: secrets shell env', sub)
   }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['shellEnv'], sub => attachShellEnv(sub))
   } else if (ctx.get?.('shellEnv') !== undefined) {
-    attachShellEnv({ shellEnv: ctx.get('shellEnv'), effect: (execute, label) => ctx.effect(execute, label) })
+    attachShellEnv({ shellEnv: ctx.get('shellEnv'), effect: (execute, label) => safe.effect(execute, label) })
   }
 
-  ctx.effect(() => {
-    void loadSecrets()
-    return () => { if (usedTimer !== null) clearTimeout(usedTimer) }
+  safe.effect(() => {
+    safe.run('secrets background job', () => loadSecrets())
+    return () => { if (usedTimer !== null) safe.clearTimeout(usedTimer) }
   }, 'ds-bot: load secrets')
 
   Object.assign(rt, {

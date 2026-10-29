@@ -630,7 +630,7 @@ test('when a turn ends, the memory review keeps what the user said, through the 
     ['add', 'Writer', true], ['add', 'Writer', true], ['replace', 'Writer', true],
   ])
   // The review's tokens count as the Bot's memory use, not as "Other".
-  const meter = ctx.listeners.get('llm/stream').find(listener => /tags\.get/.test(String(listener)))
+  const meter = ctx.listeners.get('llm/stream').find(listener => listener.name === 'meterUsage')
   for await (const chunk of meter(requests[0], async function* () { yield { type: 'usage', usage: { inputTokens: 40, outputTokens: 2 } } })) assert.equal(chunk.type, 'usage')
   const usage = (await call('usage', { timeZone: 'UTC' })).value
   assert.deepEqual(usage.rows.map(row => [usage.owners[row[1]].name, usage.kinds[row[3]], row[4] + row[7]]), [['Writer', 'memory', 42]])
