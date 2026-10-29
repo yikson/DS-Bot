@@ -3,6 +3,10 @@ import { asyncScope } from './async.js'
 import { HISTORY_TIMEOUT_MS, SOURCE_KIND } from './constants.js'
 
 export const TASK_CONCLUSION_HEADER = '[Task closed]'
+const MAX_CONCLUSION_ATTEMPTS = 5
+const MAX_DELIVERY_TARGETS = 64
+const CONCLUSION_ATTEMPT = Symbol('task conclusion attempt')
+const TIMED_OUT = Symbol('task conclusion timeout')
 export const conclusionText = task => [
   TASK_CONCLUSION_HEADER, task.title, `Task: ${task.id}`, `Status: ${task.conclusion.status}`,
   `Conclusion: ${task.conclusion.text}`,
@@ -12,9 +16,11 @@ export const conclusionText = task => [
 
 export function install(rt) {
   const safe = asyncScope(rt)
-  const check = () => {
+  const conclusions = new Map()
+  const check = args => {
     if (safe.stopped || rt.isStopped?.()) throw new Error('Task operation stopped; delivery remains pending')
     if (rt.readOnly()) throw new Error(rt.readOnly())
+    if (args?.[CONCLUSION_ATTEMPT]?.active === false) throw new Error('Task conclusion attempt expired; delivery remains pending')
   }
   const taskOf = id => {
     check()
@@ -22,11 +28,48 @@ export function install(rt) {
     if (!task) throw new Error(`Unknown task "${id}"`)
     return task
   }
-  const commit = async (id, update) => {
-    check()
-    const result = await rt.commitTask(id, update)
-    check()
+  const commit = async (id, update, args) => {
+    check(args)
+    const result = await rt.commitTask(id, task => { check(args); return update(task) })
+    check(args)
     return result
+  }
+  async function deferConclusion(args, budget) {
+    if (!budget.warned) {
+      await commit(args.taskId, task => { task.delivery.state = 'pending'; return task })
+      budget.warned = true
+      rt.warn('ds-bot: conclusion %s remains pending until next startup: retry limit reached (%d attempts)', args.exchangeId, MAX_CONCLUSION_ATTEMPTS)
+    }
+    throw Object.assign(new Error('Task conclusion retry limit reached; delivery remains pending until next startup'),
+      { code: 'task/conclusion-deferred' })
+  }
+  async function attemptConclusion(args, action, retry) {
+    check()
+    let budget = conclusions.get(args.exchangeId)
+    if (!budget) conclusions.set(args.exchangeId, budget = { attempts: 0 })
+    safe.clearTimeout(budget.timer)
+    budget.timer = undefined
+    if (budget.attempts >= MAX_CONCLUSION_ATTEMPTS) return deferConclusion(args, budget)
+    budget.attempts += 1
+    const attempt = { active: true }
+    try {
+      const result = await safe.race(action({ ...args, [CONCLUSION_ATTEMPT]: attempt }), HISTORY_TIMEOUT_MS, TIMED_OUT)
+      check()
+      if (result === TIMED_OUT) throw new Error('Task conclusion attempt timed out; delivery remains pending')
+      return result
+    } catch (error) {
+      // A timed-out resolve/inspect may still finish; it must never save or enqueue.
+      attempt.active = false
+      check()
+      if (budget.attempts >= MAX_CONCLUSION_ATTEMPTS) await deferConclusion(args, budget)
+      else {
+        // The lane action ends before this timer acquires it for the next attempt.
+        budget.timer = safe.setTimeout(() => safe.run('task conclusion retry', () => retry().catch(() => {})),
+          1000 * 2 ** (budget.attempts - 1))
+        budget.timer?.unref?.()
+      }
+      throw error
+    } finally { attempt.active = false }
   }
   const ofTurn = (sessionId, entry = rt.live.get(sessionId)) => entry?.info?.role === 'task-conclusion'
     ? undefined : entry?.info?.taskId ?? rt.state.works?.[rt.workOf(entry?.info)]?.taskId
@@ -39,13 +82,17 @@ export function install(rt) {
     if (!ledger) throw new Error('Task delivery has no durable intent')
     update(ledger)
     return task
-  })
+  }, args)
   async function prepare(args) {
+    check(args)
     const task = taskOf(args.taskId)
     if (args.role !== 'task-conclusion' && task.state !== 'open'
       && !(args.deferred || args.resent)) throw new Error('This task is not open')
     const current = destination(task, args)
     if (!current) throw new Error('Task participant has no endpoint')
+    const attempt = args[CONCLUSION_ATTEMPT]
+    if (attempt?.target && attempt.target !== current) throw new Error('Task conclusion endpoint changed; delivery remains pending')
+    if (attempt) attempt.target = current
     if (args.role !== 'task-conclusion' && !task.sends?.[args.exchangeId]) {
       if (task.state !== 'open') throw new Error('Terminal tasks cannot admit new deliveries')
       await commit(task.id, task => {
@@ -53,21 +100,26 @@ export function install(rt) {
         task.sends[args.exchangeId] = { args: { ...args, sessionId: current },
           delivery: { summaryId: args.exchangeId, targets: [], state: 'pending' } }
         return task
-      })
+      }, args)
     }
     // A failed save retains dirty targets in memory; every attempt must persist again.
     await commit(task.id, task => {
       const ledger = ledgerOf(task, args)
-      if (!ledger.targets.some(target => target.sessionId === current)) ledger.targets.push({ sessionId: current, state: 'pending' })
+      if (!ledger.targets.some(target => target.sessionId === current)) {
+        if (ledger.targets.length >= MAX_DELIVERY_TARGETS) throw new Error('Task delivery target limit reached; inspect the recorded targets')
+        ledger.targets.push({ sessionId: current, state: 'pending' })
+      }
       ledger.targetSessionId = current
+      if (args.role === 'task-conclusion') ledger.state = 'pending'
       if (args.role !== 'task-conclusion' && task.state === 'open' && task.participants[args.toId]?.kind === 'trunk') {
         task.sessions[args.toId] = current
       }
       return task
-    })
+    }, args)
     args.sessionId = current
   }
   function atBoundary(args, { forwarding = false } = {}) {
+    check(args)
     const task = taskOf(args.taskId)
     if (args.role === 'task-conclusion') {
       if (task.state === 'open' || task.delivery?.summaryId !== args.exchangeId || args.toId !== task.requester) throw new Error('Invalid task conclusion')
@@ -84,11 +136,11 @@ export function install(rt) {
   const matches = (source, args) => source?.kind === SOURCE_KIND
     && source.taskId === args.taskId && source.exchangeId === args.exchangeId
   async function observe(sessionId, args) {
-    check()
+    check(args)
     const agent = await rt.resolveAgent(sessionId)
-    check()
+    check(args)
     const result = await rt.ctx.sessionController.inspect(sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS))
-    check()
+    check(args)
     if (!Array.isArray(result?.events)) throw new Error('Task delivery history is unavailable; outcome remains unknown')
     const consumed = result.events.some(event => event.type === 'user/message' && matches(event.data?.source, args))
     const admitted = result.events.filter(event => event.type === 'agent/inbox/spliced')
@@ -106,33 +158,41 @@ export function install(rt) {
     })
   }
   async function forwardInLane(args, message) {
-    for (;;) {
-      check()
+    for (let migrations = 0; migrations < MAX_CONCLUSION_ATTEMPTS; migrations += 1) {
+      check(args)
       args = { ...args, resent: true }
       await prepare(args)
       const current = args.sessionId
-      if (destination(taskOf(args.taskId), args) !== current) continue
+      if (destination(taskOf(args.taskId), args) !== current) {
+        if (args.role === 'task-conclusion') throw new Error('Task conclusion endpoint changed; delivery remains pending')
+        continue
+      }
       await rt.ensureCapabilities(current)
-      check()
+      check(args)
       if (await alreadyPresent(args, message)) return
-      check()
+      check(args)
       const agent = await rt.resolveAgent(current)
-      check()
-      if (destination(taskOf(args.taskId), args) !== current) continue
+      check(args)
+      if (destination(taskOf(args.taskId), args) !== current) {
+        if (args.role === 'task-conclusion') throw new Error('Task conclusion endpoint changed; delivery remains pending')
+        continue
+      }
       atBoundary(args, { forwarding: true })
       agent.followup(createUserMessage({ content: message.content, source: message.source }))
       await rt.ctx.sessions.flush(agent.session)
-      check()
+      check(args)
       await acknowledge(args, current)
       return
     }
+    throw new Error('Task delivery migration limit reached; delivery remains pending')
   }
   async function alreadyPresent(args, moving) {
     const ledger = ledgerOf(taskOf(args.taskId), args)
+    if (ledger.targets.length > MAX_DELIVERY_TARGETS) throw new Error('Task delivery target limit reached; inspect the recorded targets')
     const observations = []
-    for (const target of ledger.targets) {
+    for (const target of ledger.targets.slice()) {
       const seen = await observe(target.sessionId, args)
-      check()
+      check(args)
       observations.push({ ...seen, sessionId: target.sessionId })
     }
     // Old splice records survive migrations. Consumption anywhere wins over a stale
@@ -145,28 +205,31 @@ export function install(rt) {
       if (moving && (seen.pending || seen.admitted.every(message => message.id === moving.id))) return false
       if (seen.pending) {
         await forwardInLane({ ...args, resent: true }, seen.pending)
-        check()
+        check(args)
         // Save the target acknowledgement before withdrawing the durable source.
         if (seen.agent.inbox.remove(seen.pending.id)) {
           await rt.ctx.sessions.flush(seen.agent.session)
-          check()
+          check(args)
         }
         return true
       }
     }
     await rt.ctx.sessions.flush(seen.agent.session)
-    check()
+    check(args)
     await acknowledge(args, seen.sessionId)
     return true
   }
   async function runDelivery(args, receipt, enqueue) {
-    check()
+    if (args.role === 'task-conclusion' && !args[CONCLUSION_ATTEMPT]) {
+      return attemptConclusion(args, scoped => runDelivery(scoped, receipt, enqueue), () => rt.deliver({ ...args }, {}))
+    }
+    check(args)
     const operationId = args.exchangeId
     await prepare(args)
     if (await alreadyPresent(args)) { receipt.present = true; return args.exchangeId }
-    check()
-    const result = await enqueue()
-    check()
+    check(args)
+    const result = await enqueue(args)
+    check(args)
     if (!receipt.skipped) {
       if (ledgerOf(taskOf(args.taskId), args)) await acknowledge(args, args.sessionId)
       if (operationId !== args.exchangeId) await acknowledge({ ...args, exchangeId: operationId }, args.sessionId)
@@ -293,7 +356,7 @@ export function install(rt) {
         check()
       } catch (error) {
         check()
-        rt.warn('ds-bot: recovering task %s failed; remains pending: %s', task.id, error)
+        if (error?.code !== 'task/conclusion-deferred') rt.warn('ds-bot: recovering task %s failed; remains pending: %s', task.id, error)
       }
     }
   }
@@ -330,6 +393,9 @@ export function install(rt) {
         : task.sends?.[source.exchangeId]?.args
       if (!args) throw new Error('Forwarded task message has no durable send record')
       if (args.toId !== owner.botId) throw new Error('Forwarded task message belongs to another Bot')
-      return rt.withTask(task.id, () => forwardInLane({ ...args, resent: true }, message))
+      const forwarded = { ...args, resent: true }
+      return rt.withTask(task.id, () => source.role === 'task-conclusion'
+        ? attemptConclusion(forwarded, scoped => forwardInLane(scoped, message), () => rt.forwardTaskMessage(owner, message))
+        : forwardInLane(forwarded, message))
     } })
 }

@@ -434,7 +434,7 @@ export function install(rt) {
   const deliver = rt.deliver
   rt.deliver = (args, receipt = {}, lane) => {
     const send = () => args.taskId && rt.runTaskDelivery
-      ? rt.runTaskDelivery(args, receipt, () => deliver(args, receipt)) : deliver(args, receipt)
+      ? rt.runTaskDelivery(args, receipt, deliveryArgs => deliver(deliveryArgs, receipt)) : deliver(args, receipt)
     return args.taskId && lane !== deliveryLane ? withTask(args.taskId, send) : send()
   }
 }

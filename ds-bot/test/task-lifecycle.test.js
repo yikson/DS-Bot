@@ -13,6 +13,37 @@ async function opened(t) {
   return { ...f, task, close: (args = closeArgs, sessionId = task.sessions.a) => f.rt.closeTask(sessionId, { task: task.id, ...args }),
     settle: async () => answerSender(f.rt, task.sessions.b, f.incoming(task.sessions.b), 'Result with evidence') }
 }
+async function pendingConclusion(t) {
+  const f = await opened(t)
+  await f.settle()
+  const deliver = f.rt.deliver
+  f.rt.deliver = async (args, ...rest) => {
+    if (args.role === 'task-conclusion') throw new Error('before conclusion attempt')
+    return deliver(args, ...rest)
+  }
+  await assert.rejects(f.close(), /before conclusion attempt/)
+  f.rt.deliver = deliver
+  return f
+}
+function retryClock(rt) {
+  const safe = asyncScope(rt)
+  const set = safe.setTimeout, clear = safe.clearTimeout
+  const timers = []
+  safe.setTimeout = (callback, ms, ...args) => {
+    if (![1000, 2000, 4000, 8000].includes(ms)) return set(callback, ms, ...args)
+    const timer = { callback, ms, unref() {} }
+    timers.push(timer)
+    return timer
+  }
+  safe.clearTimeout = timer => {
+    if (timers.includes(timer)) timer.cancelled = true
+    else clear(timer)
+  }
+  return {
+    timers,
+    fire: async timer => { if (!timer.cancelled) await timer.callback() },
+  }
+}
 test('only the requester task endpoint can close; done requires evidence and settled work', async t => {
   const f = await opened(t)
   for (const id of ['a', 'b', f.task.sessions.b, 'c']) await assert.rejects(f.close(closeArgs, id), /root requester/)
@@ -128,7 +159,8 @@ test('conclusion target rotates while saving; only the final current part is enq
     }
     return result
   }
-  await f.close()
+  await assert.rejects(f.close(), /endpoint changed/)
+  await f.rt.recoverTasks()
   assert.equal(f.agentOf('a').calls.length, 0)
   assert.equal(f.agentOf('a-next').calls.length, 1)
   assert.deepEqual(f.rt.taskOf(f.task.id).delivery.targets.map(target => target.sessionId), ['a', 'a-next'])
@@ -428,9 +460,166 @@ test('forwarding persists each target again when the trunk rotates during its sa
     assert.ok(f.saved().tasks[f.task.id].delivery.targets.some(target => target.sessionId === 'a-2'))
     followup(message)
   }
+  await assert.rejects(f.rt.forwardTaskMessage({ botId: 'a' }, message), /endpoint changed/)
   await f.rt.forwardTaskMessage({ botId: 'a' }, message)
   assert.equal(f.agentOf('a-1').calls.length, 0)
   assert.equal(target.calls.length, 1)
+})
+test('continuous conclusion rotation stops after five attempts and releases its lane during 1/2/4/8 second backoff', async t => {
+  const f = await pendingConclusion(t)
+  const clock = retryClock(f.rt), warnings = [], inspected = []
+  f.rt.warn = (...args) => warnings.push(args.map(String).join(' '))
+  const inspect = f.ctx.sessionController.inspect
+  f.ctx.sessionController.inspect = async id => { inspected.push(id); return inspect(id) }
+  const ensure = f.rt.ensureCapabilities
+  let rotations = 0, laneTurns = 0
+  f.rt.ensureCapabilities = async id => {
+    await ensure(id)
+    f.rt.botOf('a').sessionId = `rotated-${++rotations}`
+    await f.rt.save({ required: true })
+  }
+  await f.rt.recoverTasks()
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await f.rt.withTask(f.task.id, async () => { laneTurns += 1 })
+    assert.equal(clock.timers.length, attempt + 1)
+    assert.equal(clock.timers[attempt].ms, 1000 * 2 ** attempt)
+    await clock.fire(clock.timers[attempt])
+  }
+  assert.equal(laneTurns, 4)
+  assert.equal(rotations, 5)
+  assert.equal(inspected.length, 15, 'at most one recorded-target scan per attempt')
+  assert.equal(clock.timers.length, 4, 'no sixth automatic attempt')
+  assert.equal([...f.logs.values()].flat().filter(event => event.data?.source?.role === 'task-conclusion').length, 0)
+  assert.equal(f.saved().tasks[f.task.id].delivery.state, 'pending')
+  await f.rt.recoverTasks()
+  await f.rt.recoverTasks()
+  assert.equal(rotations, 5, 'manual recovery shares the generation budget')
+  assert.equal(inspected.length, 15)
+  assert.equal(warnings.filter(warning => warning.includes('pending until next startup: retry limit')).length, 1)
+  const g = await setup(t, {}, f.saved())
+  await g.rt.recoverTasks()
+  await g.rt.recoverTasks()
+  assert.equal(g.agentOf('rotated-5').calls.length, 1, 'a new generation gets a fresh budget')
+  assert.equal(g.rt.taskOf(f.task.id).delivery.state, 'delivered')
+})
+test('forwarded conclusions share the same attempt cap and never keep scanning a rotating trunk', async t => {
+  const f = await opened(t)
+  await f.settle()
+  await f.close()
+  const message = f.agentOf('a').calls[0][1]
+  const g = await setup(t, {}, f.saved())
+  for (const [id, events] of f.logs) g.logs.set(id, structuredClone(events))
+  g.agentOf('a').inbox.nextTurn.push(message)
+  const clock = retryClock(g.rt), inspected = []
+  const inspect = g.ctx.sessionController.inspect
+  g.ctx.sessionController.inspect = async id => { inspected.push(id); return inspect(id) }
+  const ensure = g.rt.ensureCapabilities
+  let rotations = 0
+  g.rt.botOf('a').sessionId = 'forward-0'
+  await g.rt.save({ required: true })
+  g.rt.ensureCapabilities = async id => {
+    await ensure(id)
+    g.rt.botOf('a').sessionId = `forward-${++rotations}`
+    await g.rt.save({ required: true })
+  }
+  await assert.rejects(g.rt.forwardTaskMessage({ botId: 'a' }, message), /endpoint changed/)
+  for (let attempt = 0; attempt < 4; attempt += 1) await clock.fire(clock.timers[attempt])
+  assert.equal(rotations, 5)
+  assert.equal(inspected.length, 20)
+  assert.equal(clock.timers.length, 4)
+  assert.equal(g.saved().tasks[f.task.id].delivery.state, 'pending')
+  assert.equal(g.agentOf('a').inbox.nextTurn[0].id, message.id, 'the durable source is kept')
+  for (let part = 0; part <= 5; part += 1) assert.equal(g.agentOf(`forward-${part}`).calls.length, 0)
+  await assert.rejects(g.rt.forwardTaskMessage({ botId: 'a' }, message), /retry limit/)
+  assert.equal(inspected.length, 20)
+})
+test('a stable eighteen-target conclusion scan checks each recorded target once and recognizes consumption', async t => {
+  const f = await pendingConclusion(t)
+  await f.rt.commitTask(f.task.id, task => {
+    task.delivery.targets = Array.from({ length: 17 }, (_, index) => ({ sessionId: `old-${index}`, state: 'pending' }))
+    task.delivery.targetSessionId = 'old-16'
+    return task
+  })
+  const g = await setup(t, {}, f.saved())
+  g.logs.set('old-8', [{ type: 'user/message', data: { source: { kind: SOURCE_KIND,
+    taskId: f.task.id, exchangeId: `${f.task.id}:closed`, role: 'task-conclusion' } } }])
+  const inspected = [], inspect = g.ctx.sessionController.inspect
+  g.ctx.sessionController.inspect = async id => { inspected.push(id); return inspect(id) }
+  await g.rt.recoverTasks()
+  assert.equal(inspected.length, 18)
+  assert.equal(new Set(inspected).size, 18)
+  assert.equal(g.agentOf('a').calls.length, 0)
+  assert.equal(g.rt.taskOf(f.task.id).delivery.state, 'delivered')
+})
+for (const count of [64, 65]) {
+  test(`${count} recorded targets cannot bypass the scan limit or lose unverified history`, async t => {
+    const f = await pendingConclusion(t)
+    await f.rt.commitTask(f.task.id, task => {
+      task.delivery.targets = Array.from({ length: count }, (_, index) => ({ sessionId: count === 65 && index === 0 ? 'a' : `old-${index}`, state: 'pending' }))
+      task.delivery.targetSessionId = task.delivery.targets[0].sessionId
+      return task
+    })
+    const clock = retryClock(f.rt)
+    let reads = 0
+    f.ctx.sessionController.inspect = async () => { reads += 1; return { events: [] } }
+    await f.rt.recoverTasks()
+    for (let attempt = 0; attempt < 4; attempt += 1) await clock.fire(clock.timers[attempt])
+    assert.equal(reads, 0)
+    assert.equal(f.agentOf('a').calls.length, 0)
+    assert.equal(f.saved().tasks[f.task.id].delivery.targets.length, count)
+    assert.equal(f.saved().tasks[f.task.id].delivery.state, 'pending')
+    assert.equal(clock.timers.length, 4)
+  })
+}
+for (const phase of ['resolve', 'inspect']) {
+  test(`an attempt deadline releases a hung ${phase} and prevents its late continuation from enqueueing`, async t => {
+    const f = await pendingConclusion(t)
+    const clock = retryClock(f.rt)
+    const entered = Promise.withResolvers(), release = Promise.withResolvers(), expired = Promise.withResolvers()
+    const method = phase === 'resolve' ? 'resolveAgent' : 'inspect'
+    const original = f.ctx.sessionController[method], safe = asyncScope(f.rt), race = safe.race
+    f.ctx.sessionController[method] = async id => {
+      if (id === 'a') { entered.resolve(); await release.promise }
+      return original(id)
+    }
+    safe.race = async (job, ms, value) => {
+      assert.equal(ms, 20_000)
+      job.catch(() => {})
+      await entered.promise
+      await expired.promise
+      return value
+    }
+    const recovering = f.rt.recoverTasks()
+    await entered.promise
+    let passed = false
+    const behind = f.rt.withTask(f.task.id, async () => { passed = true })
+    expired.resolve()
+    await recovering
+    await behind
+    assert.equal(passed, true)
+    assert.equal(f.saved().tasks[f.task.id].delivery.state, 'pending')
+    assert.equal(clock.timers.length, 1)
+    release.resolve()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(f.agentOf('a').calls.length, 0)
+    f.ctx.sessionController[method] = original
+    safe.race = race
+    await clock.fire(clock.timers[0])
+    assert.equal(f.agentOf('a').calls.length, 1)
+  })
+}
+test('stopping a generation cancels its pending conclusion retry', async t => {
+  const f = await pendingConclusion(t)
+  const clock = retryClock(f.rt)
+  let reads = 0
+  f.ctx.sessionController.inspect = async () => { reads += 1; return { error: {} } }
+  await f.rt.recoverTasks()
+  assert.equal(clock.timers.length, 1)
+  const before = reads
+  asyncScope(f.rt).stop()
+  await clock.fire(clock.timers[0])
+  assert.equal(reads, before)
+  assert.equal(f.agentOf('a').calls.length, 0)
 })
 test('removed source inboxes and their old splice records still permit two successive migrations', async t => {
   const f = await opened(t)
