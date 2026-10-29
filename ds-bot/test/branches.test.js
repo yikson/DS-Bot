@@ -713,3 +713,52 @@ test('answer: dispose', async t => {
   await f.ctx.dispose()
   assert.equal(timers[0].cleared, true)
 })
+
+// Records in the shape the first work-branch build persisted: open, closed (delivered) and
+// failed branches, an open work waiting on the open branch, and no later fields.
+const persistedBranches = () => ({
+  version: 1, mainBotIds: ['a'], bots: {
+    a: { id: 'a', name: 'ADA', sessionId: 'a', createdAt: 1, workBranches: {
+      'br-open': { id: 'br-open', sessionId: 'sess-open', trunkSessionId: 'a', targetBotId: 'b', title: 'Check the pack',
+        brief: 'Check the pack', workIds: ['br-open'], state: 'open', openedAt: 1000, inheritedThrough: 7 },
+      'br-closed': { id: 'br-closed', sessionId: 'sess-closed', trunkSessionId: 'a', targetBotId: 'b', title: 'Old task',
+        brief: 'Old task', workIds: ['br-closed'], state: 'closed', openedAt: 500, inheritedThrough: 3, closedAt: 900,
+        summaryId: 'br-closed:closed', summaryDelivered: true,
+        conclusion: { status: 'done', text: '[Work branch closed] Old task\nBranch: br-closed\nStatus: done\nConclusion: ok\nLink: none' } },
+      'br-failed': { id: 'br-failed', trunkSessionId: 'a', targetBotId: 'b', title: 'Never forked', brief: 'x', workIds: [],
+        state: 'failed', openedAt: 400 },
+    } },
+    b: { id: 'b', name: 'Cardpack', sessionId: 'b', createdAt: 1 },
+    c: { id: 'c', name: 'Other', sessionId: 'c', createdAt: 1 },
+  }, rooms: {}, exchanges: [],
+  works: { 'br-open': { from: 'a', to: 'b', open: [], results: [], at: 1000 } },
+})
+
+test('state written by the first work-branch build still routes and recovers', async t => {
+  const f = await setup(t, { enabled: false, seed: persistedBranches() })
+  const byId = Object.fromEntries(f.branches().map(branch => [branch.id, branch]))
+  assert.deepEqual(Object.keys(byId).sort(), ['br-closed', 'br-failed', 'br-open'])
+  // Routing indexes rebuild from the records.
+  assert.equal(f.rt.selfOf('sess-open'), 'a')
+  assert.equal(f.rt.selfOf('sess-closed'), 'a')
+  assert.equal(f.rt.branchForWork('br-open').id, 'br-open')
+  assert.equal(f.rt.branchOf('sess-open').state, 'open')
+  // A restart leaves the delivered conclusion alone and keeps the readable open branch open.
+  await f.rt.resumeAll()
+  assert.equal(f.agentOf('a').calls.length, 0)
+  assert.equal(byId['br-open'].state, 'open')
+  assert.equal(byId['br-closed'].state, 'closed')
+  assert.equal(byId['br-failed'].state, 'failed')
+  // Cardpack's reply to the open work reaches the branch, not the main chat.
+  const source = { kind: 'bot', role: 'request', exchangeId: 'br-open', senderSessionId: 'a', replySessionId: 'sess-open' }
+  await answerSender(f.rt, 'b', source, 'Result')
+  assert.match(f.agentOf('sess-open').calls[0].content[0].text, /Result$/)
+  assert.equal(f.agentOf('a').calls.length, 0)
+  assert.equal(f.rt.state.works['br-open'], undefined)
+  // The open branch closes once, the closed one refuses a second close.
+  await f.tool('close_work_branch', { status: 'done', conclusion: 'Accepted' }, 'sess-open')
+  assert.equal(f.agentOf('a').calls.length, 1)
+  assert.equal(f.agentOf('a').calls[0].source.exchangeId, 'br-open:closed')
+  await assert.rejects(f.tool('close_work_branch', { status: 'done', conclusion: 'again' }, 'sess-closed').then(() => { throw new Error('closed again') }), /closed again|not open/)
+  assert.equal(f.agentOf('a').calls.length, 1)
+})
