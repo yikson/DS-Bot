@@ -45,12 +45,23 @@ export function install(rt) {
     const self = rt.selfOf(id)
     const bot = rt.botOf(self)
     if (bot !== undefined) {
+      const choices = rt.workBranchChoices?.(self) ?? []
       return [
         '# Your identity',
         `You are ${bot.name}, a Bot on the user's team in DS Bot.${bot.role ? ` Your role: ${bot.role}.` : ''}`,
         bot.instructions ? `\n${bot.instructions}` : '',
         '',
         rt.isMain(self) ? `${MAIN_RULES}\n\n${TEAM_RULES}` : TEAM_RULES,
+        ...(rt.branchOf?.(id) ? [
+          '\n## Work branch',
+          `Branch: ${rt.branchOwners.get(id).branchId}\nTask: ${rt.branchOf(id).brief}`,
+          'Work and follow up in this branch. Read read_own_chat for newer main-chat decisions before deciding. When finished, call close_work_branch with a concise conclusion; it sends one conclusion to the main chat.',
+        ] : []),
+        ...(choices.length > 0 ? [
+          '\n## Open work branches',
+          ...choices,
+          'Use message_bot work with a branch id for a related follow-up, or "new" for a separate task. One open branch is reused by default; multiple branches require a choice. Pull list_bots for current choices; use read_own_chat to review your task context.',
+        ] : []),
       ].join('\n')
     }
     const room = rt.roomOf(id)

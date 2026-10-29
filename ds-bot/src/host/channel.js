@@ -87,7 +87,11 @@ export function install(rt) {
   // and per Session, when its running turn began.
   const live = () => ({
     activity: rt.activityView(),
-    work: { bots: rt.workView(), rooms: rt.roomWorkView(), approvals: rt.approvalsView(), waiting: rt.waitingView?.() ?? {}, turns: rt.turnsView?.() ?? {}, steered: rt.steeredView?.() ?? {} },
+    work: { bots: rt.workView(), rooms: rt.roomWorkView(), approvals: rt.approvalsView(), waiting: rt.waitingView?.() ?? {}, turns: rt.turnsView?.() ?? {}, steered: rt.steeredView?.() ?? {},
+      branches: Object.fromEntries(Object.values(state.bots).flatMap(bot => Object.values(bot.workBranches ?? {}).filter(branch => branch.sessionId).map(branch => [branch.sessionId,
+        Object.values(state.works ?? {}).some(work => work.pendingAnswer?.failed
+          && (work.sessionId === branch.sessionId || work.replySessionId === branch.sessionId)) ? 'Delivery failed; retry pending'
+          : rt.live.get(branch.sessionId)?.turn !== undefined ? 'Working' : branch.workIds.some(id => state.works?.[id]) ? 'Waiting' : 'Needs close']))) },
     memoryNews: rt.memoryNews(),
     memoryReviews: rt.memoryReviews(),
     connectors: rt.connectorsView(),
