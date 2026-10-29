@@ -111,12 +111,18 @@ export function install(rt) {
   const failureTimers = new Map()
   let writing = Promise.resolve()
   let stopped = false
+  rt.isStopped = () => stopped
   let latest
   let due = false
   const persist = () => {
     // Only the host that saves the team runs its work again.
     if (stopped || rt.readOnly() !== undefined) return
-    latest = JSON.stringify({ turns, queued, pendingResumes })
+    const deliveries = {}
+    for (const id of new Set([...Object.keys(interrupted.queued), ...Object.keys(queued)])) {
+      deliveries[id] = [...new Map([...(interrupted.queued[id] ?? []), ...(queued[id] ?? [])]
+        .map(item => [item.args.exchangeId, item])).values()]
+    }
+    latest = JSON.stringify({ turns: { ...interrupted.turns, ...turns }, queued: deliveries, pendingResumes })
     // One write waits at a time and takes the latest notes, so a busy round does not
     // write the file once per change.
     if (due) return
@@ -139,16 +145,17 @@ export function install(rt) {
     persist()
   }
   const forgetQueued = (exchangeId) => {
-    for (const [sessionId, list] of Object.entries(queued)) {
-      const at = list.findIndex(item => item.args.exchangeId === exchangeId)
-      if (at === -1) continue
-      const rest = list.toSpliced(at, 1)
-      queued = { ...queued }
-      if (rest.length === 0) delete queued[sessionId]
-      else queued[sessionId] = rest
-      persist()
-      return
+    let changed = false
+    for (const table of [queued, interrupted.queued]) {
+      for (const [sessionId, list] of Object.entries(table)) {
+        const rest = list.filter(item => item.args.exchangeId !== exchangeId)
+        if (rest.length === list.length) continue
+        if (rest.length === 0) delete table[sessionId]
+        else table[sessionId] = rest
+        changed = true
+      }
     }
+    if (changed) persist()
   }
 
   const forgetResume = (exchangeId) => {
@@ -157,6 +164,11 @@ export function install(rt) {
     delete pendingResumes[exchangeId]
   }
   const openResume = record => record.work === undefined || rt.ownsWork(record.args.toId, record.work)
+  const workOfDelivery = args => args.work ?? (args.role === 'request' && args.audience !== 'user' ? args.exchangeId : undefined)
+  const queuedFailures = () => [...Object.values(interrupted.queued), ...Object.values(queued)].flat().filter(item => item.args.failureResumes !== undefined)
+  const hasFailureResume = work => Object.values(pendingResumes).some(record => record.work === work)
+    || queuedFailures().some(item => workOfDelivery(item.args) === work)
+  rt.failureResumePending = (exchangeId, attempt) => queuedFailures().some(item => item.args.exchangeId === exchangeId && item.args.failureResumes === attempt)
   const armResume = (exchangeId, record) => {
     clearTimeout(failureTimers.get(exchangeId))
     const timer = setTimeout(() => {
@@ -186,10 +198,14 @@ export function install(rt) {
       forgetResume(exchangeId)
       persist()
     }
+    for (const { args } of queuedFailures()) {
+      if (workOfDelivery(args) === work || args.exchangeId === work) forgetQueued(args.exchangeId)
+    }
   }
 
   const deliver = rt.deliver
   rt.deliver = async (args) => {
+    if (stopped) return args.exchangeId
     const noted = { ...args, exchangeId: args.exchangeId ?? randomUUID() }
     const sessionId = noted.sessionId ?? rt.chatOf(noted.toId)
     const pending = pendingResumes[noted.exchangeId]
@@ -201,6 +217,8 @@ export function install(rt) {
     try {
       return await deliver(noted)
     } catch (error) {
+      // A stopped host leaves the durable queue for the next install.
+      if (stopped) throw error
       forgetQueued(noted.exchangeId)
       if (pending !== undefined && openResume(pending) && !stopped) {
         pendingResumes[noted.exchangeId] = { ...pending, due: Date.now() + FAILURE_RESUME_DELAY_MS }
@@ -268,6 +286,7 @@ export function install(rt) {
     : approval === undefined ? (({ approval: _, ...rest }) => rest)(record) : { ...record, approval }))
 
   async function resumeTurn(sessionId, record) {
+    if (stopped) return
     const bot = rt.botOf(record.botId)
     if (bot === undefined) return
     const text = resumeText(record)
@@ -283,6 +302,9 @@ export function install(rt) {
     }
     if (record.resumed) return
     const trigger = record.trigger
+    const work = rt.workOf(trigger)
+    if (work !== undefined && (hasFailureResume(work)
+      || [...rt.live.values()].some(entry => entry.turn !== undefined && rt.workOf(entry.info) === work))) return
     if ((trigger?.role === 'request' || trigger?.role === 'stopped') && trigger.senderSessionId && trigger.audience !== 'user' && rt.botOf(trigger.senderSessionId)) {
       // The sender still waits for this turn's answer, so it goes on under the same exchange.
       await rt.deliver({ fromId: trigger.senderSessionId, toId: bot.id, role: trigger.role, ...(trigger.exchangeId ? { exchangeId: trigger.exchangeId } : {}), ...(trigger.senderRoomId ? { fromRoomId: trigger.senderRoomId } : {}), ...(trigger.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}), resumed: true, text })
@@ -409,11 +431,13 @@ export function install(rt) {
 
   async function resumeAll() {
     await rt.load()
-    if (rt.readOnly() !== undefined) return
+    if (stopped || rt.readOnly() !== undefined) return
     const { turns: noted, queued: dropped } = interrupted
-    interrupted = { turns: {}, queued: {} }
-    // Taken up now, so another restart does not pick them up twice.
-    persist()
+    const forgetTurn = (id) => {
+      if (stopped) return
+      delete noted[id]
+      persist()
+    }
     // Agents and inboxes are read before anything wakes their Sessions.
     const cut = []
     for (const [sessionId, record] of Object.entries(noted)) {
@@ -422,26 +446,41 @@ export function install(rt) {
         // The turn ended while DS Bot was not watching it: what it did is settled from
         // the Session's durable log.
         await reconcileEnded(sessionId, record, first).catch(error => rt.warn('ds-bot: settling the work of %s failed: %s', sessionId, error))
+        forgetTurn(sessionId)
         continue
       }
       // Still running: noted again, as if it had started here.
-      if (first === undefined && (await rt.resolveAgent(sessionId).catch(() => undefined))?.status === 'running') update(sessionId, () => record)
+      if (first === undefined && (await rt.resolveAgent(sessionId).catch(() => undefined))?.status === 'running') {
+        if (stopped) return
+        update(sessionId, () => record)
+        forgetTurn(sessionId)
+      }
       else cut.push([sessionId, record])
     }
     firstTurn = undefined
     for (const [sessionId, list] of Object.entries(dropped)) {
       if (!Array.isArray(list)) continue
       await resendQueued(sessionId, list).catch(error => rt.warn('ds-bot: sending again what %s was sent failed: %s', sessionId, error))
+      if (stopped) return
+      delete dropped[sessionId]
+      persist()
     }
     taken = undefined
     for (const [sessionId, record] of cut) {
       await resumeTurn(sessionId, record).catch(error => rt.warn('ds-bot: picking up the turn of %s failed: %s', sessionId, error))
+      forgetTurn(sessionId)
     }
   }
 
   ctx.effect(() => {
     void rt.load().then(() => {
       if (stopped || rt.readOnly() !== undefined) return
+      // An interrupted continuation owns its work. Older snapshots may still carry
+      // the failure wait it superseded; do not arm both recovery paths.
+      for (const record of Object.values(interrupted.turns)) {
+        const work = rt.workOf(record.trigger)
+        if (work !== undefined) rt.cancelFailureResumes(work)
+      }
       for (const [exchangeId, record] of Object.entries(pendingResumes)) armResume(exchangeId, record)
     }).catch(error => rt.warn('ds-bot: loading pending failure resumes failed: %s', error))
     const pending = Object.keys(interrupted.turns).length > 0 || Object.keys(interrupted.queued).length > 0

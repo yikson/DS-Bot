@@ -836,6 +836,126 @@ test('work that closes while the resume resolves its Session is not replayed', a
   assert.equal(host.agentOf('a').calls.length, 1)
 })
 
+for (const legacy of [false, true]) {
+  test(`${legacy ? 'an old dual-recovery snapshot' : 'a child result continuing failed work'} has one recovery owner across reload`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() })
+    const home = freshHome(t)
+    const first = await start(home)
+    const request = await askWriter(first, home)
+    const work = request.source.exchangeId
+    first.emit('b', 'turn/end', { turn: 1, reason: failureOf('TIMEOUT') })
+    await settle(() => notes(home).pendingResumes?.[work] !== undefined)
+    const pending = notes(home).pendingResumes[work]
+    run(first, 'b', 2, {
+      content: [{ type: 'text', text: 'the child result is ready' }],
+      source: { kind: 'bot', role: 'reply', exchangeId: 'child-result', replyTo: 'child', work },
+    })
+    await settle(() => inflight(home).b?.trigger?.work === work)
+    assert.deepEqual(notes(home).pendingResumes, {})
+    await first.stop()
+    if (legacy) {
+      // Older hosts could write both records; make the failure deadline overdue.
+      const saved = notes(home)
+      saved.pendingResumes[work] = { ...pending, due: Date.now() - 1 }
+      writeFileSync(join(home, 'inflight.json'), JSON.stringify(saved))
+    }
+    let second = await start(home)
+    if (legacy) {
+      // Ownership and the interrupted turn must survive a second reload before 3s.
+      await second.stop()
+      assert.equal(inflight(home).b.trigger.work, work)
+      second = await start(home)
+    }
+    t.mock.timers.tick(3000)
+    await settle(() => second.agentOf('b').calls.length === 1)
+    const resume = second.agentOf('b').calls[0]
+    assert.deepEqual([resume.source.role, resume.source.work], ['resume', work])
+    t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(second.agentOf('b').calls.length, 1, 'the old failure wait cannot also resume this work')
+    run(second, 'b', 3, resume)
+    second.emit('b', 'assistant/message', { message: { content: [{ type: 'text', text: 'finished with the child result' }] } })
+    second.emit('b', 'turn/end', { turn: 3, reason: { kind: 'completed' } })
+    await settle(() => second.agentOf('a').calls.length === 1)
+    assert.equal(second.agentOf('a').calls[0].source.replyTo, work)
+    t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(second.agentOf('a').calls.length, 1)
+  })
+}
+
+for (const rejects of [false, true]) {
+  test(`a failure resume whose Session ${rejects ? 'rejects' : 'resolves'} after dispose stays queued for the next install`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const home = freshHome(t)
+    const first = await start(home)
+    const request = await askWriter(first, home)
+    first.emit('b', 'turn/end', { turn: 1, reason: failureOf('TIMEOUT') })
+    let release
+    const gate = new Promise(resolve => { release = resolve })
+    t.after(() => release())
+    let resolving = false
+    let returned = false
+    const resolveAgent = first.ctx.sessionController.resolveAgent
+    first.ctx.sessionController.resolveAgent = async (id) => {
+      if (id === 'b') {
+        resolving = true
+        await gate
+        returned = true
+        if (rejects) throw new Error('Session closed during reload')
+      }
+      return resolveAgent(id)
+    }
+    t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+    await settle(() => resolving)
+    await first.stop()
+    release()
+    await settle(() => returned)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(first.agentOf('b').calls.length, 1, 'the disposed host cannot enqueue the resume')
+    assert.deepEqual(notes(home).queued.b.map(item => [item.args.exchangeId, item.args.failureResumes]), [[request.source.exchangeId, 1]])
+    const second = await start(home)
+    t.mock.timers.tick(3000)
+    await settle(() => second.agentOf('b').calls.length === 1)
+    const resume = second.agentOf('b').calls[0]
+    assert.deepEqual([resume.source.exchangeId, resume.source.failureResumes], [request.source.exchangeId, 1])
+    run(second, 'b', 2, resume)
+    second.emit('b', 'assistant/message', { message: { content: [{ type: 'text', text: 'finished in the new host' }] } })
+    second.emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+    await settle(() => second.agentOf('a').calls.length === 1)
+    t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(second.agentOf('b').calls.length, 1)
+    assert.equal(second.agentOf('a').calls.length, 1)
+  })
+}
+
+test('a new failure wait owns the work before normal restart recovery runs', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() })
+  const home = freshHome(t)
+  const first = await start(home)
+  const request = await askWriter(first, home)
+  await first.stop()
+  const second = await start(home)
+  run(second, 'b', 2, request)
+  second.emit('b', 'turn/end', { turn: 2, reason: failureOf('TIMEOUT') })
+  t.mock.timers.tick(3000)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(second.agentOf('b').calls.length, 0)
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await settle(() => second.agentOf('b').calls.length === 1)
+  const resume = second.agentOf('b').calls[0]
+  assert.deepEqual([resume.source.exchangeId, resume.source.failureResumes], [request.source.exchangeId, 1])
+  run(second, 'b', 3, resume)
+  second.emit('b', 'assistant/message', { message: { content: [{ type: 'text', text: 'finished after the new failure' }] } })
+  second.emit('b', 'turn/end', { turn: 3, reason: { kind: 'completed' } })
+  await settle(() => second.agentOf('a').calls.length === 1)
+  t.mock.timers.tick(FAILURE_RESUME_DELAY_MS)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(second.agentOf('b').calls.length, 1)
+  assert.equal(second.agentOf('a').calls.length, 1)
+})
+
 test('input during the wait keeps its turn and the failed request resumes as a followup', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const home = freshHome(t)

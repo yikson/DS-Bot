@@ -95,10 +95,14 @@ export function install(rt) {
       void rt.save().catch(() => {})
     }
     await rt.ensureCapabilities(targetSessionId)
+    if (rt.isStopped?.()) return exchangeId
     const agent = await resolveAgent(targetSessionId)
+    // Keep the recovery queue intact when disposal overtakes an async delivery.
+    if (rt.isStopped?.()) return exchangeId
     // Work can finish while capabilities or the Session are being resolved.
     const failureWork = work ?? (role === 'request' && audience !== 'user' ? exchangeId : undefined)
-    if (failureResumes !== undefined && failureWork !== undefined && !rt.ownsWork(toId, failureWork)) {
+    if (failureResumes !== undefined && (rt.failureResumePending?.(exchangeId, failureResumes) === false
+      || (failureWork !== undefined && !rt.ownsWork(toId, failureWork)))) {
       rt.forgetDelivery?.(exchangeId)
       return exchangeId
     }
