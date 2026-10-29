@@ -6,6 +6,7 @@
 // runtime lives inside its bundle and only its own updater moves it, to the
 // newest release it finds, so the client offers it only when that release is
 // the verified one.
+import { asyncScope } from './async.js'
 import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -20,6 +21,7 @@ const APP_BOOT = '@deepseek-ai/dsh-app-boot'
 const DSH_PACKAGE = '@deepseek-ai/dsh'
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, config } = rt
   const enabled = config.updateCheck !== false
 
@@ -156,17 +158,17 @@ export function install(rt) {
       running.once?.('error', reject)
       running.once?.('close', code => (code === 0 ? resolve() : reject(new Error(`npm exited ${code}`))))
     })
-    void done
+    safe.run('dsh-update background job', () => done
       .then(() => Object.assign(status, { phase: 'installed', installed: chosen.version }))
       .catch((error) => {
         rt.warn('ds-bot: dsh update to %s failed: %s', chosen.version, error?.message ?? error)
         Object.assign(status, { phase: 'failed', error: `${error?.message ?? error}${output ? ` — ${output.trim().slice(-400)}` : ''}`.slice(0, 600) })
-      })
+      }))
     return view()
   }
 
   // Whatever npm is still running when the plugin unloads dies with it.
-  ctx.effect(() => () => running?.kill?.(), 'ds-bot: dsh update install')
+  safe.effect(() => () => running?.kill?.(), 'ds-bot: dsh update install')
 
   Object.assign(rt, { dshUpdateCheck: check, dshUpdateStart: start, dshUpdateView: view })
 }

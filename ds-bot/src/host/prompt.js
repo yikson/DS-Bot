@@ -1,6 +1,7 @@
 // Prompt: one section whose text depends only on the rendering Session's own Bot
 // record, so the prefix stays byte-stable across turns and roster changes.
 
+import { asyncScope } from './async.js'
 const TEAM_RULES = [
   '## How your Bot team works',
   '- Every Bot is its own long-lived conversation with the user, with its own memory and computer.',
@@ -38,6 +39,7 @@ const MAIN_RULES = [
 ].join('\n')
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx } = rt
 
   // A group Session renders exactly its Bot's text, so both share one cached prefix.
@@ -75,7 +77,7 @@ export function install(rt) {
     return ''
   }
 
-  ctx.effect(() => ctx.systemPrompt.section({
+  safe.effect(() => ctx.systemPrompt.section({
     name: 'bot-identity',
     order: 640,
     interpolate: false,

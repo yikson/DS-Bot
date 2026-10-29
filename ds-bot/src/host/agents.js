@@ -1,10 +1,12 @@
 // The DSH Agent: a team's one plain dsh entry, listed beside the Bots but not one of
 // them. Its Sessions are ordinary root Sessions in the DS Bot workspace, so they get
 // the whole dsh conversation surface and none of the team tools.
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { AGENT_NAME, AGENT_SESSION_TITLE_MAX, TEAM_TOOLS } from './constants.js'
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state } = rt
 
   /** @type {Map<string, string>} Session id -> DSH Agent record id. */
@@ -28,18 +30,18 @@ export function install(rt) {
   const pendingRestrict = new Set()
   let retryTimer
   const stopRetry = () => {
-    if (retryTimer !== undefined) clearInterval(retryTimer)
+    if (retryTimer !== undefined) safe.clearInterval(retryTimer)
     retryTimer = undefined
   }
-  ctx.effect(() => stopRetry, 'ds-bot: agent tool restrict retry')
+  safe.effect(() => stopRetry, 'ds-bot: agent tool restrict retry')
   const scheduleRetry = (agent) => {
     pendingRestrict.add(agent)
     if (retryTimer === undefined) {
-      retryTimer = setInterval(() => {
-        for (const waiting of [...pendingRestrict]) void restrictTeamTools(waiting)
+      retryTimer = safe.setInterval(() => {
+        for (const waiting of [...pendingRestrict]) safe.run('agents background job', () => restrictTeamTools(waiting))
         if (pendingRestrict.size === 0) stopRetry()
       }, RETRY_MS)
-      retryTimer.unref?.()
+      retryTimer?.unref?.()
     }
   }
   const restrictTeamTools = async (agent) => {
@@ -67,10 +69,10 @@ export function install(rt) {
     }
   }
   // Fires when a root Session resolves its agent, including sessions saved earlier.
-  ctx.on('agent/created', ({ agent }) => {
-    void rt.load()
+  safe.on('agent/created', ({ agent }) => {
+    safe.run('agents background job', () => rt.load()
       .then(() => restrictTeamTools(agent))
-      .catch(error => rt.warn('ds-bot: tool restrict on agent/created failed: %s', error))
+      .catch(error => rt.warn('ds-bot: tool restrict on agent/created failed: %s', error)))
   })
 
   const writeCheck = () => {

@@ -49,6 +49,7 @@ test('apply registers listeners, tools, and effects in a fixed order', (t) => {
   t.after(stop)
   assert.equal(applyResult, undefined)
   assert.deepEqual(ctx.calls, [
+    'effect ds-bot: async callbacks',
     'effect ds-bot: diagnostics log',
     'effect ds-bot: state lock',
     'on llm/adapters-updated',
@@ -135,6 +136,7 @@ test('apply registers listeners, tools, and effects in a fixed order', (t) => {
     'effect ds-bot: api route',
     'route POST /api/bot',
     'effect ds-bot: load state',
+    'effect ds-bot: stop async callbacks',
   ])
 })
 

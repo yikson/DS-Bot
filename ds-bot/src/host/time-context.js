@@ -1,9 +1,11 @@
+import { asyncScope } from './async.js'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 const SOURCE = 'ds-bot-time-context'
 const isClock = source => source?.kind === SOURCE || source?.kind === 'time-context'
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, config } = rt
   const interval = config.timeRefreshIntervalMs ?? 600_000
   if (!Number.isSafeInteger(interval) || interval < 0) throw new TypeError('timeRefreshIntervalMs must be a non-negative safe integer')
@@ -15,7 +17,7 @@ export function install(rt) {
   })
   const zone = formatter.resolvedOptions().timeZone
 
-  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+  safe.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
     if (decision.kind === 'reject' || signal.aborted) return decision
     await rt.load()

@@ -5,6 +5,7 @@
 // Cards live in a file per Bot and part (<home>/btw/<botId>/<partId>.json), not
 // in state.json, so a save never rewrites them; only the host that owns the
 // team writes them.
+import { asyncScope } from './async.js'
 import { mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { BlockAssembler } from '@deepseek-ai/dsh-llm'
@@ -194,6 +195,7 @@ export function locatePrivate(rt, raw, groupError) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state } = rt
   registerAnchor(ctx)
   const dropped = new Set()
@@ -222,7 +224,7 @@ export function install(rt) {
       const temp = `${path}.${process.pid}.tmp`
       try {
         await writeFile(temp, JSON.stringify(cards.get(botId)?.get(partId) ?? [], null, 2), 'utf8')
-        await replaceFile(temp, path)
+        await replaceFile(temp, path, undefined, safe.delay)
       } catch (error) {
         await unlink(temp).catch(() => {})
         throw error

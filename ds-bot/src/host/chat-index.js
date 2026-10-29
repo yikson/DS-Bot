@@ -7,6 +7,7 @@
 // The index is derived from the Session logs: a part catches up when it is read, an
 // ended part is sealed once it is complete, and deleting the file only costs a
 // rebuild. Without SQLite, read_own_chat scans the logs as before.
+import { asyncScope } from './async.js'
 import { mkdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { ANCHOR_LINE_MAX, HISTORY_PAGE, HISTORY_PAGES_MAX, HISTORY_TIMEOUT_MS, OWN_CHAT_BRIEF, OWN_CHAT_LINE_MAX, OWN_CHAT_READ, OWN_CHAT_SEARCH } from './constants.js'
@@ -43,6 +44,7 @@ export function termQuery(terms, sessions, limit, hidden) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, home } = rt
 
   const indexPath = join(home, 'chat-index.sqlite')
@@ -124,7 +126,7 @@ export function install(rt) {
       throw error
     }
   }
-  ctx.effect(() => () => {
+  safe.effect(() => () => {
     chatIndex?.db.close()
     chatIndex = undefined
     indexOpening = undefined

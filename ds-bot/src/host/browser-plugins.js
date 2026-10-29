@@ -1,5 +1,6 @@
 // The whole team uses one browser plugin. Each Bot still gets its own profile
 // directory, including the group Sessions where that Bot speaks.
+import { asyncScope } from './async.js'
 import { isAbsolute, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -10,25 +11,40 @@ import * as script from './browser/script.js'
 import * as task from './browser/task.js'
 
 export const browserPlugins = { refs, script, task }
-export function appBrowserEndpoint(botId, downloadRoots) {
+export function appBrowserEndpoint(botId, downloadRoots, signal) {
   if (typeof process.send !== 'function') throw new Error('The app browser relay is unavailable.')
   const id = randomUUID()
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    const cleanup = () => {
+      clearTimeout(timeout)
       process.off('message', receive)
+      signal?.removeEventListener('abort', abort)
+    }
+    const timeout = setTimeout(() => {
+      cleanup()
       reject(new Error('The app browser relay did not respond.'))
     }, 10_000)
     const receive = message => {
       if (message?.type !== 'ds-bot:browser-endpoint-response' || message.id !== id) return
-      clearTimeout(timeout)
-      process.off('message', receive)
+      cleanup()
       if (typeof message.url === 'string') resolve(message.url)
       else reject(new Error(message.error || 'The app browser relay is unavailable.'))
     }
+    const abort = () => {
+      cleanup()
+      reject(new Error('DS Bot stopped before the app browser relay answered.'))
+    }
+    if (signal?.aborted) return abort()
+    signal?.addEventListener('abort', abort, { once: true })
     process.on('message', receive)
-    process.send({ type: 'ds-bot:browser-endpoint', id, botId, downloadRoots }, error => {
-      if (error) receive({ type: 'ds-bot:browser-endpoint-response', id, error: error.message })
-    })
+    try {
+      process.send({ type: 'ds-bot:browser-endpoint', id, botId, downloadRoots }, error => {
+        if (error) receive({ type: 'ds-bot:browser-endpoint-response', id, error: error.message })
+      })
+    } catch (error) {
+      cleanup()
+      reject(error)
+    }
   })
 }
 
@@ -112,6 +128,7 @@ async function authorizeBrowserAction(rt, exec, botId, action) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const name = rt.config.browserPlugin
   const injected = rt.config.browserPluginApi
   if (!name && !injected) return
@@ -132,6 +149,8 @@ export function install(rt) {
   }
   const mounted = {}
   mountBrowserPlugin(rt.ctx, {
+    lifecycle: safe,
+    warn: (...args) => rt.warn(...args),
     api: mounted,
     toolDefs: plugin.tools ?? plugin.toolDefs,
     defineTool,
@@ -145,7 +164,8 @@ export function install(rt) {
     headless,
     playwrightUrl,
     executablePath,
-    connect: process.env.DS_BOT_APP === '1' && typeof process.send === 'function' ? appBrowserEndpoint : undefined,
+    connect: process.env.DS_BOT_APP === '1' && typeof process.send === 'function'
+      ? (botId, roots) => appBrowserEndpoint(botId, roots, safe.signal) : undefined,
     getHold: botId => rt.browserChannel?.holdOf(botId) ?? null,
     onHold: (botId, hold) => rt.browserChannel?.setHold(botId, hold && handoffHold(rt, botId, hold)),
     subscribeHolds: listener => rt.browserChannel?.subscribeHolds?.(listener),

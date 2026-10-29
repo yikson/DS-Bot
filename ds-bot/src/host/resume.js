@@ -9,6 +9,7 @@
 // is settled from the Session's durable log: an answer that was produced goes to the Bot
 // that waits for it, and an outcome that cannot be read is said to be unknown. The
 // request itself is never sent again there.
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
@@ -99,6 +100,7 @@ const readNotes = (file) => {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, home } = rt
   const file = join(home, 'inflight.json')
 
@@ -162,7 +164,7 @@ export function install(rt) {
   }
 
   const forgetResume = (exchangeId) => {
-    clearTimeout(failureTimers.get(exchangeId))
+    safe.clearTimeout(failureTimers.get(exchangeId))
     failureTimers.delete(exchangeId)
     delete pendingResumes[exchangeId]
   }
@@ -173,8 +175,8 @@ export function install(rt) {
     || queuedFailures().some(item => workOfDelivery(item.args) === work)
   rt.failureResumePending = (exchangeId, attempt) => queuedFailures().some(item => item.args.exchangeId === exchangeId && item.args.failureResumes === attempt)
   const armResume = (exchangeId, record) => {
-    clearTimeout(failureTimers.get(exchangeId))
-    const timer = setTimeout(() => {
+    safe.clearTimeout(failureTimers.get(exchangeId))
+    const timer = safe.setTimeout(() => {
       failureTimers.delete(exchangeId)
       if (stopped || pendingResumes[exchangeId] !== record) return
       if (!openResume(record) || rt.botOf(record.args.toId) === undefined) {
@@ -182,9 +184,9 @@ export function install(rt) {
         persist()
         return
       }
-      void rt.deliver(record.args).catch(error => rt.warn('ds-bot: resuming the turn of %s failed: %s', record.args.sessionId, error))
+      safe.run('resume background job', () => rt.deliver(record.args).catch(error => rt.warn('ds-bot: resuming the turn of %s failed: %s', record.args.sessionId, error)))
     }, Math.max(0, record.due - Date.now()))
-    timer.unref?.()
+    timer?.unref?.()
     failureTimers.set(exchangeId, timer)
   }
   rt.scheduleFailureResume = ({ work, args }) => {
@@ -245,7 +247,7 @@ export function install(rt) {
 
   // A message is done with once a turn takes it up, or once it leaves the inbox untaken
   // while DS Bot runs: the user stopped the Bot, or DS Bot moved or withdrew it.
-  ctx.on('agent/inbox/discarded', ({ message } = {}) => {
+  safe.on('agent/inbox/discarded', ({ message } = {}) => {
     if (message?.source?.kind === SOURCE_KIND && message.source.exchangeId) forgetQueued(message.source.exchangeId)
   })
   // Exchanges a turn took up since this start, until the resends are done, so a resend
@@ -255,7 +257,7 @@ export function install(rt) {
   // picked up. A turn that ends, or still runs, before one starts here outlived the
   // last run: only DS Bot restarted (the plugin reloaded) and DSH went on.
   let firstTurn = Object.keys(interrupted.turns).length > 0 ? new Map() : undefined
-  ctx.on('session/event', (session, event) => {
+  safe.on('session/event', (session, event) => {
     const id = session?.id
     if (id === undefined) return
     if ((event.type === 'turn/start' || event.type === 'turn/end') && firstTurn?.has(id) === false) {
@@ -356,7 +358,7 @@ export function install(rt) {
       const seen = await controller.inspect(sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS)).catch(() => undefined)
       if (Array.isArray(seen?.events)) return seen.events
       if (attempt > 0) return undefined
-      await new Promise(resolve => setTimeout(resolve, LOG_RETRY_MS))
+      if (!await safe.delay(LOG_RETRY_MS)) return undefined
     }
   }
 
@@ -516,8 +518,8 @@ export function install(rt) {
     }
   }
 
-  ctx.effect(() => {
-    if (Object.keys(pendingResumes).length > 0) void rt.load().then(() => {
+  safe.effect(() => {
+    if (Object.keys(pendingResumes).length > 0) safe.run('resume background job', () => rt.load().then(() => {
       if (stopped || rt.readOnly() !== undefined) return
       // An interrupted continuation owns its work. Older snapshots may still carry
       // the failure wait it superseded; do not arm both recovery paths.
@@ -526,7 +528,7 @@ export function install(rt) {
         if (work !== undefined) rt.cancelFailureResumes(work)
       }
       for (const [exchangeId, record] of Object.entries(pendingResumes)) armResume(exchangeId, record)
-    }).catch(error => rt.warn('ds-bot: loading pending failure resumes failed: %s', error))
+    }).catch(error => rt.warn('ds-bot: loading pending failure resumes failed: %s', error)))
     let timer
     const hasBranches = bots => Object.values(bots ?? {}).some(bot => Object.keys(bot.workBranches ?? {}).length > 0)
     let pending = Object.keys(interrupted.turns).length > 0 || Object.keys(interrupted.queued).length > 0
@@ -537,14 +539,14 @@ export function install(rt) {
       try { pending = hasBranches(JSON.parse(readFileSync(rt.statePath, 'utf8')).bots) } catch {}
     }
     if (pending) {
-      timer = setTimeout(() => void resumeAll().catch(error => rt.warn('ds-bot: picking up interrupted work failed: %s', error)), RESUME_DELAY_MS)
-      timer.unref?.()
+      timer = safe.setTimeout(() => safe.run('resume background job', () => resumeAll().catch(error => rt.warn('ds-bot: picking up interrupted work failed: %s', error))), RESUME_DELAY_MS)
+      timer?.unref?.()
     }
     // What the turns stopped by this shutdown left stays as last noted.
     return () => {
       stopped = true
-      clearTimeout(timer)
-      for (const failureTimer of failureTimers.values()) clearTimeout(failureTimer)
+      safe.clearTimeout(timer)
+      for (const failureTimer of failureTimers.values()) safe.clearTimeout(failureTimer)
       failureTimers.clear()
       return writing
     }

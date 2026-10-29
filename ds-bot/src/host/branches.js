@@ -1,3 +1,4 @@
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { BRANCH_SUMMARY_HEADER, HISTORY_TIMEOUT_MS, TEXT_KEPT } from './constants.js'
 import { splitRef } from './text.js'
@@ -18,14 +19,15 @@ export function deliverySession(rt, args) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state, config } = rt
   const closing = new Map()
   const creating = new Set()
   const answerRetries = new Map()
   let stopped = false
-  ctx.effect(() => () => {
+  safe.effect(() => () => {
     stopped = true
-    for (const retry of answerRetries.values()) clearTimeout(retry.timer)
+    for (const retry of answerRetries.values()) safe.clearTimeout(retry.timer)
     answerRetries.clear()
   }, 'ds-bot: branch answer retries')
   const serial = (key, action) => {
@@ -176,11 +178,11 @@ export function install(rt) {
       const retry = answerRetries.get(workId) ?? { attempts: 0 }
       if (!stopped && !retry.timer && retry.attempts < 3) {
         const delay = 1000 * 2 ** retry.attempts++
-        retry.timer = setTimeout(() => {
+        retry.timer = safe.setTimeout(() => {
           retry.timer = undefined
           return resumeBranchAnswer(workId).catch(retryError => rt.warn('ds-bot: retrying reply %s failed: %s', workId, retryError))
         }, delay)
-        retry.timer.unref?.()
+        retry.timer?.unref?.()
         answerRetries.set(workId, retry)
       }
     }
@@ -188,7 +190,7 @@ export function install(rt) {
   }
 
   function clearAnswerRetry(workId) {
-    clearTimeout(answerRetries.get(workId)?.timer)
+    safe.clearTimeout(answerRetries.get(workId)?.timer)
     answerRetries.delete(workId)
   }
 

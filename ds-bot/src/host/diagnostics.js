@@ -4,6 +4,7 @@
 // a report written after a restart still has them. Every text is cleaned of saved keys,
 // credential-like strings and the home folder before it is kept and again before it is
 // shown, because the report is meant for a public issue.
+import { asyncScope } from './async.js'
 import { readFileSync } from 'node:fs'
 import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { arch, homedir, platform, release } from 'node:os'
@@ -112,6 +113,7 @@ const dshVersion = () => {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, home, config } = rt
   const logPath = join(home, 'logs', 'diagnostics.jsonl')
   const toFile = config.diagnosticsFile !== false
@@ -122,7 +124,7 @@ export function install(rt) {
 
   // The log is written in the background. A stop waits for what is queued and writes
   // nothing after it, so nothing changes in `home` once the plugin has stopped.
-  ctx.effect(() => () => {
+  safe.effect(() => () => {
     stopped = true
     return writing
   }, 'ds-bot: diagnostics log')

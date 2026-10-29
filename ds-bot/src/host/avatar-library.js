@@ -2,6 +2,7 @@
 // same picture can be picked for several Bots and outlives the Bot that used it. Every
 // image is named by the hash of its bytes, so the same picture is stored once, and the
 // index and the images are written whole, so a half-written file is never read.
+import { asyncScope } from './async.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -16,6 +17,7 @@ const MAX_PHOTOS = 500
 const MAX_LISTED = 48
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const root = typeof rt.home === 'string' ? join(rt.home, 'avatars') : undefined
   const files = root === undefined ? undefined : join(root, 'files')
   const indexPath = root === undefined ? undefined : join(root, 'index.json')
@@ -53,7 +55,7 @@ export function install(rt) {
     await mkdir(root, { recursive: true })
     const temp = `${indexPath}.${process.pid}.${randomUUID()}.tmp`
     await writeFile(temp, JSON.stringify({ version: 1, items }, null, 2), 'utf8')
-    await replaceFile(temp, indexPath)
+    await replaceFile(temp, indexPath, undefined, safe.delay)
   }
 
   const writeImage = async (entry, bytes) => {
@@ -61,7 +63,7 @@ export function install(rt) {
     const path = fileOf(entry)
     const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
     await writeFile(temp, bytes)
-    await replaceFile(temp, path)
+    await replaceFile(temp, path, undefined, safe.delay)
   }
 
   const there = async path => stat(path).then(() => true, () => false)

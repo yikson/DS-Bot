@@ -14,6 +14,7 @@
 // The next part opens with the handoff package: the note, the latest messages word for
 // word, and where the rest is. Input that arrives meanwhile waits and moves along.
 // read_own_chat searches every part, the condensed messages included.
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { openTurnAt } from './btw.js'
@@ -221,6 +222,7 @@ export function canonicalHeadings(note, names) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, config, state } = rt
 
   const RECENT_TOKENS = config.handoffRecentTokens ?? 16_384
@@ -328,7 +330,7 @@ export function install(rt) {
     }
     adoptedEngines.add(engine)
   }
-  ctx.effect(() => () => {
+  safe.effect(() => () => {
     for (const engine of adoptedEngines) {
       for (const [key, method] of Object.entries(engine[ORIGINAL_COMPACT] ?? {})) {
         delete engine[key]
@@ -338,7 +340,7 @@ export function install(rt) {
     }
     adoptedEngines.clear()
   }, 'ds-bot: Bot compaction')
-  ctx.on('agent/created', ({ agent }) => { adoptCompaction(agent) })
+  safe.on('agent/created', ({ agent }) => { adoptCompaction(agent) })
 
   // A Bot's own chat, or its Session in one group, as numbered parts, oldest first;
   // the last one is current.
@@ -844,7 +846,7 @@ export function install(rt) {
     if (place === undefined || switches.has(agent.id) || readOnly()) return
     const job = { ...place, carry: [...carry], info, joined, resume, overflow, failed, bare, folder, hard, since: Date.now() }
     switches.set(agent.id, job)
-    void runSwitch(agent, job)
+    safe.run('parts background job', () => runSwitch(agent, job)
       .catch(error => {
         if (unloaded(error)) return noteInfo('ds-bot: plugin unloaded while %s switched parts; input kept in part %s', rt.botOf(job.botId)?.name ?? agent.id, agent.id)
         rt.warn('ds-bot: %s did not move on to a fresh part: %s', rt.botOf(job.botId)?.name ?? agent.id, error)
@@ -860,7 +862,7 @@ export function install(rt) {
           noteFailures.delete(agent.id)
           folderRetry.delete(agent.id)
           // The folder may have changed again while the switch ran.
-          if (job.roomId === undefined) void followFolder(job.botId)
+          if (job.roomId === undefined) safe.run('following switched folder', () => followFolder(job.botId))
           return
         }
         if (folder) folderRetry.set(agent.id, Date.now() + FOLDER_RETRY_MS)
@@ -890,7 +892,7 @@ export function install(rt) {
       })
       // A state write that fails here (full disk, a file another program holds, a lost lock)
       // must not end up as an unhandled rejection, which stops the whole host.
-      .catch(error => rt.warn('ds-bot: the switch of %s did not finish: %s', agent.id, error))
+      .catch(error => rt.warn('ds-bot: the switch of %s did not finish: %s', agent.id, error)))
   }
 
   async function runSwitch(agent, job) {
@@ -1065,7 +1067,7 @@ export function install(rt) {
   // Runs first: an earlier part hands its input on, a part past the hard line makes
   // room before the step (condensed in place, or it stops and goes on in a fresh
   // part), and the backend's own pre-step listener sees the wrapper.
-  ctx.on('agent/pre-step', async (payload, next) => {
+  safe.on('agent/pre-step', async function preparePart(payload, next) {
     await rt.load()
     const { agent } = payload
     const past = rt.pastOwners.get(agent.id)
@@ -1131,7 +1133,7 @@ export function install(rt) {
   // own folder went away first changes to the folder it would move to, through DSH's
   // documented way out (`workingDirectory.set`), and the pre-step then moves it to a
   // fresh part there, as on DSH 0.2.0.
-  ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+  safe.on('system-prompt/assemble', async (assembly, context, next) => {
     const agent = context.agent
     const folders = ctx.get?.('workingDirectory')
     if (agent === undefined || typeof folders?.get !== 'function' || readOnly()) return next()
@@ -1163,7 +1165,7 @@ export function install(rt) {
     }
   }
 
-  ctx.on('agent/request-error', async (payload, next) => {
+  safe.on('agent/request-error', async (payload, next) => {
     const failure = payload.failure
     if (!STUCK_CODES.includes(failure?.code)) return next()
     const decided = await next()
@@ -1181,7 +1183,7 @@ export function install(rt) {
     return undefined
   }, { prepend: true })
 
-  ctx.on('agent/request-error', async (payload, next) => {
+  safe.on('agent/request-error', async (payload, next) => {
     if (payload.failure?.code !== OVERFLOW || payload.signal?.aborted) return next()
     await rt.load()
     const { agent } = payload
@@ -1231,23 +1233,23 @@ export function install(rt) {
     if (end !== undefined && end.data?.reason?.kind !== 'error') rescued.delete(agent.id)
   }
 
-  ctx.effect(() => {
-    const timer = setTimeout(() => void heldBack().catch(error => rt.warn('ds-bot: handing on input kept in earlier parts failed: %s', error)), RESUME_DELAY_MS)
-    timer.unref?.()
-    return () => clearTimeout(timer)
+  safe.effect(() => {
+    const timer = safe.setTimeout(() => safe.run('parts background job', () => heldBack().catch(error => rt.warn('ds-bot: handing on input kept in earlier parts failed: %s', error))), RESUME_DELAY_MS)
+    timer?.unref?.()
+    return () => safe.clearTimeout(timer)
   }, 'ds-bot: hand on input kept in earlier parts')
 
-  ctx.on('agent/status', ({ agent, status }) => {
+  safe.on('agent/status', ({ agent, status }) => {
     if (status === 'idle' && rt.isBotSession(agent.id) && !rt.branchOwners?.has(agent.id)) {
       releaseRescued(agent)
-      void checkContext(agent).catch(error => rt.warn('ds-bot: context check for %s failed: %s', agent.id, error))
+      safe.run('parts background job', () => checkContext(agent).catch(error => rt.warn('ds-bot: context check for %s failed: %s', agent.id, error)))
     }
   })
 
   // The handoff package opens a part as a turn of its own, so it is the first message
   // in the part's history. When nothing is left to do, that turn's reply is a fixed
   // line instead of a model call.
-  ctx.on('llm/stream', (options, next) => {
+  safe.on('llm/stream', function acknowledgeHandoff(options, next) {
     if (options.sessionId === undefined || options.purpose !== undefined || rt.ownRequest(options)) return next()
     const messages = options.messages ?? []
     const since = messages.findLastIndex(message => message.role === 'assistant' || message.role === 'tool') + 1

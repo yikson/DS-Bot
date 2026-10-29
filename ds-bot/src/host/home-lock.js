@@ -22,7 +22,7 @@ export function pidAlive(pid) {
   }
 }
 
-export function homeLock(path, { staleMs = 60_000, beatMs = 15_000, host = hostname(), pid = process.pid, isAlive = pidAlive, now = Date.now } = {}) {
+export function homeLock(path, { staleMs = 60_000, beatMs = 15_000, host = hostname(), pid = process.pid, isAlive = pidAlive, now = Date.now, timers = globalThis } = {}) {
   const token = randomUUID()
   let timer
 
@@ -54,7 +54,7 @@ export function homeLock(path, { staleMs = 60_000, beatMs = 15_000, host = hostn
     try { utimesSync(path, time, time) } catch {}
   }
   const stop = () => {
-    if (timer !== undefined) clearInterval(timer)
+    if (timer !== undefined) timers.clearInterval(timer)
     timer = undefined
   }
 
@@ -66,8 +66,8 @@ export function homeLock(path, { staleMs = 60_000, beatMs = 15_000, host = hostn
       try {
         writeFileSync(path, JSON.stringify({ pid, host, token, since: now() }), { flag: 'wx' })
         stop()
-        timer = setInterval(beat, beatMs)
-        timer.unref?.()
+        timer = timers.setInterval(beat, beatMs)
+        timer?.unref?.()
         return undefined
       } catch (error) {
         if (error?.code !== 'EEXIST') throw error

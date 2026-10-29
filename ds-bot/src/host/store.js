@@ -1,6 +1,7 @@
 // Store: the saved team (state.json), its migrations, the lock that keeps a second dsh
 // host on the same data from writing it, and the indexes that map a Session to the Bot
 // or group chat it belongs to.
+import { asyncScope } from './async.js'
 import { mkdirSync, statSync } from 'node:fs'
 import { copyFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -16,6 +17,7 @@ import { currentColor, headOf, normalize, unquote } from './text.js'
 export const own = (table, key) => (table != null && Object.hasOwn(table, key) ? table[key] : undefined)
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, home, statePath } = rt
 
   /** @type {{version:1, workspaceId?:string, mainBotIds:string[], bots:Record<string,any>, rooms:Record<string,any>, agents:Record<string,any>, capabilities:{items:Record<string,any>}, exchanges:any[], exchangeTurns:Record<string,number[]>, revision:number}} */
@@ -42,7 +44,7 @@ export function install(rt) {
       return ''
     }
   }
-  const lock = homeLock(join(home, 'state.lock'))
+  const lock = homeLock(join(home, 'state.lock'), { timers: safe })
   const claimLock = () => {
     if (lockBroken) return
     try {
@@ -245,7 +247,7 @@ export function install(rt) {
       }
     }
     // Not awaited: renaming a session must not hold up the first roster read.
-    for (const room of stale) void rt.retitleRoom(room)
+    for (const room of stale) safe.run('store background job', () => rt.retitleRoom(room))
   })()
 
   // A reading host follows the file and takes over once the other host has gone.
@@ -321,7 +323,7 @@ export function install(rt) {
         ensureLock()
         await writeFile(temp, snapshot, 'utf8')
         ensureLock()
-        await replaceFile(temp, statePath, ensureLock)
+        await replaceFile(temp, statePath, ensureLock, safe.delay)
         seen = stamp()
         rt.capabilitiesStateSaved?.()
         rt.stateSaved?.()
@@ -337,7 +339,7 @@ export function install(rt) {
     })
   }
 
-  ctx.effect(() => () => {
+  safe.effect(() => () => {
     stopped = true
     return writing.finally(() => lock.release())
   }, 'ds-bot: state lock')
@@ -409,7 +411,7 @@ export function install(rt) {
     rt.cancelApprovals?.(sessionId)
     // A plain archive refuses a running Session, which would go on working for a group
     // that no longer has it.
-    void ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: true }).catch(() => {})
+    safe.run('store background job', () => ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: true }))
   }
   // A group Session DSH can no longer open is set aside; the member's earlier parts in
   // the group stay, and its next turn there starts a new Session.
@@ -419,7 +421,7 @@ export function install(rt) {
     delete room.sessions[botId]
     groupOwners.delete(sessionId)
     rt.cancelApprovals?.(sessionId)
-    void ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: true }).catch(() => {})
+    safe.run('store background job', () => ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: true }))
   }
   const findBot = (ref) => {
     if (ref === undefined) return undefined

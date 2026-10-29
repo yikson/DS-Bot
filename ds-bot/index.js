@@ -2,6 +2,7 @@
 // Every Bot is one root Session; the roster, rooms, and the bot-to-bot exchange log live
 // in one JSON file under DSH_HOME so they survive restarts without new Session event types.
 import { join } from 'node:path'
+import { asyncScope } from './src/host/async.js'
 import * as diagnostics from './src/host/diagnostics.js'
 import * as store from './src/host/store.js'
 import * as models from './src/host/models.js'
@@ -69,5 +70,7 @@ export function createRuntime(ctx, config = {}) {
     },
   }
   for (const module of MODULES) module.install(rt)
+  // Registered last: stop callbacks before any asynchronous module cleanup begins.
+  asyncScope(rt).effect(() => asyncScope(rt).stop, 'ds-bot: stop async callbacks')
   return rt
 }

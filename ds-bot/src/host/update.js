@@ -1,5 +1,6 @@
 // Version checks only. Replacing a running bundle unloads this plugin before
 // its replacement is known to work; release and recovery must run out of band.
+import { asyncScope } from './async.js'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -110,6 +111,7 @@ const releasesUrl = () => {
 export const STARS_TTL_MS = 60 * 60_000
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, config } = rt
   const enabled = config.updateCheck !== false
   const manager = () => ctx.get?.('pluginManager')
@@ -208,11 +210,11 @@ export function install(rt) {
   }
 
   if (enabled) {
-    ctx.effect(() => {
-      const timer = setTimeout(() => { void check() }, STARTUP_DELAY_MS)
+    safe.effect(() => {
+      const timer = safe.setTimeout(() => { safe.run('update background job', () => check()) }, STARTUP_DELAY_MS)
       // A pending first check never keeps the process alive.
-      timer.unref?.()
-      return () => clearTimeout(timer)
+      timer?.unref?.()
+      return () => safe.clearTimeout(timer)
     }, 'ds-bot: update check')
   }
 

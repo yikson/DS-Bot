@@ -45,7 +45,7 @@ function start({ presets } = {}) {
     sessionTitle: { rename: async () => {} },
   })
   const rt = createRuntime(ctx, { home, github: false, diagnosticsFile: false })
-  const relay = ctx.listeners.get('llm/stream').find(listener => /relayOrPass/.test(String(listener)))
+  const relay = ctx.listeners.get('llm/stream').find(listener => listener.name === 'relayGroup')
   const stop = async () => {
     await ctx.dispose()
     rmSync(home, { recursive: true, force: true, maxRetries: 5 })

@@ -16,6 +16,7 @@
 // it started, or that is called while still at earlier work, lets the round go on. Its
 // turn keeps running in its group Session, and what it ends with is posted to the group,
 // where the member that asked for it answers.
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { readFile, rm } from 'node:fs/promises'
@@ -131,6 +132,7 @@ const lostSession = error => error?.code === 'session/not-found' || /\bis corrup
 const fileLine = file => `[File "${file.name}" (${file.bytes} bytes) attached]`
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx } = rt
 
   // A long line keeps its start in state.json, which is written whole on every save,
@@ -162,12 +164,12 @@ export function install(rt) {
   function dropGroupLine(roomId, line) {
     if (line.length === undefined) return
     wholeLines.delete(lineKey(roomId, line.seq))
-    if (writes()) void rm(lineFile(roomId, line.seq), { force: true }).catch(() => {})
+    if (writes()) safe.run('groups background job', () => rm(lineFile(roomId, line.seq), { force: true }))
   }
 
   function dropGroupLines(roomId) {
     for (const key of wholeLines.keys()) if (key.startsWith(`${roomId}/`)) wholeLines.delete(key)
-    if (writes()) void rm(join(linesDir, roomId), { recursive: true, force: true }).catch(() => {})
+    if (writes()) safe.run('groups background job', () => rm(join(linesDir, roomId), { recursive: true, force: true }))
   }
 
   // After a restart the whole lines are read back before a member reads them.
@@ -208,8 +210,8 @@ export function install(rt) {
     // Undefined means the member is gone from the group.
     const gone = rt.roomOf(room.id) !== room || !room.members.includes(member.id) || rt.botOf(member.id) === undefined
     if (gone || room.sessions?.[member.id] !== undefined) {
-      void ctx.workspaceRegistry.archiveSession(id, { stopActivity: true })
-        .catch(error => rt.warn('ds-bot: unused group Session of %s in %s not archived: %s', member.name, room.name, error))
+      safe.run('groups background job', () => ctx.workspaceRegistry.archiveSession(id, { stopActivity: true })
+        .catch(error => rt.warn('ds-bot: unused group Session of %s in %s not archived: %s', member.name, room.name, error)))
       return gone ? undefined : groupSessionFor(room, member)
     }
     room.sessions[member.id] = id
@@ -282,7 +284,7 @@ export function install(rt) {
   const postInRound = (room, round, member, text, duration) => {
     appendRoom(room, { who: member.name, botId: member.id, text })
     round.replies.push({ botId: member.id, name: member.name, color: member.color, text, time: Date.now(), ...(duration === undefined ? {} : { duration }) })
-    void rt.save().catch(() => {})
+    safe.run('groups background job', () => rt.save())
   }
 
   // One member turn inside the room; resolves to its final text, `{ failure }` when its
@@ -293,7 +295,7 @@ export function install(rt) {
   // called it, which answers what the turn posts after the round moved on. What the
   // member writes before its last step is posted at once and collected in `said`.
   async function roomTurn(room, member, sessionId, { text, files }, note, signal, round, by, said = []) {
-    if (signal.aborted) return null
+    if (signal.aborted || safe.stopped) return null
     const startedAt = Date.now()
     const exchangeId = randomUUID()
     const turn = { botId: member.id, sessionId, exchangeId }
@@ -308,16 +310,19 @@ export function install(rt) {
       let timer
       let grace
       const finish = (value) => {
-        clearTimeout(timer)
-        clearTimeout(grace)
+        safe.clearTimeout(timer)
+        safe.clearTimeout(grace)
+        signal.removeEventListener('abort', abort)
+        safe.signal.removeEventListener('abort', abort)
         rt.roomWaiters.delete(exchangeId)
         resolve(value)
       }
+      const abort = () => finish(null)
       const touch = () => {
-        clearTimeout(timer)
-        timer = setTimeout(() => finish({ missed: true }), ROOM_REPLY_TIMEOUT_MS)
+        safe.clearTimeout(timer)
+        timer = safe.setTimeout(() => finish({ missed: true }), ROOM_REPLY_TIMEOUT_MS)
       }
-      const work = () => { grace ??= setTimeout(() => finish({ working: true }), ROOM_WORK_GRACE_MS) }
+      const work = () => { grace ??= safe.setTimeout(() => finish({ working: true }), ROOM_WORK_GRACE_MS) }
       const say = (raw) => {
         const step = stripOwnName(member.name, raw)
         if (isPass(step)) return
@@ -326,7 +331,8 @@ export function install(rt) {
       }
       touch()
       rt.roomWaiters.set(exchangeId, { sessionId, botId: member.id, roomId: room.id, resolve: finish, fail: failure => finish({ failure }), touch, work, say, approval: () => finish({ approval: true }) })
-      signal.addEventListener('abort', () => finish(null), { once: true })
+      signal.addEventListener('abort', abort, { once: true })
+      safe.signal.addEventListener('abort', abort, { once: true })
     })
     try {
       await rt.deliver({ fromId: undefined, toId: member.id, sessionId, role: 'room', roomId: room.id, exchangeId, note, text, files, steer: busy, ...(by ? { askedBy: by } : {}) })
@@ -343,7 +349,7 @@ export function install(rt) {
       const lost = lostSession(error)
       if (lost && room.sessions?.[member.id] === sessionId) {
         rt.retireGroupSession(room, member.id)
-        void rt.save().catch(() => {})
+        safe.run('groups background job', () => rt.save())
       }
       rt.roomWaiters.get(exchangeId)?.fail({ code: lost ? 'SESSION_RESET' : 'SESSION', message: String(error?.message ?? error).slice(0, 300) })
     }
@@ -449,7 +455,7 @@ export function install(rt) {
     // The user spoke in this room, so Bot relays count afresh and the paused run.
     room.relays = 0
     resumePaused(room, round)
-    void rt.save().catch(() => {})
+    safe.run('groups background job', () => rt.save())
   }
 
   async function runRound(room, round, signal, agent) {
@@ -667,11 +673,11 @@ export function install(rt) {
         rt.roomProgress.delete(exec.callId)
       }
       if (exec.signal?.aborted) {
-        for (const turn of round.started) void rt.stopRoomTurn?.(room.sessions?.[turn.botId] ?? turn.sessionId, turn.exchangeId)
+        for (const turn of round.started) safe.run('groups background job', () => rt.stopRoomTurn?.(room.sessions?.[turn.botId] ?? turn.sessionId, turn.exchangeId))
       }
       await rt.save()
       for (const post of posts) {
-        if (post.reportBack && rt.botOf(post.botId)) void reportRound(room, post, round)
+        if (post.reportBack && rt.botOf(post.botId)) safe.run('groups background job', () => reportRound(room, post, round))
       }
       exec.concludeTurn?.()
       return JSON.stringify({ replies: round.replies, passed: round.passed, ...(round.failed.length > 0 ? { failed: round.failed } : {}) })
@@ -707,7 +713,7 @@ export function install(rt) {
         for (const round of rt.roomProgress.values()) {
           if (round.roomId === room.id) round.replies.push({ kind: 'lookup', botId: member.id, name: member.name, color: member.color, text, time: Date.now() })
         }
-        void rt.save().catch(() => {})
+        safe.run('groups background job', () => rt.save())
       }
       const partsNote = parts.length > 1 ? `\n\nYour own chat has ${parts.length} parts: ${rt.partIndex(parts)}. Call read_own_chat with part N for the note that closed an earlier part, or with words to search all parts.` : ''
       if (query === '' && around !== '') {
@@ -877,10 +883,10 @@ export function install(rt) {
   // for and a line that calls a member go at once; lines still held when the turn ends
   // open its result. Per group Session.
   const held = new Map()
-  ctx.effect(() => () => { for (const entry of held.values()) clearTimeout(entry.timer) }, 'ds-bot: group step lines')
+  safe.effect(() => () => { for (const entry of held.values()) safe.clearTimeout(entry.timer) }, 'ds-bot: group step lines')
   const flushSteps = (sessionId) => {
     const entry = held.get(sessionId)
-    clearTimeout(entry.timer)
+    safe.clearTimeout(entry.timer)
     entry.timer = undefined
     if (entry.lines.length === 0) return undefined
     entry.last = Date.now()
@@ -896,12 +902,12 @@ export function install(rt) {
     entry.info = info
     entry.lines.push(text)
     if ((first && info?.role === 'room') || callsIn(room, member, text) || Date.now() - entry.last >= ROOM_STEP_GAP_MS) return flushSteps(sessionId)
-    entry.timer ??= setTimeout(() => void flushSteps(sessionId)?.catch(error => rt.warn('ds-bot: step lines from %s not posted: %s', member.name, error)), entry.last + ROOM_STEP_GAP_MS - Date.now())
+    entry.timer ??= safe.setTimeout(() => safe.run('groups background job', () => flushSteps(sessionId)?.catch(error => rt.warn('ds-bot: step lines from %s not posted: %s', member.name, error))), entry.last + ROOM_STEP_GAP_MS - Date.now())
   }
   rt.takeRoomSteps = (sessionId) => {
     const entry = held.get(sessionId)
     if (entry === undefined) return ''
-    clearTimeout(entry.timer)
+    safe.clearTimeout(entry.timer)
     entry.timer = undefined
     entry.last = Date.now()
     return entry.lines.splice(0).join('\n\n')
@@ -988,7 +994,7 @@ export function install(rt) {
   // group_relay" (they message one member directly when the user names it), so the
   // relay step is synthesized here. Auxiliary calls such as titles, and DS Bot's own
   // calls for the room such as image readings, still reach the model.
-  ctx.on('llm/stream', (options, next) => {
+  safe.on('llm/stream', function relayGroup(options, next) {
     if (options.sessionId === undefined || options.purpose !== undefined || rt.ownRequest(options)) return next()
     return (async function* relayOrPass() {
       await rt.load()

@@ -23,6 +23,7 @@
 // memory section the first time it renders, so its prompt stays byte-stable and the
 // provider's prefix cache holds; a fresh part, or a checkpoint (which breaks the cache
 // anyway), freezes it anew.
+import { asyncScope } from './async.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs'
 import { appendFile, mkdir, rename, unlink, writeFile } from 'node:fs/promises'
@@ -444,6 +445,7 @@ const askRequest = ({ name, group = false, numbered, language, text }) => [
 // ---------------------------------------------------------------------------
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, config, home, state } = rt
 
   if (config.memory === false) {
@@ -519,7 +521,7 @@ export function install(rt) {
     await mkdir(dirname(path), { recursive: true })
     const temp = `${path}.${process.pid}.tmp`
     await writeFile(temp, text, 'utf8')
-    await replaceFile(temp, path)
+    await replaceFile(temp, path, undefined, safe.delay)
   }
   let writing = Promise.resolve()
   const queued = (job) => {
@@ -658,8 +660,8 @@ export function install(rt) {
   })
 
   // A change that was interrupted is finished when the host starts.
-  ctx.effect(() => {
-    void rt.load().then(() => recover()).catch(error => rt.warn('ds-bot: memory recovery failed: %s', error?.message ?? error))
+  safe.effect(() => {
+    safe.run('memory background job', () => rt.load().then(() => recover()).catch(error => rt.warn('ds-bot: memory recovery failed: %s', error?.message ?? error)))
   }, 'ds-bot: memory recovery')
 
   // Checked when the write runs: a Bot or group chat deleted after the write was
@@ -983,7 +985,7 @@ export function install(rt) {
     const path = snapshotPath(sessionId)
     const snap = existsSync(path) ? sectionRead(path) : { text: '' }
     if (pending.pending === true || pending.failed === true) {
-      if (pending.pending === true) void recover().catch(error => rt.warn('ds-bot: memory recovery failed: %s', error?.message ?? error))
+      if (pending.pending === true) safe.run('memory background job', () => recover().catch(error => rt.warn('ds-bot: memory recovery failed: %s', error?.message ?? error)))
       // Only a previously committed snapshot is safe while files may be half-written.
       if (snap.text !== '' && holds(snap.text)) return snap.text
       return ['# Your memory', memoryRules(reviewOn), ...marks, '', 'Memory is unavailable until its pending change has been recovered. Use recall after recovery.'].join('\n')
@@ -1017,7 +1019,7 @@ export function install(rt) {
     try { unlinkSync(snapshotPath(sessionId)) } catch { /* none saved */ }
   }
 
-  ctx.effect(() => ctx.systemPrompt.section({
+  safe.effect(() => ctx.systemPrompt.section({
     name: 'bot-memory',
     order: 645,
     interpolate: false,
@@ -1331,7 +1333,7 @@ export function install(rt) {
     const request = panel.group
       ? groupSummaryRequest({ name: panel.name, lines: linesFor(loaded.group), language })
       : summaryRequest({ name: panel.name, own: linesFor(loaded.own), team: linesFor(loaded.team), language })
-    const job = (async () => {
+    const job = safe.run('memory summary', () => (async () => {
       const text = await botShot(keeper, SUMMARY_SYSTEM, request, panel.tag)
       const value = { hash, text: text.slice(0, SUMMARY_TEXT_MAX), at: Date.now() }
       summaries.set(panel.id, value)
@@ -1340,7 +1342,7 @@ export function install(rt) {
     })().catch((error) => {
       summaryFailures.set(panel.id, { hash, model, message: error?.message ?? String(error) })
       rt.warn('ds-bot: memory summary for %s failed: %s', panel.name, error)
-    }).finally(() => summarizing.delete(panel.id))
+    }).finally(() => summarizing.delete(panel.id)))
     summarizing.set(panel.id, job)
   }
 
@@ -1688,7 +1690,7 @@ export function install(rt) {
       return
     }
     reviewQueue.set(seen.key, seen)
-    reviewChain = reviewChain.then(async () => {
+    reviewChain = reviewChain.then(() => safe.run('memory review', async () => {
       const waited = reviewQueue.get(seen.key)
       reviewQueue.delete(seen.key)
       reviewsRunning += 1
@@ -1699,7 +1701,7 @@ export function install(rt) {
       } finally {
         reviewsRunning -= 1
       }
-    })
+    }))
   }
 
   if (reviewOn) {
@@ -1709,10 +1711,10 @@ export function install(rt) {
     /** @type {Map<string, ReturnType<typeof reviewOf>>} */
     const turnOwners = new Map()
     // A turn that starts again before the delay is over is reviewed when it ends.
-    ctx.on('agent/status', ({ agent, status }) => {
+    safe.on('agent/status', ({ agent, status }) => {
       const id = agent?.id
       if (id === undefined || (!rt.isBotSession(id) && !turnOwners.has(id))) return
-      clearTimeout(reviewTimers.get(id))
+      safe.clearTimeout(reviewTimers.get(id))
       reviewTimers.delete(id)
       if (status !== 'idle') {
         if (!turnOwners.has(id)) turnOwners.set(id, reviewOf(id))
@@ -1722,15 +1724,15 @@ export function install(rt) {
       turnOwners.delete(id)
       const seen = reviewOf(id) ?? started
       if (seen === undefined) return
-      const timer = setTimeout(() => {
+      const timer = safe.setTimeout(() => {
         reviewTimers.delete(id)
         queueReview(seen)
       }, delay)
-      timer.unref?.()
+      timer?.unref?.()
       reviewTimers.set(id, timer)
     })
-    ctx.effect(() => () => {
-      for (const timer of reviewTimers.values()) clearTimeout(timer)
+    safe.effect(() => () => {
+      for (const timer of reviewTimers.values()) safe.clearTimeout(timer)
       reviewTimers.clear()
       turnOwners.clear()
     }, 'ds-bot: memory review')

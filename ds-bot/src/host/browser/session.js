@@ -4,6 +4,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises'
 import { basename, extname, isAbsolute, join, relative as relativePath } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { gateScope } from './gate.js'
 
 const ACTION_TIMEOUT = 5_000
@@ -86,9 +87,9 @@ async function loadChromium(playwrightUrl) {
 }
 
 /**
- * @param {{ botId: string, profileRoot: string, headless?: boolean, playwrightUrl?: string, executablePath?: string, actionTimeout?: number, downloadDir?: string | (() => Promise<string | undefined>), uploadRoots?: () => Promise<string[]>, connect?: (botId: string) => Promise<string>, getHold?: () => any, onHold?: (hold: any) => void }} options
+ * @param {{ botId: string, profileRoot: string, headless?: boolean, playwrightUrl?: string, executablePath?: string, actionTimeout?: number, downloadDir?: string | (() => Promise<string | undefined>), uploadRoots?: () => Promise<string[]>, connect?: (botId: string) => Promise<string>, getHold?: () => any, onHold?: (hold: any) => void, signal?: AbortSignal, warn?: Function }} options
  */
-export async function openBotBrowser({ botId, profileRoot, downloadDir, headless = true, playwrightUrl, executablePath, actionTimeout = ACTION_TIMEOUT, connect, getHold, onHold, uploadRoots }) {
+export async function openBotBrowser({ botId, profileRoot, downloadDir, headless = true, playwrightUrl, executablePath, actionTimeout = ACTION_TIMEOUT, connect, getHold, onHold, uploadRoots, signal, warn }) {
   const getDownloadDir = typeof downloadDir === 'function' ? downloadDir : async () => downloadDir
   const userDataDir = join(profileRoot, botId)
   const chromium = await loadChromium(playwrightUrl)
@@ -114,10 +115,33 @@ export async function openBotBrowser({ botId, profileRoot, downloadDir, headless
       if (Array.isArray(saved) && saved.length > 0) await context.addCookies(saved)
     } catch { /* no cookies yet */ }
   }
-  return createSession({ context, browser, page, botId, userDataDir, cookieFile, downloadDir: getDownloadDir, actionTimeout, getHold, onHold, uploadRoots })
+  return createSession({ context, browser, page, botId, userDataDir, cookieFile, downloadDir: getDownloadDir, actionTimeout, getHold, onHold, uploadRoots, signal, warn })
 }
 
-export function createSession({ context, browser, page, botId, userDataDir, cookieFile, downloadDir, actionTimeout, getHold, onHold, uploadRoots }) {
+export function createSession({ context, browser, page, botId, userDataDir, cookieFile, downloadDir, actionTimeout, getHold, onHold, uploadRoots, signal: parentSignal, warn }) {
+  const closed = new AbortController()
+  const signal = parentSignal ? AbortSignal.any([parentSignal, closed.signal]) : closed.signal
+  // Browser events may create work long before the next tool awaits it.
+  // Attach a handler now, but keep the rejected promise for that awaited path.
+  const observe = (promise, label) => {
+    promise.catch(error => {
+      try { warn?.('ds-bot: browser %s failed: %s', label, error) } catch {}
+    })
+    return promise
+  }
+  async function waitFor(job, ms, message) {
+    const timer = new AbortController()
+    try {
+      return await Promise.race([
+        job,
+        delay(ms, undefined, { signal: AbortSignal.any([signal, timer.signal]) }).then(() => {
+          if (message) throw new Error(message)
+        }),
+      ])
+    } finally {
+      timer.abort()
+    }
+  }
   const pages = new Set()
   const unknownByOrigin = new Map()
   const unknownPageOrigins = new WeakMap()
@@ -131,6 +155,7 @@ export function createSession({ context, browser, page, botId, userDataDir, cook
   let pendingDeleteLocator = null
 
   const ready = () => {
+    signal.throwIfAborted()
     const externalHold = getHold?.()
     if (externalHold?.by === 'user') throw new Error('The user has taken over this browser. Wait for them to give it back.')
     if (hold && getHold && externalHold == null) hold = null
@@ -138,9 +163,9 @@ export function createSession({ context, browser, page, botId, userDataDir, cook
   }
 
   function activateAfterLoad(target) {
-    pendingPageReady = waitForPageReady(target).then(() => {
-      if (!target.isClosed()) current = target
-    })
+    pendingPageReady = observe(waitForPageReady(target).then(() => {
+      if (!signal.aborted && !target.isClosed()) current = target
+    }), 'popup load')
   }
 
   function trackPage(target, activate = false) {
@@ -167,7 +192,8 @@ export function createSession({ context, browser, page, botId, userDataDir, cook
   }
 
   for (const target of context.pages()) trackPage(target)
-  context.on('page', target => trackPage(target, true))
+  const onPage = target => { if (!signal.aborted) trackPage(target, true) }
+  context.on('page', onPage)
 
   function openPages() {
     return context.pages().filter(target => !target.isClosed())
@@ -196,7 +222,7 @@ export function createSession({ context, browser, page, botId, userDataDir, cook
     const target = activePage()
     if (!target) throw new Error('The browser has no open tabs.')
     await waitForPageReady(target)
-    await new Promise(resolve => setTimeout(resolve, 150))
+    await delay(150, undefined, { signal })
   }
 
   async function tabs() {
@@ -377,15 +403,11 @@ export function createSession({ context, browser, page, botId, userDataDir, cook
       }
       if (!parent && failure && batch.items.length === 0
         && String(failure?.message ?? failure).includes('Download is starting')) {
-        await new Promise(resolve => {
-          const finish = () => {
-            clearTimeout(timer)
-            batch.notify = undefined
-            resolve()
-          }
-          const timer = setTimeout(finish, Math.max(actionTimeout, ACTION_TIMEOUT))
-          batch.notify = finish
-        })
+        try {
+          await waitFor(new Promise(resolve => { batch.notify = resolve }), Math.max(actionTimeout, ACTION_TIMEOUT))
+        } finally {
+          batch.notify = undefined
+        }
       }
     } finally {
       if (!parent) activeDownloads = null
@@ -429,17 +451,7 @@ export function createSession({ context, browser, page, botId, userDataDir, cook
 
   async function waitForWriteRequests(requests) {
     if (requests.length === 0) return
-    let timer
-    try {
-      await Promise.race([
-        Promise.all(requests),
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('the browser request did not finish')), actionTimeout)
-        }),
-      ])
-    } finally {
-      clearTimeout(timer)
-    }
+    await waitFor(Promise.all(requests), actionTimeout, 'the browser request did not finish')
   }
 
   async function performWrite(action, target, perform) {
@@ -457,10 +469,10 @@ export function createSession({ context, browser, page, botId, userDataDir, cook
         if (requestOrigin !== action.origin || ['GET', 'HEAD'].includes(request.method().toUpperCase())) return
         let resolve
         let reject
-        requests.push(new Promise((res, rej) => {
+        requests.push(observe(new Promise((res, rej) => {
           resolve = res
           reject = rej
-        }))
+        }), 'write request'))
         pendingRequests.set(request, { resolve, reject })
       }
       const onRequestFinished = request => {
@@ -719,6 +731,7 @@ export function createSession({ context, browser, page, botId, userDataDir, cook
       return 'The browser is yours again.'
     },
     async runScript(source, origin) {
+      signal.throwIfAborted()
       const body = String(source ?? '')
       if (body.length > 8_000) throw new Error('Script is longer than 8000 characters.')
       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
@@ -749,12 +762,13 @@ export function createSession({ context, browser, page, botId, userDataDir, cook
         () => this.back(),
         done,
       )
-      const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Script ran longer than 20 seconds.')), 20_000))
-      const value = await Promise.race([run, timeout])
+      const value = await waitFor(run, 20_000, 'Script ran longer than 20 seconds.')
       const finalAnswer = answer ?? value
       return finalAnswer === undefined ? 'Script finished without done().' : String(finalAnswer)
     },
     async close() {
+      closed.abort()
+      context.off?.('page', onPage)
       if (browser) { await browser.close().catch(() => {}); return }
       const cookies = await context.cookies().catch(() => [])
       const kept = cookies.map(cookie => cookie.expires > 0 ? cookie : { ...cookie, expires: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60 })

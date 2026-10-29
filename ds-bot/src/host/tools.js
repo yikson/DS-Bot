@@ -1,5 +1,6 @@
 // Team tools: the roster, bot-to-bot messages, group chat settings and posts, and the
 // question and view cards. Group rounds and reading chats are in groups.js.
+import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { readAvatar } from './avatar.js'
@@ -37,6 +38,7 @@ const foreignRegistryName = (spec) => {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state } = rt
 
   const pluginChange = exec => exec.name === 'plugin_manager'
@@ -47,7 +49,7 @@ export function install(rt) {
   const verifiedChanges = new WeakSet()
   // Resolve dynamic entry ids and bundle aliases through public inventory APIs.
   // The final guard fails closed if this policy was skipped or inventory failed.
-  ctx.on('tools/pre-execute', async (exec, next) => {
+  safe.on('tools/pre-execute', async (exec, next) => {
     if (!pluginChange(exec)) return next()
     await rt.load()
     checkedSessions.add(exec)
@@ -460,7 +462,7 @@ export function install(rt) {
   // the Bot's working folder again. A Bot that changes to a folder outside its working folder
   // sets its working folder instead, with update_bot's checks, and goes on in a fresh part
   // there; a folder inside it only moves this Session there.
-  ctx.on('tools/execute', async (exec, next) => {
+  safe.on('tools/execute', async (exec, next) => {
     // Resolved as DSH gets it, untrimmed, so that both mean the same folder.
     const cd = exec.name === WORKING_DIRECTORY_TOOL && typeof exec.arguments?.cd === 'string' ? exec.arguments.cd : ''
     const session = exec.agent?.session
@@ -815,7 +817,7 @@ export function install(rt) {
     ? `Bots cannot use ${BLOCKING_QUESTION_TOOL}. Ask with ask_user in your own chat, or ask in your reply.`
     : undefined))
   // Creation waits for this listener, so the Agent's first step already lacks the tool.
-  ctx.on('agent/created', async ({ agent }) => {
+  safe.on('agent/created', async ({ agent }) => {
     try {
       await rt.load()
       hideBotUnusedTools(agent)
@@ -830,10 +832,10 @@ export function install(rt) {
   const attachGoals = (sub) => {
     const own = sub.goals
     goals = own
-    sub.effect(() => () => { if (goals === own) goals = null }, 'ds-bot: goal service')
+    safe.effect(() => () => { if (goals === own) goals = null }, 'ds-bot: goal service', sub)
   }
   if (typeof ctx.inject === 'function') ctx.inject(['goals'], attachGoals)
-  else if (ctx.get?.('goals') !== undefined) attachGoals({ goals: ctx.get('goals'), effect: (execute, label) => ctx.effect(execute, label) })
+  else if (ctx.get?.('goals') !== undefined) attachGoals({ goals: ctx.get('goals'), effect: (execute, label) => safe.effect(execute, label) })
   const blockGoal = async (sessionId) => {
     const service = goals
     if (service === null) return
@@ -846,12 +848,12 @@ export function install(rt) {
       rt.warn('ds-bot: blocking the goal in %s failed: %s', sessionId, error)
     }
   }
-  ctx.on('session/event', (session, event) => {
+  safe.on('session/event', (session, event) => {
     if (event.type !== 'goal/change' || event.data?.goal?.phase !== 'active') return
     const id = session?.id
     if (!rt.isBotSession(id) && rt.roomOf(id) === undefined) return
     // block() appends to the same log, so it waits until every listener has seen this change.
-    setTimeout(() => void blockGoal(id), 0)
+    safe.setTimeout(() => safe.run('tools background job', () => blockGoal(id)), 0)
   })
 
   ctx.tools.register(defineTool({

@@ -2,6 +2,7 @@
 // reaches a model that cannot read them, each image becomes text from a vision model.
 // Texts are kept per attachment, so later requests repeat the same words and the
 // prompt cache still hits.
+import { asyncScope } from './async.js'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BlockAssembler } from '@deepseek-ai/dsh-llm'
@@ -29,6 +30,7 @@ export function offloadTargets(session, beforeSeq) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, config, home } = rt
 
   // `textOnlyModels` names models whose provider claims image input but rejects it.
@@ -79,12 +81,12 @@ export function install(rt) {
   function saveOcr() {
     while (ocrCache.size > OCR_CACHE_MAX) ocrCache.delete(ocrCache.keys().next().value)
     const snapshot = JSON.stringify(Object.fromEntries(ocrCache))
-    ocrWriting = ocrWriting.then(async () => {
+    ocrWriting = safe.run('OCR cache write', () => ocrWriting.then(async () => {
       await mkdir(home, { recursive: true })
       const temp = `${ocrPath}.${process.pid}.tmp`
       await writeFile(temp, snapshot, 'utf8')
-      await replaceFile(temp, ocrPath)
-    }).catch(error => rt.warn('ds-bot: OCR cache write failed: %s', error))
+      await replaceFile(temp, ocrPath, undefined, safe.delay)
+    }))
   }
 
   // `sessionId` is the Session the reading is for; its usage counts there.
@@ -176,7 +178,7 @@ export function install(rt) {
       : message))
   }
 
-  ctx.on('llm/stream', (options, next) => {
+  safe.on('llm/stream', function readImages(options, next) {
     if (options.sessionId === undefined || rt.ownRequest(options) || !(options.messages ?? []).some(liveImages)) return next()
     return (async function* imagesAsTextOrPass() {
       await rt.load()
@@ -190,21 +192,19 @@ export function install(rt) {
     })()
   })
 
-  ctx.on('agent/status', ({ agent, status }) => {
+  safe.on('agent/status', ({ agent, status }) => {
     if (status !== 'idle' || !agent?.session || !rt.isBotSession(agent.id) || rt.readOnly() !== undefined) return
     const beforeSeq = agent.session.seq
-    setImmediate(() => {
-      void (async () => {
-        try {
-          if (!ctx.sessions.messageProjections.some(projection => projection.type === 'image/offload')) return
-          const targets = offloadTargets(agent.session, beforeSeq)
-          if (targets.length === 0) return
-          agent.session.append('image/offload', { targets })
-          await ctx.sessions.flush(agent.session)
-        } catch (error) {
-          rt.warn('ds-bot: old images for %s not offloaded: %s', agent.id, error)
-        }
-      })()
+    safe.setImmediate(async () => {
+      try {
+        if (!ctx.sessions.messageProjections.some(projection => projection.type === 'image/offload')) return
+        const targets = offloadTargets(agent.session, beforeSeq)
+        if (targets.length === 0) return
+        agent.session.append('image/offload', { targets })
+        await ctx.sessions.flush(agent.session)
+      } catch (error) {
+        rt.warn('ds-bot: old images for %s not offloaded: %s', agent.id, error)
+      }
     })
   })
 

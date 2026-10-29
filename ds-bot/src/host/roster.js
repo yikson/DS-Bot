@@ -1,5 +1,6 @@
 // Roster: creating, changing, and deleting Bots and group chats, the Main Bot role, and
 // the first Main Bot of a new team.
+import { asyncScope } from './async.js'
 import { mkdir } from 'node:fs/promises'
 import { MAX_AVATAR_IMAGE, ROOM_MAX_MEMBERS, ROOM_MODES, ROOM_NAME_MAX, ROOM_NOTICE_MAX } from './constants.js'
 import { currentColor, isColor, normalize, unquote } from './text.js'
@@ -40,6 +41,7 @@ function cleanBrowserGrants(input) {
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, defaults, state } = rt
 
   let bootstrapping = null
@@ -192,9 +194,9 @@ export function install(rt) {
       }
       await rt.save()
       // The greeting runs on the Bot's own model, once its provider is registered.
-      void rt.waitForModel(bot)
+      safe.run('roster background job', () => rt.waitForModel(bot)
         .then(() => rt.applyModel(bot).catch(error => rt.warn('ds-bot: model for %s not applied: %s', cleanName, error)))
-        .then(() => sendKickoff(bot, { text, from: createdBy }))
+        .then(() => sendKickoff(bot, { text, from: createdBy })))
       return bot
     } catch (error) {
       // The Bot's Session was already made: archive it instead of leaving an orphan.
@@ -203,7 +205,7 @@ export function install(rt) {
       rt.chatOwners.delete(id)
       // A save that another change queued meanwhile still carries this Bot; a later
       // one writes the team without it.
-      void rt.save().catch(() => {})
+      safe.run('roster background job', () => rt.save())
       await ctx.workspaceRegistry.archiveSession(id)
         .catch(archiveError => rt.warn('ds-bot: archiving the Session for %s failed: %s', cleanName, archiveError))
       throw error
@@ -211,8 +213,8 @@ export function install(rt) {
   }
 
   function sendKickoff(bot, { text, from }) {
-    void rt.deliver({ fromId: from ?? undefined, toId: bot.id, text, role: 'kickoff' })
-      .catch(error => rt.warn('ds-bot: kickoff failed: %s', error))
+    safe.run('roster background job', () => rt.deliver({ fromId: from ?? undefined, toId: bot.id, text, role: 'kickoff' })
+      .catch(error => rt.warn('ds-bot: kickoff failed: %s', error)))
   }
 
   // The user wrote first, so the held greeting would only interrupt.
@@ -220,7 +222,7 @@ export function install(rt) {
     const bot = rt.botOf(botId)
     if (bot?.kickoff === undefined) return
     delete bot.kickoff
-    void rt.save().catch(() => {})
+    safe.run('roster background job', () => rt.save())
   }
 
   async function duplicateBot(id) {
@@ -332,11 +334,11 @@ export function install(rt) {
     // the notice still goes out.
     const selfEditInChat = actorId === bot.id && fromSessionId === rt.chatOf(bot.id)
     if (notes.length > 0 && bot.kickoff === undefined && !selfEditInChat) {
-      void rt.deliver({ toId: bot.id, text: notes.join('\n'), role: 'update' })
-        .catch(error => rt.warn('ds-bot: profile update for %s not delivered: %s', bot.name, error?.message ?? error))
+      safe.run('roster background job', () => rt.deliver({ toId: bot.id, text: notes.join('\n'), role: 'update' })
+        .catch(error => rt.warn('ds-bot: profile update for %s not delivered: %s', bot.name, error?.message ?? error)))
     }
     if (modelChanged) await rt.applyModel(bot, { force: true })
-    if (moved) void rt.followFolder(bot.id)
+    if (moved) safe.run('roster background job', () => rt.followFolder(bot.id))
     if (bot.model && bot.kickoff !== undefined) {
       const held = bot.kickoff
       delete bot.kickoff
@@ -438,7 +440,7 @@ export function install(rt) {
     } catch (error) {
       // The group's Session was already made: archive it instead of leaving an orphan.
       delete state.rooms[id]
-      void rt.save().catch(() => {})
+      safe.run('roster background job', () => rt.save())
       await ctx.workspaceRegistry.archiveSession(id)
         .catch(archiveError => rt.warn('ds-bot: archiving the Session for %s failed: %s', title, archiveError))
       throw error
@@ -663,7 +665,7 @@ export function install(rt) {
 
   async function bootstrap() {
     await rt.load()
-    void rt.syncModels()
+    safe.run('roster background job', () => rt.syncModels())
     if (state.mainBotIds.some(id => rt.botOf(id))) return
     // Only the team's first Main Bot is stored as the DeepSeek whale; other Bots get a
     // look from their id, and a Bot made Main Bot later keeps its own.

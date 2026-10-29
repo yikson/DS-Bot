@@ -4,6 +4,8 @@
 // written into the Session, and no tool call is ever dispatched. A Bot's chats
 // live in one file (<home>/side/<botId>.json), not in state.json; only the host
 // that owns the team writes them.
+import { asyncScope } from './async.js'
+import { setImmediate } from 'node:timers/promises'
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -42,6 +44,7 @@ const pairsOf = (chat, entry, route) =>
 const answering = chat => (chat?.entries ?? []).some(entry => entry?.status === 'answering')
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state } = rt
   /** @type {Map<string, {botId: string, controller: AbortController, done?: Promise<void>}>} */
   const flights = new Map()
@@ -86,7 +89,7 @@ export function install(rt) {
       const temp = `${path}.${process.pid}.tmp`
       try {
         await writeFile(temp, JSON.stringify(chats.get(botId) ?? [], null, 2), 'utf8')
-        await replaceFile(temp, path)
+        await replaceFile(temp, path, undefined, safe.delay)
       } catch (error) {
         await unlink(temp).catch(() => {})
         throw error
@@ -199,7 +202,7 @@ export function install(rt) {
         await Promise.allSettled(waiting)
         continue
       }
-      await new Promise(resolve => { setTimeout(resolve, 0) })
+      await setImmediate()
     }
   }
 
@@ -313,7 +316,7 @@ export function install(rt) {
         if (disposing && !dropped.has(botId) && alive(botId, chat, entry)) return { chatId: chat.id, entryId: id }
         throw new Error('Unknown Bot')
       }
-      const done = complete(botId, chat, entry, snapshot, controller.signal).finally(() => untrack(id))
+      const done = safe.run('side chat completion', () => complete(botId, chat, entry, snapshot, controller.signal).finally(() => untrack(id)))
       const flight = flights.get(id)
       if (flight !== undefined) flight.done = done
       started = true

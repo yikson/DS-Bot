@@ -9,6 +9,7 @@
 // send it anywhere. The Secrets page can still share it. Signing in is `signIn` alone, so a browser login can
 // take its place later without touching the mount.
 
+import { asyncScope } from './async.js'
 export const GITHUB = 'github'
 export const GITHUB_SECRET = 'GITHUB_TOKEN'
 const MCP_CLIENT = '@deepseek-ai/dsh-mcp-client'
@@ -39,6 +40,7 @@ export async function signIn(token, { api = DEFAULTS.api, fetch: request = fetch
 }
 
 export function install(rt) {
+  const safe = asyncScope(rt)
   const { ctx, state } = rt
   const options = rt.config.github === false ? null : { ...DEFAULTS, ...rt.config.github }
   const insecure = options !== null && [options.url, options.api].some(address => !/^https:\/\//i.test(String(address)))
@@ -156,14 +158,14 @@ export function install(rt) {
 
   const connectorEndpoint = (endpoint, body) => endpoints[endpoint](body ?? {})
 
-  ctx.effect(() => {
+  safe.effect(() => {
     stopped = false
-    void rt.loadSecrets().then(() => sync())
+    safe.run('connectors background job', () => rt.loadSecrets().then(() => sync()))
     return () => {
       stopped = true
-      void unmount()
+      return unmount()
     }
   }, 'ds-bot: connectors')
 
-  Object.assign(rt, { connectorsView, connectorEndpoint, secretsChanged: () => { void sync() } })
+  Object.assign(rt, { connectorsView, connectorEndpoint, secretsChanged: () => { safe.run('connectors background job', () => sync()) } })
 }
