@@ -126,6 +126,7 @@ profile stopped for forward recovery.
 Set explicit operator paths in a separate terminal:
 
 ```powershell
+$ErrorActionPreference = 'Stop'
 $Dsh = '<Desktop install>/resources/runtime/cli/bin/dsh.cmd'
 $env:DSH_HOME = '<DSH_HOME>'
 $ProfileDir = Join-Path $env:DSH_HOME 'profiles/desktop'
@@ -133,6 +134,7 @@ $PackageDir = Join-Path $ProfileDir 'node_modules/ds-bot'
 $Checkout = '<checkout>'
 $Backup = '<private backup directory outside the profile and checkout>'
 & $Dsh --version
+if ($LASTEXITCODE -ne 0) { throw 'Runtime check failed; leave Desktop stopped.' }
 ```
 
 Keep backups private, outside Git and public attachments. Do not dump profile
@@ -167,28 +169,80 @@ the user's npm configuration.
 Before any package operation, inspect `node_modules/ds-bot`. If it is a
 symlink/junction, **park that directory entry itself** outside `node_modules`
 before asking the package manager to remove/reinstall it. Do not recursively
-delete through it. This reversible operation preserves its target:
+delete through it. Use PowerShell 7. Run the preparation below and the
+release commands in **one script**, with the same variables. Any error must
+terminate that script; do not catch an error and continue with package
+operations.
+
+Choose a fresh parking path directly inside the profile, on the same volume,
+outside `node_modules`. Do not move the junction to a backup on another
+volume. The plain package backup remains separate. For a linked package,
+set the approved current target and its `index.js` SHA-256 recorded during
+preflight, independently of the new release checkout:
 
 ```powershell
-# Requires the profile to be stopped and $Backup to exist.
-# Review the printed real target against the approved checkout first.
-node --input-type=module -e "import {realpathSync} from 'node:fs'; console.log(realpathSync(process.argv[1]))" "$PackageDir"
+$ExpectedTarget = '<approved current linked ds-bot directory>'
+$ExpectedMarkerHash = '<preflight SHA-256 of that directory/index.js>'
+$ParkedLink = Join-Path $ProfileDir 'ds-bot-link-<unique-id>'
+$PackageEntry = Get-Item -LiteralPath $PackageDir -Force -ErrorAction Stop
+$HadLink = $PackageEntry.LinkType -in @('Junction', 'SymbolicLink')
 
-# After verifying that exact target, rename only the junction entry.
-# Use a fresh destination that does not already exist.
-$ParkedLink = Join-Path $Backup 'previous-ds-bot-link'
-node --input-type=module -e "import {lstatSync,renameSync} from 'node:fs'; if (!lstatSync(process.argv[1]).isSymbolicLink()) throw Error('Expected a link'); renameSync(process.argv[1],process.argv[2])" "$PackageDir" "$ParkedLink"
+function Assert-PackageOperationReady {
+    $Entries = @(Get-ChildItem -LiteralPath (Split-Path $PackageDir -Parent) `
+        -Force -ErrorAction Stop |
+        Where-Object { $_.Name -eq (Split-Path $PackageDir -Leaf) })
+    if ($HadLink) {
+        # Enumeration also catches a dangling junction at the original path.
+        if ($Entries.Count -ne 0) { throw 'Original package entry still exists.' }
+        $Parked = Get-Item -LiteralPath $ParkedLink -Force -ErrorAction Stop
+        if ($Parked.LinkType -notin @('Junction', 'SymbolicLink')) {
+            throw 'Parked entry is not a link.'
+        }
+        $Target = $Parked.ResolveLinkTarget($true)
+        if ($null -eq $Target -or $Target.FullName -ne $ExpectedTarget) {
+            throw 'Parked link does not resolve to the approved checkout.'
+        }
+        $Hash = (Get-FileHash -LiteralPath (Join-Path $Target.FullName 'index.js') `
+            -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ($Hash -ne $ExpectedMarkerHash) { throw 'Checkout marker changed.' }
+    } elseif ($Entries | Where-Object {
+        $_.Attributes -band [IO.FileAttributes]::ReparsePoint
+    }) {
+        throw 'Unexpected package link; repeat preparation.'
+    }
+}
+
+if ($HadLink) {
+    $Target = $PackageEntry.ResolveLinkTarget($true)
+    if ($null -eq $Target -or $Target.FullName -ne $ExpectedTarget) {
+        throw 'Current link target is not approved.'
+    }
+    $Hash = (Get-FileHash -LiteralPath (Join-Path $Target.FullName 'index.js') `
+        -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($Hash -ne $ExpectedMarkerHash) { throw 'Preflight marker mismatch.' }
+    if (Get-ChildItem -LiteralPath $ProfileDir -Force -ErrorAction Stop |
+        Where-Object { $_.Name -eq (Split-Path $ParkedLink -Leaf) }) {
+        throw 'Parking destination already exists; choose a fresh name.'
+    }
+    Move-Item -LiteralPath $PackageDir -Destination $ParkedLink -ErrorAction Stop
+}
+Assert-PackageOperationReady
 ```
 
-Skip the rename for a normal copied package. Keep the parked link and plain
-package backup until acceptance. Do not run a recursive cleanup against the
-parked link.
+The rename is skipped for a normal copied package. A failed move, missing
+entry, wrong target or changed marker stops the script before any package
+operation. The readiness check runs again before **each** remove/add, so
+neither a stale approval nor a native command's exit code substitutes for
+checking the filesystem. Keep the parked link and plain package backup until
+acceptance. Do not run a recursive cleanup against the parked link.
 
 Then use the installation's package manager through DSH:
 
 ```powershell
+Assert-PackageOperationReady
 & $Dsh plugin --profile desktop remove ds-bot
 if ($LASTEXITCODE -ne 0) { throw 'Remove failed; leave Desktop stopped.' }
+Assert-PackageOperationReady
 & $Dsh plugin --profile desktop add "link:$Checkout/ds-bot"
 if ($LASTEXITCODE -ne 0) { throw 'Install failed; leave Desktop stopped.' }
 ```
@@ -245,12 +299,17 @@ If loading or health verification fails, keep producers paused. Fully quit
 Desktop again. Check the **current** data compatibility before choosing a
 rollback target; new v2 data can invalidate a previously acceptable target.
 
-Park a linked `node_modules/ds-bot` entry as described above, using a fresh
-backup name. Then:
+In the rollback script, rerun the **entire preparation block** above with
+the currently linked target, its preflight marker hash and a fresh same-volume
+parking name. Do not reuse the release's `$HadLink` or prior verification.
+A parking/verification failure terminates rollback before any package
+operation. In that same script, continue with:
 
 ```powershell
+Assert-PackageOperationReady
 & $Dsh plugin --profile desktop remove ds-bot
 if ($LASTEXITCODE -ne 0) { throw 'Remove failed; keep Desktop stopped.' }
+Assert-PackageOperationReady
 & $Dsh plugin --profile desktop add '<backup>/ds-bot-<known-good-version>.tgz'
 if ($LASTEXITCODE -ne 0) { throw 'Rollback install failed; keep Desktop stopped.' }
 ```
@@ -348,6 +407,39 @@ predates v2 implementation; the v2 rollback restriction is the release
 operator's required gate, not a claim that v2 compatibility was exercised.
 No release-check helper was added: existing diagnostics plus the stopped-state
 inventory cover this procedure without adding another release control path.
+
+## Review correction: failed junction moves (2026-10-30)
+
+The first public snippet used a native `node` command without checking its
+exit status. PowerShell could continue to package removal after a failed
+rename. The revised preparation uses native PowerShell
+`Move-Item -LiteralPath ... -ErrorAction Stop` and rechecks both paths and
+the approved checkout marker before each package operation. Both release
+and rollback run that preparation in the same script as their package
+commands; rollback repeats it with fresh current-target inputs.
+
+The corrected PowerShell blocks were extracted from this document and
+executed against the stopped, isolated profile with the installed rc.3
+bundled CLI. Only placeholder values and `desktop` -> `s3-release` were
+substituted. Results recorded at **08:25 UTC+08:00**:
+
+| Scenario | Result | Package commands reached | Elapsed |
+|---|---|---:|---:|
+| Release from copied package to linked checkout | Passed; expected link/version installed | 2 | 1.175 s |
+| Release with an injected junction move failure | Terminated at `Move-Item`; original link/target intact | 0 | 0.077 s |
+| Release from an already-linked checkout | Passed; original junction parked, target preserved | 2 | 1.114 s |
+| Rollback with an injected junction move failure | Terminated at `Move-Item`; original link/target intact | 0 | 0.067 s |
+| Rollback from link to known-good archive | Passed; ordinary 0.2.3 package restored | 2 | 1.142 s |
+
+Failure injection selected a nonexistent parking parent, producing a real
+`MoveDirectoryItemIOError` under the default `Continue` error preference.
+The explicit `-ErrorAction Stop` terminated the script before its remove/add
+commands. A controlled CLI launcher counted invocations and refused to
+execute package commands in failure cases. All candidate tracked-file hashes
+and the Bot state hash stayed unchanged after every scenario. The profile
+ended with the known-good ordinary package. These are stopped-profile
+package/control-flow tests, not a repeat of the earlier HMR timing tests.
+No live Desktop/profile or user npm configuration was touched.
 
 [desktop-cli]: https://github.com/deepseek-ai/deepseek-harness/blob/main/apps/desktop/README.md#bundled-command-runtime
 [hmr]: https://github.com/deepseek-ai/deepseek-harness/blob/main/packages/boot/hmr/README.md
