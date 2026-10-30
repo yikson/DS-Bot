@@ -1,6 +1,7 @@
 import { asyncScope } from './async.js'
 import { isDeepStrictEqual } from 'node:util'
 import { deliveryId as taskDeliveryId } from './delivery-id.js'
+import { validateWorkers, validateWorkerUpdate } from './worker-data.js'
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const text = value => typeof value === 'string' && value.trim().length > 0
@@ -95,6 +96,7 @@ export function validateTask(task, id) {
   require(record(task.lateReplies) && Array.isArray(task.lateReplies.ids)
     && task.lateReplies.ids.every(text) && new Set(task.lateReplies.ids).size === task.lateReplies.ids.length
     && task.lateReplies.count === task.lateReplies.ids.length, 'late reply count must match unique source ids')
+  validateWorkers(task)
   return task
 }
 
@@ -157,11 +159,12 @@ export function install(rt) {
       }
       validateTask(next, id)
       if (previous) {
+        validateWorkerUpdate(previous.workers, next.workers, previous.state !== 'open')
         if (previous.mode !== next.mode || previous.requester !== next.requester || previous.assignee !== next.assignee
           || JSON.stringify(previous.capabilityAtCreation) !== JSON.stringify(next.capabilityAtCreation)) throw new Error('Task creation identity is immutable')
         if (previous.state !== 'open') {
-          const { lateReplies: before, delivery: oldDelivery, sends: oldSends, ...closed } = previous
-          const { lateReplies: after, delivery, sends, ...changed } = next
+          const { lateReplies: before, delivery: oldDelivery, sends: oldSends, workers: _oldWorkers, ...closed } = previous
+          const { lateReplies: after, delivery, sends, workers: _workers, ...changed } = next
           const { ids: oldIds, count: _oldCount, results: oldResults = [], ...oldExtra } = before
           const { ids, count: _count, results = [], ...extra } = after
           const added = ids.length - oldIds.length
@@ -203,6 +206,7 @@ export function install(rt) {
       // Rolling back here could erase a task already captured by another queued save.
       await rt.save({ required: true })
       if (safe.stopped) throw new Error('Cannot finish a task commit after this host stopped')
+      if (next.state !== 'open') rt.scheduleWorkerSettlement?.(id)
       return structuredClone(next)
     })
     commits.set(id, job)

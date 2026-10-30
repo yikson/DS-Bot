@@ -50,6 +50,7 @@ export function install(rt) {
     await applyPermission({ ...bot, permission: wanted }, rt.chatOf(bot.id))
     for (const sessionId of rt.taskSessionsOf(bot.id)) await applyPermission({ ...bot, permission: wanted }, sessionId)
     bot.permission = wanted
+    await rt.reconcileWorkerPermissions?.(bot.id)
     for (const sessionId of [...rt.groupSessionsOf(bot.id), ...Object.values(bot.workBranches ?? {}).map(branch => branch.sessionId).filter(Boolean)]) {
       if (roomOfSession(sessionId)?.permission) continue
       await applyPermission(bot, sessionId)

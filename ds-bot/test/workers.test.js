@@ -1,0 +1,490 @@
+import assert from 'node:assert/strict'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { test } from 'node:test'
+import { Context } from '@deepseek-ai/cordis'
+import LlmRuntime, { LlmAdapter, createUserMessage } from '@deepseek-ai/dsh-llm'
+import SessionStore from '@deepseek-ai/dsh-session'
+import SessionProjections from '@deepseek-ai/dsh-session-projection'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import SandboxPolicy, { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
+import Approval, { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
+import { createRuntime, inject } from '../index.js'
+import { validateTask } from '../src/host/tasks.js'
+import { hasWorkers, validateWorkerUpdate, workerClaims } from '../src/host/worker-data.js'
+import { workerEvidence, workerResult } from '../src/host/workers.js'
+import { historyEntry } from '../src/host/parts.js'
+import { fakeContext } from './fake-ctx.js'
+
+const task = () => ({
+  id: 'task', mode: 'v2', title: 'Worker test', brief: 'Run isolated work.',
+  requester: 'a', assignee: 'b', state: 'open', phase: 'ready',
+  capabilityAtCreation: { requester: true, initialAssignee: true },
+  sessions: { a: 'ta', b: 'tb' },
+  participants: { a: { role: 'requester', kind: 'fresh' }, b: { role: 'assignee', kind: 'fresh' } },
+  openedAt: 1, updatedAt: 1, closedAt: null, conclusion: null, creationIntents: {}, pendingSends: {},
+  lateReplies: { count: 0, ids: [] },
+})
+const seed = () => ({ version: 1, bots: {
+  a: { id: 'a', name: 'PM', model: 'mock/model', role: 'PM', createdAt: 1, capabilities: [] },
+  b: { id: 'b', name: 'Dev', model: 'mock/model', role: 'Dev', createdAt: 1, capabilities: [] },
+}, rooms: {}, agents: {}, tasks: { task: task() }, mainBotIds: ['a'], workspaceId: 'unit-workspace' })
+const worker = () => ({
+  id: 'w', kind: 'native-worker', taskId: 'task', requestedBy: 'a', requesterSessionId: 'ta',
+  sessionId: 'ws', marker: 'worker:task:w', title: 'Check', mode: 'execute',
+  sandboxRoot: '/project', canonicalRoot: '/project', initialWorkdir: '/project', sandbox: 'workspace-write',
+  approval: 'never', initialModel: { provider: 'mock', model: 'model' }, followupCount: 0, currentRunId: 'w',
+  admissionsClosed: false, runs: { w: { id: 'w', ordinal: 0, state: 'pending', admissionKey: 'ta:call',
+    promptRequestId: 'w', promptDigest: 'hash', admission: { state: 'reserved' } } },
+  cleanup: { state: 'none' }, archivedAt: null,
+})
+const event = (seq, type, data) => ({ seq, type, data, time: seq })
+const inserted = (seq = 0, id = 'm') => event(seq, 'agent/inbox/spliced', {
+  target: 'next-turn', start: 0, inserted: [{ id, source: { kind: 'user', rpcId: 'w' }, content: [] }],
+})
+const claimed = (seq = 2, outcome) => event(seq, 'agent/inbox/spliced', {
+  target: 'next-turn', start: 0, removedCount: 1, inserted: [], ...(outcome ? { outcome } : {}),
+})
+
+test('optional workers preserve absent/empty history and structural validation ignores current roster/limits', () => {
+  assert.equal(hasWorkers({ tasks: { task: task() } }), false)
+  const value = task()
+  value.workers = {}
+  assert.equal(hasWorkers({ tasks: { task: value } }), false)
+  value.workers.w = worker()
+  assert.equal(hasWorkers({ tasks: { task: value } }), true)
+  assert.equal(validateTask(value, 'task'), value)
+  value.workers.w.requestedBy = 'gone'
+  assert.throws(() => validateTask(value, 'task'), /requester/)
+})
+
+test('malformed worker reservations retain a security claim; duplicate claims never become ordinary Sessions', () => {
+  const state = { tasks: { task: { workers: { w: { sessionId: 'reserved' } } },
+    other: { workers: { broken: { sessionId: 'reserved' } } } } }
+  assert.equal(workerClaims(state).get('reserved').length, 2)
+})
+
+test('worker tombstones, permissions, settled outcomes and terminal admission counts cannot be rewritten', () => {
+  const old = { w: worker() }
+  assert.throws(() => validateWorkerUpdate(old, {}), /tombstone/)
+  const changed = structuredClone(old)
+  changed.w.sandboxRoot = '/other'
+  assert.throws(() => validateWorkerUpdate(old, changed), /identity/)
+  old.w.sandbox = 'read-only'
+  changed.w = { ...old.w, sandbox: 'workspace-write' }
+  assert.throws(() => validateWorkerUpdate(old, changed), /permission/)
+  assert.throws(() => validateWorkerUpdate({}, old, true), /add workers/)
+  old.w.runs.w.state = 'completed'
+  changed.w = structuredClone(old.w)
+  changed.w.runs.w.state = 'running'
+  assert.throws(() => validateWorkerUpdate(old, changed), /immutable/)
+})
+
+for (const kind of ['completed', 'blocked', 'error', 'aborted', 'interrupted']) {
+  test(`raw claim binds ${kind} before any user/message, independent of later turns`, () => {
+    const events = [inserted(), event(1, 'turn/start', { turn: 7 }), claimed(),
+      event(3, 'turn/end', { turn: 7, reason: { kind } }),
+      event(4, 'turn/start', { turn: 8 }), event(5, 'turn/end', { turn: 8, reason: { kind: 'completed' } })]
+    const evidence = workerEvidence(events, worker().runs.w)
+    assert.equal(evidence.turn, 7)
+    assert.equal(evidence.endSeq, 3)
+    assert.deepEqual(evidence.finish, { kind })
+    assert.equal(evidence.text, '(no final text)')
+  })
+}
+
+test('canceled input is never mistaken for a claim or a successful later turn', () => {
+  const evidence = workerEvidence([inserted(), claimed(1, 'canceled'), event(2, 'turn/start', { turn: 1 }),
+    event(3, 'turn/end', { turn: 1, reason: { kind: 'completed' } })], worker().runs.w)
+  assert.equal(evidence.turn, undefined)
+  assert.equal(evidence.droppedSeq, 1)
+  assert.equal(evidence.finish, undefined)
+})
+
+test('result keeps final text, exact interrupted warning, outside-input notice, link and Unicode budget', () => {
+  const w = worker()
+  const events = [inserted(), event(1, 'turn/start', { turn: 1 }), claimed(),
+    event(3, 'assistant/message', { message: { content: [{ type: 'text', text: 'first' }] } }),
+    event(4, 'user/message', { source: { kind: 'user', rpcId: 'outside' }, content: [] }),
+    event(5, 'assistant/message', { message: { content: [{ type: 'text', text: 'last' }] } }),
+    event(6, 'turn/end', { turn: 1, reason: { kind: 'interrupted' } })]
+  const e = workerEvidence(events, w.runs.w)
+  assert.equal(e.text, 'last')
+  const text = workerResult(w, w.runs.w, e.finish, 'x😀'.repeat(5000), e.outsideInput)
+  assert.equal(Array.from(text).length, 4000)
+  assert.match(text, /may have partially run; not re-run/)
+  assert.match(text, /worker received outside input/)
+  assert.match(text, /session:ws/)
+  const source = { kind: 'worker-result', taskId: 'task', workerId: 'w', runId: 'w', resultId: 'w:result', requesterSessionId: 'ta' }
+  const entry = historyEntry(event(8, 'user/message', { source, content: [{ type: 'text', text }] }), false)
+  assert.equal(entry.who, 'worker')
+  assert.equal(entry.provenance.resultId, 'w:result')
+  assert.equal(entry.provenance.sessionId, 'ta')
+})
+
+test('flag-off with no workers registers identical tools, schemas and prompt sections', async t => {
+  const a = fakeContext()
+  const b = fakeContext()
+  const roots = await Promise.all([mkdtemp(join(tmpdir(), 'worker-off-')), mkdtemp(join(tmpdir(), 'worker-off-'))])
+  const ra = createRuntime(a, { home: roots[0], memory: false })
+  const rb = createRuntime(b, { home: roots[1], memory: false, nativeWorkers: false })
+  await Promise.all([ra.load(), rb.load()])
+  assert.deepEqual(a.calls, b.calls)
+  assert.deepEqual([...a.registeredTools.keys()], [...b.registeredTools.keys()])
+  assert.deepEqual([...a.sections.keys()], [...b.sections.keys()])
+  assert.equal(a.registeredTools.has('run_worker'), false)
+  assert.equal(ra.state.tasks && Object.keys(ra.state.tasks).length, 0)
+  t.after(async () => { await a.dispose(); await b.dispose(); for (const root of roots) await rm(root, { recursive: true, force: true }) })
+})
+
+class WorkerMock extends LlmAdapter {
+  requests = []
+  fault
+  async listModels(provider) { return [{ provider, id: 'model', name: 'model' }] }
+  async resolveModel(provider, model) {
+    return { provider, id: model, name: model, defaultMaxTokens: 500,
+      reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: 'low' } }
+  }
+  async *stream(options) {
+    this.requests.push(options)
+    if (this.fault === 'hang') {
+      await new Promise((resolve, reject) => {
+        if (options.signal.aborted) return reject(options.signal.reason)
+        options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+      })
+    }
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text: 'Native evidence.' }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Native evidence.' } }
+    yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 3 } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
+// Native factory, scoped tools, inbox/claim, loop, sandbox and approval are real DSH.
+// The controller/persistence facade below is a unit fixture, not Web/cold-controller acceptance.
+async function nativeHarness(t, config = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'worker-native-'))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = join(root, 'dsh')
+  const cwd = join(root, 'project')
+  const home = join(root, 'bot')
+  await mkdir(join(cwd, 'child'), { recursive: true })
+  await mkdir(home)
+  await writeFile(join(home, 'state.json'), JSON.stringify(seed()))
+  const ctx = new Context()
+  for (const [plugin, options] of [[LlmRuntime], [SessionStore], [SessionProjections], [SystemPrompt],
+    [ToolRuntime], [AgentRegistry], [AgentLoop, { agents: [] }], [SandboxPolicy], [Approval]]) await ctx.plugin(plugin, options)
+  const adapter = new WorkerMock()
+  ctx.llm.registerAdapter(['mock'], adapter)
+  const dirs = new Map()
+  const flushes = []
+  ctx.provide('workingDirectory', { get: session => dirs.get(session.id) ?? session.header.cwd,
+    set: async (agent, path) => { dirs.set(agent.id, path) } })
+  ctx.provide('agentPresets', { resolve: async () => ({ id: 'test-default' }), mount: async () => {}, serviceFor: () => undefined })
+  ctx.provide('workspaceRegistry', { get: () => ({ id: 'unit-workspace', path: cwd, title: 'Unit workspace' }),
+    archiveSession: async () => {}, archivedSessionIds: [] })
+  ctx.provide('sessionTitle', { rename: async () => {} })
+  const originalFlush = ctx.sessions.flush.bind(ctx.sessions)
+  ctx.sessions.flush = async session => { flushes.push(session.id); return originalFlush(session) }
+  let admissionWait
+  ctx.provide('sessionController', {
+    resolveAgent: async id => ({ agent: ctx.agents.get(id) }),
+    inspect: async id => {
+      const agent = ctx.agents.get(id)
+      if (!agent) throw new Error('fixture Session missing')
+      return { meta: agent.session.header, events: agent.session.snapshotEvents() }
+    },
+    page: async ({ address }) => ({ records: ctx.agents.get(address.sessionId).session.snapshotEvents().map(event => ({ event })), hasMore: false }),
+    prompt: async (request, signal) => {
+      signal.throwIfAborted()
+      await admissionWait?.()
+      ctx.agents.get(request.sessionId).followup(createUserMessage({
+        content: request.content, source: { kind: 'user', rpcId: request.requestId },
+      }))
+      return { accepted: true }
+    },
+  })
+  const plugin = await ctx.plugin(scope => {
+    scope.provide('connection', { fetch: { register: () => () => {} } })
+  })
+  let rt
+  const fiber = await ctx.plugin({ inject, apply(scope) {
+    rt = createRuntime(scope, { home, memory: false, nativeWorkers: true, taskSessions: ['PM', 'Dev'], ...config })
+  } })
+  await rt.load()
+  // Skip unrelated Bot capability restoration in this native worker unit harness.
+  rt.ensureCapabilities = async () => {}
+  for (const id of ['a', 'b', 'ta', 'tb']) {
+    const handle = await ctx.agents.create({ sessionId: id, meta: { cwd }, agentOptions: { provider: 'mock', model: 'model' } })
+    setSandboxMode(handle.agent.session, 'workspace-write')
+    setApprovalPolicy(handle.agent.session, 'ask')
+  }
+  const exec = { agent: ctx.agents.get('ta'), callId: 'call-1', signal: AbortSignal.timeout(10000) }
+  const wait = async predicate => {
+    const end = Date.now() + 5000
+    while (Date.now() < end) {
+      if (predicate()) return
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    throw new Error('worker condition timed out')
+  }
+  const get = () => Object.values(rt.taskOf('task').workers ?? {})[0]
+  t.after(async () => {
+    await fiber.dispose(); await plugin.dispose(); await ctx.fiber.dispose()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await rm(root, { recursive: true, force: true, maxRetries: 5 })
+  })
+  return { ctx, rt, adapter, exec, cwd, dirs, get, wait, flushes, fiber,
+    pauseAdmission: callback => { admissionWait = callback } }
+}
+
+test('native worker is asynchronous, uses the immutable root/current cd, forced never, initial agentOptions and durable exact-target result', async t => {
+  const h = await nativeHarness(t)
+  h.dirs.set('ta', join(h.cwd, 'child'))
+  const result = await h.rt.runWorker({ prompt: 'Report evidence.', effort: 'high' }, h.exec)
+  assert.match(result, /^started worker /)
+  await h.wait(() => h.get()?.runs[h.get().id].result)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${h.get().id}:result`]?.delivery.state === 'delivered')
+  const w = h.get()
+  const agent = h.ctx.agents.get(w.sessionId)
+  assert.equal(agent.session.header.cwd, h.cwd)
+  assert.equal(h.dirs.get(w.sessionId), join(h.cwd, 'child'))
+  assert.equal(h.ctx.approval.overrideOf(agent.session), 'never')
+  assert.equal(h.ctx.sandboxPolicy.resolve({ session: agent.session }).mode, 'workspace-write')
+  assert.equal(agent.session.requestHeader().config.provider, 'mock')
+  assert.equal(agent.session.requestHeader().config.model, 'model')
+  assert.equal(agent.session.requestHeader().config.reasoningEffort, 'high')
+  const run = w.runs[w.id]
+  assert.equal(run.state, 'completed')
+  assert.equal(typeof run.turn, 'number')
+  assert.equal(typeof run.claimSeq, 'number')
+  assert.equal(typeof run.requestHeaderSeq, 'number')
+  assert.equal(run.result.id, `${w.id}:result`)
+  assert.equal(h.rt.selfOf(w.sessionId), undefined)
+  assert.equal(h.rt.isBotSession(w.sessionId), false)
+  const messages = h.ctx.agents.get('ta').session.snapshotEvents().filter(e => e.type === 'agent/inbox/spliced')
+    .flatMap(e => e.data.inserted).filter(m => m.source?.kind === 'worker-result')
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].source.requesterSessionId, 'ta')
+  assert.equal(h.ctx.agents.get('tb').session.snapshotEvents().some(e => e.data?.source?.kind === 'worker-result'), false)
+  assert.equal((await h.rt.runWorker({ prompt: 'Report evidence.', effort: 'high' }, h.exec)), result)
+  assert.equal(Object.keys(h.rt.taskOf('task').workers).length, 1)
+})
+
+for (const failure of ['blocked', 'assembly']) {
+  test(`native ${failure} before user-message settles the exact claim`, async t => {
+    const h = await nativeHarness(t)
+    h.ctx.on('agent/created', ({ agent }) => {
+      if (!h.rt.workerClaim(agent.id)) return
+      if (failure === 'blocked') agent.ctx.on('agent/pre-step', async () => ({ kind: 'reject' }))
+      else agent.ctx.on('system-prompt/assemble', async () => { throw new Error('assembly fixture failure') })
+    })
+    await h.rt.runWorker({ prompt: 'Fail before message admission.' }, h.exec)
+    await h.wait(() => h.get()?.runs[h.get().id].result)
+    const w = h.get()
+    assert.equal(w.runs[w.id].state, 'failed')
+    assert.equal(w.runs[w.id].finish.kind, failure === 'blocked' ? 'blocked' : 'error')
+    assert.match(w.runs[w.id].result.text, /\(no final text\)/)
+    assert.equal(w.runs[w.id].turn, 1)
+  })
+}
+
+test('verify uses the direct read-only setter and cannot request workspace-write/full access or cross-root cwd', async t => {
+  const h = await nativeHarness(t)
+  await assert.rejects(h.rt.runWorker({ prompt: 'Verify.', mode: 'verify', permission: 'workspace-write' }, h.exec), /ceiling/)
+  await assert.rejects(h.rt.runWorker({ prompt: 'Verify.', permission: 'danger-full-access' }, h.exec), /permission/)
+  await assert.rejects(h.rt.runWorker({ prompt: 'Verify.', workdir: tmpdir() }, h.exec), /inside/)
+  assert.equal(Object.keys(h.rt.taskOf('task').workers ?? {}).length, 0)
+  await h.rt.runWorker({ prompt: 'Verify.', mode: 'verify' }, h.exec)
+  assert.equal(h.get().sandbox, 'read-only')
+  assert.equal(h.ctx.sandboxPolicy.resolve({ session: h.ctx.agents.get(h.get().sessionId).session }).mode, 'read-only')
+})
+
+test('all forbidden/unknown scoped names are denied even after replacement and HMR disposal leaves deny-all', async t => {
+  const h = await nativeHarness(t)
+  await h.rt.runWorker({ prompt: 'Report.' }, h.exec)
+  const agent = h.ctx.agents.get(h.get().sessionId)
+  let calls = 0
+  const names = ['message_bot', 'run_worker', 'worker_followup', 'cancel_worker', 'subagent', 'spawn_agent',
+    'create_goal', 'update_goal', 'get_goal', 'schedule', 'plugin_manager', 'mcp:write', 'unknown_alias']
+  for (const name of names) {
+    const definition = { name, parameters: {}, output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
+      execute: () => { calls++; return 'escaped' } }
+    const dispose = agent.ctx.tools.register(defineTool(definition))
+    const result = await h.ctx.tools.execute({ agent, name, arguments: {}, callId: randomId(), signal: AbortSignal.timeout(2000) })
+    assert.equal(result.isError, true, name)
+    dispose()
+    agent.ctx.tools.register(defineTool(definition))
+  }
+  assert.equal(calls, 0)
+  agent.ctx.tools.register(defineTool({ name: 'read', parameters: {},
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    execute: () => 'permitted' }))
+  const before = await h.ctx.tools.execute({ agent, name: 'read', arguments: {}, callId: randomId(), signal: AbortSignal.timeout(2000) })
+  assert.equal(before.isError, false)
+  await h.fiber.dispose()
+  const result = await h.ctx.tools.execute({ agent, name: 'read', arguments: {}, callId: randomId(), signal: AbortSignal.timeout(2000) })
+  assert.equal(result.isError, true)
+})
+
+function randomId() { return `call-${Math.random()}` }
+
+test('admission limits/capability and exact task endpoints are checked at call time without rewriting history', async t => {
+  const h = await nativeHarness(t, { maxWorkersPerTask: 0 })
+  await assert.rejects(h.rt.runWorker({ prompt: 'Run.' }, h.exec), /limit/)
+  assert.equal(h.rt.taskOf('task').workers, undefined)
+  h.rt.config.maxWorkersPerTask = 1
+  await h.rt.runWorker({ prompt: 'Run.' }, h.exec)
+  await assert.rejects(h.rt.runWorker({ prompt: 'Again.' }, { ...h.exec, callId: 'second' }), /limit/)
+  h.rt.config.taskSessions = []
+  await assert.rejects(h.rt.runWorker({ prompt: 'No capability.' }, { ...h.exec, callId: 'third' }), /eligible/)
+  h.rt.config.nativeWorkers = false
+  h.rt.indexSessions()
+  assert.equal(h.ctx.tools.schemas(h.exec.agent).some(tool => tool.name === 'run_worker'), false)
+  await assert.rejects(h.rt.runWorker({ prompt: 'Gate off.' }, h.exec), /disabled/)
+  assert.equal(Object.keys(h.rt.taskOf('task').workers).length, 1)
+  assert.equal(validateTask(h.rt.taskOf('task'), 'task').workers[h.get().id].id, h.get().id)
+  await assert.rejects(h.rt.runWorker({ prompt: 'Trunk.' }, { ...h.exec, agent: h.ctx.agents.get('a') }), /disabled/)
+})
+
+test('done refuses running workers; terminal-first close drains them without changing the conclusion or reviving the task', async t => {
+  const h = await nativeHarness(t)
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Wait for cancellation.' }, h.exec)
+  await h.wait(() => h.get()?.runs[h.get().id].state === 'running')
+  await assert.rejects(h.rt.closeTask('ta', { task: 'task', status: 'done', conclusion: 'Done.', evidence: 'Tests.' }), /dependencies/)
+  h.adapter.fault = undefined
+  await h.rt.closeTask('ta', { task: 'task', status: 'blocked', conclusion: 'Stop pending work.' })
+  assert.equal(h.rt.taskOf('task').state, 'blocked')
+  const conclusion = structuredClone(h.rt.taskOf('task').conclusion)
+  await h.wait(() => h.get()?.cleanup.state === 'settled')
+  assert.equal(h.get().admissionsClosed, true)
+  assert.deepEqual(h.rt.taskOf('task').conclusion, conclusion)
+  assert.equal(h.rt.taskOf('task').delivery.summaryId, 'task:closed')
+  await h.wait(() => h.rt.taskOf('task').lateReplies.count === 1)
+  assert.equal(Object.keys(h.rt.taskOf('task').workers).length, 1)
+  assert.equal(h.rt.taskOf('task').state, 'blocked')
+})
+
+test('a late prompt admission after terminal commit is fenced, drained and never becomes an unowned run', async t => {
+  const h = await nativeHarness(t)
+  let release
+  let waiting = false
+  h.pauseAdmission(() => new Promise(resolve => { waiting = true; release = resolve }))
+  const start = h.rt.runWorker({ prompt: 'Delayed admission.' }, h.exec)
+  start.catch(() => {})
+  await h.wait(() => waiting)
+  await h.rt.commitTask('task', task => {
+    task.state = 'failed'
+    task.closedAt = 2
+    task.conclusion = { status: 'failed', text: 'Closed during admission.' }
+    task.delivery = { summaryId: 'task:closed', state: 'pending', targets: [] }
+    return task
+  })
+  release()
+  await assert.rejects(start, /stopped/)
+  await h.wait(() => h.get()?.cleanup.state === 'settled')
+  assert.equal(h.get().admissionsClosed, true)
+  assert.equal(h.rt.taskOf('task').state, 'failed')
+  assert.equal(h.rt.taskOf('task').lateReplies.count, 1)
+})
+
+test('result receiver flush failure retries with raw-log dedupe and no second result copy', async t => {
+  const h = await nativeHarness(t)
+  const flush = h.ctx.sessions.flush.bind(h.ctx.sessions)
+  let refused = false
+  h.ctx.sessions.flush = async session => {
+    if (!refused && session.id === 'ta' && session.snapshotEvents().some(event => event.type === 'agent/inbox/spliced'
+      && event.data.inserted.some(message => message.source?.kind === 'worker-result'))) {
+      refused = true
+      throw new Error('temporary receiver flush failure')
+    }
+    return flush(session)
+  }
+  await h.rt.runWorker({ prompt: 'Result retry.' }, h.exec)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${h.get()?.id}:result`]?.delivery.state === 'delivered')
+  assert.equal(refused, true)
+  const admissions = h.ctx.agents.get('ta').session.snapshotEvents().filter(event => event.type === 'agent/inbox/spliced')
+    .flatMap(event => event.data.inserted).filter(message => message.source?.kind === 'worker-result')
+  assert.equal(admissions.length, 1)
+})
+
+test('worker ownership refuses DSH Agent adoption and task endpoint claims in both directions', async t => {
+  const h = await nativeHarness(t)
+  await h.rt.runWorker({ prompt: 'Owned worker.' }, h.exec)
+  h.rt.state.agents.g = { id: 'g', name: 'DSH Agent', sessions: [] }
+  await assert.rejects(h.rt.adoptAgentSession('g', h.get().sessionId), /cannot be adopted/)
+  await assert.rejects(h.rt.commitTask('task', task => {
+    task.sessions.extra = h.get().sessionId
+    task.participants.extra = { role: 'participant', kind: 'fresh' }
+    return task
+  }), /conflicting Session|worker-owned/)
+  assert.equal(h.rt.selfOf(h.get().sessionId), undefined)
+})
+
+test('native requester tightening cancels active work, persists the lower ceiling and reasserts never after worker UI changes', async t => {
+  const h = await nativeHarness(t)
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Wait for permission tightening.' }, h.exec)
+  await h.wait(() => h.get()?.runs[h.get().id].state === 'running')
+  const agent = h.ctx.agents.get(h.get().sessionId)
+  h.adapter.fault = undefined
+  setSandboxMode(h.exec.agent.session, 'read-only')
+  await h.wait(() => h.get()?.sandbox === 'read-only')
+  await h.wait(() => h.get()?.runs[h.get().id].result)
+  assert.equal(h.ctx.sandboxPolicy.resolve({ session: agent.session }).mode, 'read-only')
+  setSandboxMode(h.exec.agent.session, 'workspace-write')
+  setSandboxMode(agent.session, 'workspace-write')
+  setApprovalPolicy(agent.session, 'ask')
+  await h.rt.reconcileWorkerPermissions('a')
+  assert.equal(h.get().sandbox, 'read-only')
+  assert.equal(h.ctx.sandboxPolicy.resolve({ session: agent.session }).mode, 'read-only')
+  assert.equal(h.ctx.approval.overrideOf(agent.session), 'never')
+})
+
+test('headerless restart settles unknown without a model and native publication is permanently refused before queued work', async t => {
+  const h = await nativeHarness(t)
+  const w = worker()
+  Object.assign(w, { sandboxRoot: h.cwd, canonicalRoot: h.cwd, initialWorkdir: h.cwd, createdHost: 'earlier-host' })
+  await h.rt.commitTask('task', task => { task.workers = { w }; return task })
+  const inspect = h.ctx.sessionController.inspect
+  h.ctx.sessionController.inspect = async id => id === 'ws'
+    ? { meta: { id: 'ws', cwd: h.cwd }, events: [] } : inspect(id)
+  const before = h.adapter.requests.length
+  await h.rt.recoverWorkers()
+  assert.equal(h.get().runs.w.state, 'unknown')
+  assert.equal(h.get().admissionBlockReason, 'restart-before-first-header')
+  assert.equal(h.get().admissionsClosed, true)
+  assert.match(h.get().runs.w.result.text, /unknown outcome; not rerun/)
+  await assert.rejects(h.ctx.agents.create({ sessionId: 'ws', meta: { cwd: h.cwd },
+    agentOptions: { provider: 'mock', model: 'model' } }), /permanently closed/)
+  // The coordinator may read the delivered unknown result; no worker request was made.
+  assert.equal(h.adapter.requests.slice(before).some(request => request.messages.some(message =>
+    message.content?.some(block => block.type === 'text' && block.text === 'Run isolated work.'))), false)
+  assert.equal(h.ctx.agents.get('ws'), undefined)
+})
+
+for (const withUser of [false, true]) {
+  test(`restart interrupted closer remains unknown with original user/message=${withUser}`, async t => {
+    const h = await nativeHarness(t)
+    const w = worker()
+    Object.assign(w, { sandboxRoot: h.cwd, canonicalRoot: h.cwd, initialWorkdir: h.cwd, createdHost: 'earlier-host' })
+    await h.rt.commitTask('task', task => { task.workers = { w }; return task })
+    const events = [inserted(), event(1, 'turn/start', { turn: 1 }), claimed(),
+      ...(withUser ? [event(3, 'user/message', { source: { kind: 'user', rpcId: 'w' }, content: [] })] : []),
+      event(4, 'turn/end', { turn: 1, reason: { kind: 'interrupted', cause: 'restart-fixture' } })]
+    const inspect = h.ctx.sessionController.inspect
+    h.ctx.sessionController.inspect = async id => id === 'ws' ? { meta: { id, cwd: h.cwd }, events } : inspect(id)
+    await h.rt.recoverWorkers()
+    assert.equal(h.get().runs.w.state, 'unknown')
+    assert.deepEqual(h.get().runs.w.finish, { kind: 'interrupted', cause: 'restart-fixture' })
+    assert.match(h.get().runs.w.result.text, /may have partially run; not re-run/)
+    assert.equal(h.get().admissionBlockReason, 'restart-before-first-header')
+  })
+}

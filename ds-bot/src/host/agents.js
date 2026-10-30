@@ -94,6 +94,7 @@ export function install(rt) {
       ? workspaceId
       : await rt.ensureWorkspace()
     const { sessionId } = await ctx.sessionController.create({ workspaceId: target })
+    await rt.assertNonWorkerSession?.(sessionId)
     agent.sessions.push(sessionId)
     await rt.save()
     // agent/created fired before the session joined the index, so restrict again now.
@@ -107,6 +108,7 @@ export function install(rt) {
   async function adoptAgentSession(agentId, sessionId) {
     writeCheck()
     const agent = record(agentId)
+    await rt.assertNonWorkerSession?.(sessionId)
     if (agent.sessions.includes(sessionId)) return sessionId
     await rt.resolveAgent(sessionId)
     const owned = rt.selfOf(sessionId) !== undefined || rt.botOf(sessionId) !== undefined

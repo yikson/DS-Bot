@@ -137,6 +137,7 @@ export function install(rt) {
     const saved = async sessionId => {
       checkGeneration()
       if (!sessionId) throw new Error('Creation did not return a Session id')
+      await rt.assertNonWorkerSession?.(sessionId)
       await commit(id, task => {
         task.sessions[botId] = sessionId
         Object.assign(task.creationIntents[requestId], { sessionId, state: 'created' })

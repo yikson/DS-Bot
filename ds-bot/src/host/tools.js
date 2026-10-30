@@ -561,6 +561,10 @@ export function install(rt) {
     const session = exec.agent?.session
     if (cd === '' || session === undefined) return next()
     await rt.load()
+    if (rt.workerClaim?.(exec.agent.id)) {
+      await rt.checkWorkerDirectory(exec, cd)
+      return next()
+    }
     const task = rt.taskForSession?.(exec.agent.id)
     const bot = task === undefined ? callerBot(exec) : rt.botOf(Object.keys(task.sessions).find(id => task.sessions[id] === exec.agent.id))
     if (bot === undefined) return next()
@@ -934,6 +938,7 @@ export function install(rt) {
       }, 'ds-bot: task tool scope', agent.ctx)
     }
     syncTaskTool(agent)
+    rt.registerWorkerTool?.(agent)
   }
   safe.on('agent/created', async ({ agent }) => {
     try {

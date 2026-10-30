@@ -3,6 +3,7 @@
 // or group chat it belongs to.
 import { asyncScope } from './async.js'
 import { validateTask } from './tasks.js'
+import { workerClaims } from './worker-data.js'
 import { mkdirSync, statSync } from 'node:fs'
 import { copyFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -388,7 +389,9 @@ export function install(rt) {
   const validateTaskSessions = (task, claims = taskSessionClaims()) => {
     // Read persisted Agent claims directly: their live index rebuilds after task validation.
     const agentSessions = new Set(Object.values(state.agents).flatMap(agent => agent.sessions ?? []))
+    const workers = workerClaims(state)
     for (const [botId, sessionId] of Object.entries(task.sessions)) {
+      if (workers.has(sessionId)) throw new Error(`Task ${task.id}: endpoint is worker-owned`)
       const trunk = task.participants[botId].kind === 'trunk'
       if (agentSessions.has(sessionId) || (!trunk && (own(state.bots, sessionId) || own(state.rooms, sessionId)
         || chatOwners.has(sessionId) || groupOwners.has(sessionId) || pastOwners.has(sessionId) || branchOwners.has(sessionId)))) {
@@ -403,6 +406,14 @@ export function install(rt) {
       // Include every valid saved record, so conflicts fail closed in either load order.
       const others = trunk ? claims.get(sessionId)?.owned : claims.get(sessionId)?.all
       if (others && others.size > Number(others.has(task.id))) throw new Error(`Task ${task.id}: Session is already owned`)
+    }
+    for (const worker of Object.values(task.workers ?? {})) {
+      const id = worker.sessionId
+      if (own(state.bots, id) || own(state.rooms, id) || agentSessions.has(id)
+        || chatOwners.has(id) || groupOwners.has(id) || pastOwners.has(id) || branchOwners.has(id)
+        || claims.has(id) || workers.get(id)?.some(claim => claim.taskId !== task.id || claim.workerId !== worker.id)) {
+        throw new Error(`Task ${task.id}: worker Session is already owned`)
+      }
     }
   }
   const taskOf = id => taskById.get(id)
@@ -464,6 +475,7 @@ export function install(rt) {
     }
     // The agents module owns the DSH Agent session index; it installs after this.
     rt.indexAgents?.()
+    rt.indexWorkers?.()
     rt.syncTaskTools?.()
   }
   // The Bot a Session speaks for: its own chat, one of its group Sessions, or an
