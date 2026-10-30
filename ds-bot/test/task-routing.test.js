@@ -56,6 +56,50 @@ test('requester fork records actual boundary and explicit brief; assignee uses s
   assert.equal(f.saved().tasks[task.id].phase, 'ready')
 })
 
+test('an assignee with an approval-pending MCP can receive a task with a diagnostic warning', async t => {
+  const f = await setup(t)
+  f.rt.ensureCapabilities = f.ensureCapabilities
+  await f.rt.capabilitySave({ name: 'pending', kind: 'mcp', transport: 'stdio', command: 'node' }, { botId: 'a' })
+  await f.rt.capabilityEndpoint('bot-capability', { botId: 'b', name: 'pending', attached: true })
+  await f.rt.ensureCapabilities('b')
+  assert.equal(f.rt.capabilityStatusesView().b.pending.state, 'needs-approval')
+  await f.send()
+  const task = f.tasks()[0]
+  assert.equal(task.state, 'open')
+  assert.equal(task.phase, 'ready')
+  assert.equal(f.saved().tasks[task.id].phase, 'ready')
+  assert.equal(f.agentOf(task.sessions.b).calls.length, 1)
+  assert.equal(f.agentOf('b').calls.length, 0)
+  assert.equal(f.rt.state.capabilities.items.pending.approved, false)
+  const warnings = await f.rt.diagnostics.entries()
+  assert.ok(warnings.some(entry => entry.level === 'warn'
+    && entry.text === `task capabilities for ${task.sessions.b} unavailable: pending (needs-approval); continuing as in Bot chats`))
+})
+
+for (const failure of ['tools', 'permissions']) {
+  test(`task creation still refuses an assignee Session ${failure} setup failure`, async t => {
+    const f = await setup(t)
+    f.rt.ensureCapabilities = f.ensureCapabilities
+    const error = new Error(`Cannot apply task Session ${failure}`)
+    if (failure === 'tools') {
+      f.agentOf('fresh-1').ctx.tools.register = () => { throw error }
+    } else {
+      const get = f.ctx.get
+      f.ctx.get = name => name === 'permissionPresets'
+        ? { set(session) { if (session.id === 'fresh-1') throw error } } : get(name)
+    }
+    await assert.rejects(f.send(), err => err === error)
+    const task = f.tasks()[0]
+    assert.notEqual(task.phase, 'ready')
+    if (failure === 'permissions') {
+      assert.equal(task.state, 'failed')
+      assert.equal(task.conclusion.status, 'blocked')
+    }
+    assert.equal(f.agentOf('fresh-1').calls.length, 0)
+    assert.equal(f.agentOf('b').calls.length, 0)
+  })
+}
+
 for (const fallback of [false, true]) {
   test(`task workdir is applied to both saved, permissioned endpoints before delivery; fresh requester=${fallback}`, async t => {
     const f = await setup(t)

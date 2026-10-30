@@ -102,7 +102,7 @@ test('packs expand only to MCP and skill items', () => {
 })
 
 for (const outcome of ['ready', 'error', 'needs-approval', 'timeout']) {
-  test(`required Session capability setup fails closed unless ready: ${outcome}`, async t => {
+  test(`required Session capability setup keeps trunk availability behavior: ${outcome}`, async t => {
     const env = await setup()
     t.after(() => env.dispose())
     await env.rt.capabilitySave(mcp('echo'), { botId: 'chief' })
@@ -114,8 +114,29 @@ for (const outcome of ['ready', 'error', 'needs-approval', 'timeout']) {
     } })
     env.rt.resolveAgent = async () => agent
     env.rt.capabilityEnsureTimeoutMs = 5
-    if (outcome === 'ready') await env.rt.ensureCapabilities('chief', { required: true })
-    else await assert.rejects(env.rt.ensureCapabilities('chief', { required: true }), /capabilities are not ready/)
+    await env.rt.ensureCapabilities('chief', { required: true })
+    const state = outcome === 'timeout' ? 'connecting' : outcome
+    assert.equal(env.rt.capabilityStatusesView().chief.echo.state, state)
+    const warnings = (await env.rt.diagnostics.entries()).filter(entry => entry.text.startsWith('task capabilities for chief unavailable:'))
+    assert.equal(warnings.length, Number(outcome !== 'ready'))
+    if (warnings.length) assert.ok(warnings[0].text.includes(`echo (${state}); continuing as in Bot chats`))
+  })
+}
+
+for (const failure of ['resolve', 'inputs']) {
+  test(`required capability setup still refuses a Session setup failure: ${failure}`, async t => {
+    const env = await setup()
+    t.after(() => env.dispose())
+    await env.rt.capabilitySave(mcp('echo'), { botId: 'chief' })
+    env.rt.state.bots.chief.capabilities = ['echo']
+    const agent = testAgent('chief', env.mounts, env.skills)
+    env.rt.resolveAgent = async () => {
+      if (failure === 'resolve') throw new Error('Session unavailable')
+      return agent
+    }
+    env.rt.loadSecrets = async () => { throw new Error('capability inputs unavailable') }
+    await assert.rejects(env.rt.ensureCapabilities('chief', { required: true }),
+      failure === 'resolve' ? /Session unavailable/ : /Task capabilities are not ready: echo/)
   })
 }
 

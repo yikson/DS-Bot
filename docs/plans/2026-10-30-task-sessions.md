@@ -363,6 +363,14 @@ Every fresh participant Session is configured before any prompt or followup:
 The fresh Session has the Bot's identity, permissions and capabilities but
 not the other side's trunk history. Its task provenance is explicit.
 
+Capability availability follows the trunk's behavior: `needs-approval`,
+`connecting` (including a connection timeout) and `error` are recorded
+availability states, not failures to configure the task Session. Log a warning
+and continue with those capabilities unavailable; this never approves an MCP
+command or marks it ready. A missing capability state, an unresolved Session,
+stopped setup, or a failure to apply the Session's tool scope or permissions
+still fails creation before task delivery.
+
 An installed generation reattaches scoped task tools to existing live Agents,
 including before a resolved or resumed Agent's first step. Bot permission,
 model and reasoning-effort changes propagate to all that Bot's task-owned
