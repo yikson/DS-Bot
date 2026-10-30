@@ -1,238 +1,151 @@
 # Native workers
 
 - Date: 2026-10-31
-- Related: Issue #41
-- Base examined: `origin/main` at `3c34c2dd9e9951a7fba8f357b92e795b25a5fc06`
-- DSH examined: `deepseek-harness` `master` at `687f282e8625c6b8d11ff58211a90524be2e4317`
+- Related: Issue #41, PR #42; reviewed at `2365efda`
+- DS Bot base examined: `3c34c2dd9e9951a7fba8f357b92e795b25a5fc06`
+- DSH source examined: `687f282e8625c6b8d11ff58211a90524be2e4317`
+- Revised for review R1-R13 and the maintainer's decisions on 2026-10-31
 
-This note is in English. It defines the decided contract for native workers:
-native DSH Sessions used by task Sessions as bounded task executors. It is a
-design record, not evidence that the implementation exists or has passed
-acceptance.
+This English note defines the implementation contract, not completed runtime
+acceptance. The review decisions below supersede the earlier text of this note.
+The [task-session contract](2026-10-30-task-sessions.md), including flat tasks,
+in-place compaction, root closing authority and terminal commit, still applies.
 
-The product model follows the poteto/pstack split: coordinators coordinate and
-verify; workers execute. A coordinator is a Main Bot, a PM, or another Bot
-working from a task-owned Session. A worker is not a new Bot identity and does
-not become part of the long-lived team.
+## Purpose and scope
 
-## Terms
+The poteto/pstack split is the purpose: Main Bots and PMs coordinate and verify;
+native workers execute self-contained jobs. A worker is one fresh native DSH
+root Session owned by one task and one requesting participant Session. It has
+no Bot identity, Bot memory review, or Bot MCP capabilities. It never becomes a
+long-lived teammate or a central dispatcher.
 
-- **Coordinator**: the Bot Session that creates or controls a worker. It must
-  be a task-owned Session for an open task.
-- **Task Session**: a Session owned exclusively by one task and one Bot, as
-  defined by [Task sessions](2026-10-30-task-sessions.md).
-- **Worker**: one plain root DSH Session created by a coordinator for one task.
-  It has a native DSH transcript, DSH tools, its own model and permissions, and
-  no DS Bot identity.
-- **Run**: one prompt and its resulting turn in a worker Session. The first run
-  starts the worker; later runs are explicit follow-ups.
-- **Worker control tools**: `run_worker`, `worker_followup`, and
-  `cancel_worker`.
-- **Result**: the bounded, model-visible message delivered after a run ends to
-  the exact task Session that requested it.
+The coordinator provides the brief, checks evidence and decides follow-ups.
+Results return only to that exact task Session. Worker completion does not send
+a trunk summary; the task retains its single `${taskId}:closed` conclusion.
+DSH's normal tools, loop, model routing and native Session UI do the execution.
+There is no second agent runtime or subagent-provider ownership model.
 
-## Purpose and boundary
+Workers cannot dispatch through DSH tools. This is an execution policy over
+DSH tool calls, not process isolation: an allowed shell can still start another
+process or agent CLI. That limit is explicit under Known limits.
 
-Native workers solve context and role pollution between coordination and
-execution:
+## Source checks and supported DSH APIs
 
-- A coordinator keeps the task goal, calls workers, reads their evidence, and
-  closes the task.
-- A worker receives one self-contained job, executes it in a separate DSH
-  Session, and returns a bounded result.
-- A worker does not inherit the coordinator's context, Bot memory, Bot
-  capabilities, or long-term identity. The coordinator must write a complete
-  prompt.
-- A worker cannot call team tools or DSH native delegation tools, create
-  tasks, message Bots, spawn helpers, or control other workers.
-- A worker's result returns only to the requesting task Session. It never wakes
-  a Bot trunk directly.
-- A worker is short-lived. Its Session may be followed up a bounded number of
-  times, then it is cancelled or archived when the task ends.
+These are source findings at the DSH commit above. They must also pass on the
+fixed target runtime in W1; source inspection is not runtime acceptance.
 
-This is not a central dispatcher, a new team of Bots, or a substitute for task
-participants. Coordinators remain responsible for the task and its conclusion.
+| Concern | Public API and inspected source | Contract |
+|---|---|---|
+| Creation and model | `ctx.agents.create({ sessionId, agentOptions, meta, setup })`; `packages/core/agent/README.md`, `src/index.ts` | The documented root factory accepts initial provider, model and reasoning effort without a profile-default write. Omit `parentAgent`; do not spawn a DSH subagent |
+| Default preset | `ctx.agentPresets.resolve()` and `mount(agentCtx, id)`; `packages/preset/agent-preset-registry/src/index.ts` | Resolve and mount the deployment's default preset in unpublished setup, recording its id in Session metadata. No custom worker preset is required |
+| Session-local route | Exported `installModelSelection` from `@deepseek-ai/dsh-agent`; `packages/core/agent/src/model-selection.ts` | Couples a live Agent's selection to assembly/request routing without saving the profile default; reinstall from the worker record on cold resume |
+| Controller alternatives | `SessionCreateRequest`, `SessionCommandController.selectModel`; `packages/api/session-controller/src/types.ts`, `commands.ts` | Controller create has no model/effort parameter. Controller selectModel writes the profile default in the background; workers use the supported root-factory path instead |
+| Sandbox | `setSandboxMode(session, mode)` from `@deepseek-ai/dsh-sandbox-policy`; `sandboxPolicy.resolve({ session })` | Apply/read actual mode values. `workspaceRoot` uses immutable `session.header.cwd`; live cd is a separate value |
+| Approval | `setApprovalPolicy(session, 'never')` from `@deepseek-ai/dsh-user-approval` | `never` automatically rejects every operation requiring approval before answerers are consulted |
+| Execution policy | `ctx.tools.guard`, with the `tools/pre-execute`/final-guard pattern already used by S1b in `tools.js` | A monotonic execution deny covers scoped registrations and native/PTC sub-calls. `tools.restrict` only affects presentation |
+| Admission | `sessionController.prompt(request, signal)` | Signal is mandatory. `{ accepted: true }` is inbox admission, not completion or flush. The controller may await inside admission after its entry signal check |
+| Correlation | `agent/inbox/inserted`, `agent/inbox/claimed { message, turn }`; `packages/core/agent-loop/src/inbox.ts` | Persist/replay `agent/inbox/spliced`; bind the identified message to its claimed turn before any `user/message` exists |
+| Lifecycle | Awaited serial `agent/created`; `Agent.cancel`, `whenIdle` | Creation holds queued work until listeners finish. Cancellation acknowledgement is only a request; quiescence needs evidence |
 
-## DSH constraints
+The root-factory creation path uses `agentOptions` for the chosen initial route
+and the public scoped model-selection helper for subsequent requests. It must
+not call `sessionController.selectModel`, write `agentDefaultModel`, or depend
+on DSH internal files. Its native Session remains addressable by the ordinary
+controller prompt/cancel/history APIs.
 
-The design uses documented DSH APIs:
+Existing S2 task Sessions still use `models.js` `selectSessionModel`: that
+wrapper selects through the controller and attempts to restore the default.
+It does not guarantee isolation from concurrent UI selection or failed
+restoration. That S2 limitation remains outside this worker slice; workers do
+not repeat the mechanism. If a target DSH lacks the supported Session-scoped
+creation/routing API, worker admission is refused with a clear compatibility
+error rather than silently falling back to the profile-writing wrapper.
 
-1. `ctx.sessionController.create({ cwd | workspaceId })` creates an ordinary
-   root Session and returns its `sessionId`. It does not accept a title or a
-   tool restriction.
-2. `ctx.sessionController.prompt(request, signal)` requires an
-   `AbortSignal`. It returns `{ accepted: true }` after the prompt enters the
-   Agent inbox. Acceptance is not evidence that a turn started or completed.
-3. The durable `user/message` source records the prompt `requestId` as
-   `rpcId`. DSH uses that identity to deduplicate a repeated prompt.
-4. `turn/end.reason.kind` is a merge-extensible union. The current kinds are
-   `completed`, `aborted`, `blocked`, `error`, `max-tokens`, `interrupted`, and
-   `forked`. Only `completed` means success.
-5. `ctx.sessionController.cancel({ sessionId })` asks the live Agent to cancel
-   its current turn and retains the inbox. A worker cancel must therefore also
-   clear and flush that worker's pending inbox.
-6. `agent.ctx.tools.restrict({ deny })` filters inherited tools by name. It
-   throws for a name the profile does not serve. The restriction must be
-   installed after the Agent exists but before its first step.
-7. `agent.ctx.tools.guard()` is an execution-time, monotonic denial. It is
-   defense in depth for a tool that is still visible or is registered later.
-8. `ctx.workingDirectory.set(agent, path)` changes one Session. It does not
-   change permissions or another Session.
-9. A same-host Session cannot outlive the host. A host restart must reconcile
-   persisted worker state instead of assuming an in-memory completion listener
-   survived.
+## Eligibility and tools
 
-The `packages/subagent` implementation is useful comparison, not the runtime
-for this feature. It provides provider-managed child activations, parent-child
-lineage, completion notices, and optional continuation. Native workers need a
-plain root Session owned by exactly one DS Bot task Session, exact routing back
-to that Session, DS Bot's task commit lane, and DS Bot's team-tool deny set.
-Using the subagent provider directly would add a second ownership and routing
-model. Workers deny the composed DSH delegation tools; the subagent package is
-comparison material only.
-
-One helper, `applyNativeSessionToolGate(agent, { allow, deny })`, is shared by
-workers and the existing DSH Agent sessions. The helper:
-
-- requires the scoped tool runtime and a usable tool snapshot;
-- applies the requested `restrict` mask;
-- installs the matching execution-time guard;
-- verifies that every denied name is absent;
-- throws instead of scheduling a retry when any step is unavailable or
-  ambiguous.
-
-W1 uses this helper for worker setup and for DSH Agent create/adopt/resolve.
-The DSH Agent's asynchronous retry that can allow a first prompt before
-restriction lands is removed. A failed gate fails the create/adopt operation:
-a newly created Session is archived, and an adopted Session is left unowned.
-It never becomes a prompt-capable DSH Agent Session. Workers call the same
-helper after model, permission, and workdir setup and before their first
-prompt, and fail closed on any error.
-
-## Tool surface
-
-Every refusal described below is a tool error. It creates no worker, consumes
-no follow-up budget, and does not fall back to another Session.
-
-### Eligibility
-
-The worker control tools are scoped tools, not global tools. They are offered
-only when all of the following are true:
+A new run requires all of:
 
 - `nativeWorkers === true`;
-- the Agent is a task-owned Session in `taskBySession`;
-- the task is `open` and `ready`;
-- the Bot was task-enabled in the task's creation capability snapshot;
-- the task participant still exists; and
-- no worker Session is indexed as a Bot Session.
+- an open, ready task and its exact recorded task-owned participant endpoint;
+- a Bot that exists and is task-enabled **at call time**, using
+  `taskCapabilities()`;
+- writable state, current generation, resolved worker policy and permission
+  services.
 
-The tools are never offered in a Bot trunk, a group Session, a legacy work
-branch, a worker Session, or an archived task Session. Removing a Bot from the
-team or removing the current capability does not convert an existing task
-Session into a worker dispatcher.
+This includes later-added task-owned PM participants. No task-creation
+capability snapshot is consulted. Trunks, shared-trunk task handlers, groups,
+legacy branches and workers cannot start runs. Removal of capability or the
+rollout flag refuses new runs, including follow-ups; it does not invalidate
+history or prevent cancellation, result settlement or task closure.
+
+Worker tools are scoped to eligible task-owned Sessions. Execution repeats
+eligibility after every admission await and immediately before its side effect;
+schema presence is not authority. Invalid input, wrong ownership, exceeded
+limits, unsupported APIs and refused paths are tool errors, with no trunk
+fallback.
 
 ### `run_worker`
 
-```js
+```text
 run_worker({
   prompt,
   title?,
-  mode: "execute" | "verify",
+  mode?: "execute" | "verify",
   workdir?,
   model?,
   effort?,
-  permission?
+  permission?: "read-only" | "workspace-write"
 })
 ```
 
-- `prompt` is required, non-empty, and self-contained.
-- `title` is optional. The default is the first non-empty line of `prompt`,
-  trimmed to 80 Unicode code points.
-- `mode` defaults to `execute`.
-- `workdir` defaults to the requesting task Session's current working
-  directory.
-- `model` accepts a full `provider/model` reference or an unambiguous model id
-  or name.
-- `effort` is resolved against the selected model. An unavailable effort is a
-  tool error, not an ignored value.
-- `permission` names an available DSH permission preset. `auto` is not a
-  selectable worker permission.
+`prompt` is nonempty and self-contained. Title defaults to its first nonempty
+line, capped at 80 Unicode code points. Mode defaults to execute. `permission`
+selects a sandbox mode, not a named permission preset or an approval policy.
+Full-access workers are out of scope and an explicit full-access request is
+refused.
 
-Success returns immediately:
-
-```text
-started worker <worker-id>
-```
-
-The call does not wait for the run. The result is later delivered as a bounded
-synthetic message to the exact requesting task Session.
-
-There is deliberately no blocking option. A blocking tool call would keep the
-coordinator's turn open, prevent it from starting independent workers together,
-and make cancellation depend on the tool call returning. A coordinator that
-has nothing else to do ends its turn; the result starts the next turn in the
-same task Session. This follows DSH's own managed delegation behavior while
-keeping DS Bot's task routing explicit.
+After bounded admission/setup, return `started worker <id>` without waiting for
+the run's result. There is no blocking option: the coordinator can launch its
+two independent jobs and keep working, then end its turn when only waiting
+remains. Results enqueue a later turn in the same task Session.
 
 ### `worker_followup`
 
-```js
+```text
 worker_followup({ worker, message })
 ```
 
-- The worker must belong to the caller's current task and must have been
-  requested by this exact task Session.
-- A follow-up is accepted only when the worker is settled: `idle` or
-  `interrupted`. An accepted follow-up for `interrupted` warns that the prior
-  outcome is unknown; the coordinator should inspect the linked Session first.
-- A running, starting, or cancelling worker refuses follow-up with a tool
-  error. Use `cancel_worker` and start a new worker if the work must change
-  while it is running.
-- A successful call returns immediately with an accepted run identity. The
-  result is delivered like the initial result.
-- The default limit is two accepted follow-ups per worker. The initial run
-  does not count. A refused follow-up does not consume budget.
+Only the exact requesting task Session may continue its worker. The prior run
+must be completed, failed or unknown, its result must be settled, and the
+native Session must actually be idle with no pending worker admission/input.
+A cancelled run cannot be continued. Unknown means the prior outcome may have
+external effects; the coordinator should inspect its Session before proceeding.
 
-The continuation is PM-driven. It is not a hidden goal loop and does not add a
-new worker identity. The same worker Session, model, and workdir are reused
-unless the task is no longer open. Permission is checked again and clamped to
-the Bot's current ceiling before prompt; it is never raised by a follow-up.
+An accepted follow-up starts a new run in the same worker Session, preserving
+its current cd and chosen route. It never resets cd to initial workdir and
+never raises permission. No goal/automatic continuation is used.
 
 ### `cancel_worker`
 
-```js
+```text
 cancel_worker({ worker })
 ```
 
-- The worker must belong to the caller's current task and exact requesting
-  Session.
-- The operation cancels the worker's current DSH turn if one is live, clears
-  every pending worker-owned inbox message, flushes the Session, and records
-  the worker as `cancelled`.
-- An idle worker is marked cancelled without a model call.
-- Cancellation of an already cancelled worker is a successful no-op. A
-  cancelled worker cannot be followed up.
-- A cancellation failure leaves the worker nonterminal with a diagnostic. The
-  coordinator may retry; it must not assume the worker stopped.
+Only the requesting task Session controls this worker. Cancellation remains
+available for its existing workers after gate/capability removal. It requests
+stop and waits a bounded time for evidence; a timeout reports `cancelling`,
+not cancelled. Repeating cancellation is idempotent. Idle completed/failed/
+unknown history is retained; cancellation closes that worker to future runs.
+The exact protocol is under Run states, cancellation and recovery.
 
-### `list_tasks`
+### Listing
 
-There is no separate `list_workers` tool. `list_tasks` already exists in task
-Sessions and is the coordinator's task inventory, so it is extended to show
-each open task's workers:
+Extend `list_tasks` rather than add `list_workers`. Within a task Session,
+show worker id, mode, current run state, elapsed time, result status and native
+Session link. Listing grants no control over another participant's workers.
+There are no worker rows on Bot trunks or extra Bot/sidebar identities.
 
-```text
-worker <id> | <mode> | <state> | <elapsed> | <session link> | <title>
-```
-
-The worker id, state, and Session link are included because the coordinator
-needs them for `worker_followup`, `cancel_worker`, and inspection. Folding the
-list into `list_tasks` avoids a fourth tool whose scope would be nearly
-identical.
-
-## Defaults and limits
-
-Configuration is additive:
+## Configuration and model selection
 
 ```js
 {
@@ -244,191 +157,383 @@ Configuration is additive:
 }
 ```
 
-- `nativeWorkers` is the rollout gate and defaults to `false`. Worker tools do
-  not exist while it is false.
-- `maxWorkersPerTask` is the total number of worker records a task may create
-  over its whole life. The default 2 matches the pilot. It limits both
-  concurrent and sequential replacements. A refused creation is a tool error;
-  there is no worker queue.
-- `maxWorkerFollowups` is the number of accepted follow-up runs per worker.
-  The default is 2.
-- Both limits must be non-negative safe integers. A value of 0 disables that
-  operation.
-- Worker data remains readable and recoverable when the rollout gate is later
-  turned off. The gate stops new workers; it does not orphan existing records.
+`workerModel` and `verifierModel` accept `provider/model` or
+`{ provider, model, effort? }`. Explicit model arguments also accept a unique
+model id/name through `resolveModel`. Configured unavailable routes and
+unsupported explicit/configured efforts are errors; they do not silently pick
+another model.
 
-`workerModel` and `verifierModel` use the same accepted notation as
-`summaryModel`: a full `provider/model` string or an object
-`{ provider, model, effort? }`. A configured but unavailable model fails the
-worker setup; it does not silently fall back.
+Execute route: explicit argument, then `workerModel`, then the requesting task
+Session's effective Bot route. Verify route: explicit argument, then
+`verifierModel`, then `workerModel`, then that same Bot fallback.
 
-### Model selection
+Effort precedence is explicit argument, selected configuration entry's effort,
+Bot effort when supported by the selected route, then the model default.
+Changing route does not carry an incompatible Bot effort to another model.
+An explicit model override does not inherit a different config entry's effort.
 
-For `mode: "execute"`, select in this order:
+There is no model-family inference. Without `verifierModel`, verification
+independence relies on a fresh Session only; it does not promise a different
+model or family. Read-only is the verification permission boundary.
 
-1. explicit `model`;
-2. configured `workerModel`;
-3. the requesting Bot's current effective route from its task Session.
+Serialize plugin-owned worker route setup with other plugin model selection,
+without any profile-default write. Persist the selected route/effort before
+prompt and reapply the same route on cold resume and follow-up. Later config
+changes affect new workers, not an existing worker's route.
 
-For `mode: "verify"`, select in this order:
+Limits are nonnegative safe integers and constrain only **new admissions**:
+at most two lifetime worker records per task by default, and at most two
+accepted follow-ups per worker. A value of zero refuses new admissions of
+that kind. There is no wait queue. Reducing a limit never invalidates existing
+records; validation checks stored counts structurally, not against config.
 
-1. explicit `model`;
-2. configured `verifierModel`;
-3. configured `workerModel`;
-4. the requesting Bot's current effective route.
+## Permissions and directories
 
-For `effort`:
+### No approval path
 
-1. explicit `effort` wins;
-2. when the selected route is the Bot's current route, use the Bot's current
-   effort;
-3. otherwise use the selected model's default effort.
+Every worker has approval policy `never`. Apply it with the documented direct
+setter during setup, read back its durable policy, and reassert it on resume
+and before dispatch. Anything needing approval is automatically denied.
+Neither a PM nor a human approval answerer is consulted.
 
-The selected route is applied with `selectSessionModel()` and verified before
-the first prompt. A worker never writes its route back to the Bot or another
-task Session.
+There is no worker approval UI, answerer, approval-wait state, or initial
+`approveFolder()` call. In particular, setup must not ask for approval from
+an idle worker outside an open turn. Closed approval pages, disconnection and
+absent answerers cannot strand a worker because it has no approval path (R5).
 
-There is no model-family inference. `verifierModel` is explicit configuration.
-When it is set, verify mode uses it; when it is unset, verify mode uses
-`workerModel`. Verification independence therefore relies on the fresh worker
-Session and its read-only default, not on an inferred relationship between
-model names.
+### Effective sandbox and tightening
 
-### Permissions
+Read `sandboxPolicy.resolve({ session: requesterAgent.session })`, not
+`bot.permission`, a preset name, or the profile default alone. Read the actual
+Session approval facts too for diagnostics; ask/never on the requester never
+changes the worker's forced `never`.
 
-- `mode: "execute"` defaults to the requesting Bot's effective permission in
-  the task Session.
-- `mode: "verify"` defaults to `read-only`.
-- An explicit `permission` must resolve from the permission preset catalog.
-- A worker permission may never exceed the Bot's own permission.
-- A requested preset is allowed only when its sandbox is no broader than the
-  Bot's sandbox and its approval policy is no weaker. Sandbox order is
-  `read-only < workspace-write < danger-full-access`. `ask` is stricter than
-  `never`.
-- `danger-full-access` requires both that the Bot's own effective sandbox is
-  `danger-full-access` and that the caller explicitly supplied that
-  permission. It is never selected by a default.
+Execute defaults to the minimum of the requesting task Session's effective
+sandbox and workspace-write. Verify always uses read-only. A lower explicit
+mode is allowed; a higher mode than the effective requester is refused.
+An explicit workspace-write request in verify mode is refused.
 
-The permission is applied and read back before prompt. `workingDirectory.set`
-does not change permissions.
+Use `setSandboxMode(workerSession, selectedMode)` and verify with
+`sandboxPolicy.resolve`. No named `read-only` preset is required. If the target
+cannot apply and verify read-only through the documented API, refuse verify
+mode with `Worker verification requires supported read-only sandbox control`.
+Missing sandbox/approval enforcement services refuse worker setup generally.
 
-### Working directory
+Workers are added to a permission-propagation index keyed by requesting Bot
+and task Session, alongside the task-Session propagation path. This index is
+not a Bot-identity index. `setPermission` tightening applies immediately to
+running workers as well as idle ones. Actual requester `sandbox/mode` changes
+and changed effective policy are also reconciled; every worker dispatch
+rechecks the current ceiling and denies while reconciliation is incomplete.
+Raising the Bot or requester ceiling never raises an existing worker.
 
-- The default is the requesting task Session's current directory at the time
-  `run_worker` executes, not the task's original initial folder.
-- An explicit `workdir` must be an absolute existing directory. It receives
-  the same realpath, guarded-folder, and approval checks as a task Session.
-- The worker Session is created with that directory as `cwd`; if it is a
-  resumed Session, `workingDirectory.set()` is used and verified.
-- A native `working_directory` change inside the worker affects only that
-  worker Session. It never updates the Bot, the task, the coordinator, or
-  another worker.
-- A missing or unapproved directory fails the run before the first prompt.
+Persist the reduced worker mode, apply it to the live native Session and
+verify/flush. Cancel in-flight worker work on tightening rather than claim
+that a changed mode retroactively confines an already-started process.
+Subsequent confined operations read the new mode. UI changes in a worker cannot
+grant `ask` or wider mode: reconcile back to its recorded ceiling or deny.
+Cold resume reads policy before releasing queued tool work. An unreadable
+requester during reconciliation denies further worker execution; deleted Bots
+are handled by terminal settlement, not by rejecting historical data.
 
-## Start gate
+### Immutable root and live cd
 
-Setup is ordered and fail closed:
+The worker's `header.cwd` is the requesting task Session's `header.cwd`.
+Persist that root, canonicalize its realpath, and verify it matches the
+requester's resolved sandbox root. Never use the requester's current cd as
+the worker's header cwd. Missing/ambiguous roots fail closed.
 
-1. Acquire the task's serialized commit lane and re-read the task, requester
-   Session, participant, and current generation.
-2. Enforce the worker and follow-up limits and the task's open state.
-3. Resolve title, mode, model, effort, permission, and workdir without changing
-   anything.
-4. Persist a `starting` worker record with a stable worker id, creation marker,
-   requesting Bot id, requesting Session id, and resolved setup.
-5. Call `sessionController.create()` with the resolved `cwd` and no Bot
-   `agentPreset`. Persist the returned Session id immediately.
-6. Rename the Session to its worker marker/title, index it in
-   `workerBySession`, and attach the worker to the task record before any
-   prompt.
-7. Apply and verify the permission preset, model/effort, working directory,
-   and absence of Bot identity, Bot capabilities, and memory review.
-8. Apply the shared native-session tool gate:
-   - build the worker deny set from `TEAM_TOOLS`, every worker control tool,
-     and every DSH native delegation tool, including shipped names and
-     configured aliases;
-   - call the shared `applyNativeSessionToolGate()` helper;
-   - let the helper apply `restrict` to the registered names, install the
-     execution guard for the complete deny set, and verify visibility;
-   - extend the existing `plugin_manager` self-change guard so a worker is a
-     managed Session.
-9. If any tool runtime is missing, any name cannot be denied, any gate is
-   ambiguous, or the generation stops, do not prompt. Mark the worker
-   `failed`, persist the diagnostic, and deliver one bounded failure result.
-10. Install the turn listener before prompt, then call:
+The starting live cd defaults to the requester's current cd, but both it and
+an explicit absolute `workdir` must resolve to an existing directory inside
+that canonical root. Resolve symlinks/junctions and apply the existing
+guarded-data-root checks. Cross-root paths are refused with no approval or
+new-root creation, even when inside the team's general folder.
 
-```js
-ctx.sessionController.prompt({
-  sessionId,
-  requestId: workerId,
-  mode: "queue",
-  content: [{ type: "text", text: prompt }]
-}, signal)
-```
+Create with `meta.cwd = requester.header.cwd`; then set the worker's live cd
+with `workingDirectory.set(agent, checkedWorkdir)`. Compare the actual root
+and cd again before prompt. Parent or child cd changes never change the root.
+A retargeted root symlink/junction must not silently replace the saved
+canonical root: revalidate it and deny execution if it no longer matches.
 
-The initial prompt uses `requestId === workerId`. A follow-up uses
-`${workerId}:followup:<n>`, because DSH deduplicates an already-used
-`requestId`. Acceptance is persisted only as "accepted"; it is not completion.
+Add a worker branch **before** the Bot-only early return in `tools.js`'s
+native `working_directory` execution path. Every worker cd, including PTC,
+resolves realpath against its current cd, stays inside its saved root, and
+checks guarded roots before calling the native tool. The execution policy
+rejects unverified aliases of directory-changing tools. It never calls
+`updateBot`, updates the task workdir, or moves another Session. Follow-up
+retains and revalidates the worker's current cd.
 
-No `setTimeout` retry may allow the prompt to run before this gate succeeds.
-No Bot capabilities are mounted into the worker. No memory review is scheduled
-for it.
+## Execution policy and Session ownership
 
-## Turn correlation and results
+### Authoritative tool deny
 
-The worker listener observes only the worker Session id. It:
+Use the same documented execution hooks as the S1b `plugin_manager` deny:
+an awaited `tools/pre-execute` policy plus a monotonic `ctx.tools.guard`
+at the final execution boundary. Key it by durable worker Session ownership,
+not Bot identity, mode, schema visibility or what a preset happened to install.
+Ownership or policy lookup failure is deny, never "ordinary Session".
 
-1. waits for the `user/message` whose `source.kind === "user"` and
-   `source.rpcId` equals the run's prompt id;
-2. captures the turn number from the enclosing `turn/start`;
-3. ignores every `turn/end` with a different turn number;
-4. on the matching `turn/end`, records the reason and the last text-bearing
-   `assistant/message` in that turn.
-
-The listener is installed before prompt and is generation-scoped. The
-Session log is authoritative: a lost event, HMR, or restart is reconciled by
-inspecting the log for the same `rpcId` and turn boundary.
-
-Only `turn/end.reason.kind === "completed"` counts as success. The result
-reports the exact reason:
-
-| Reason | Recorded outcome |
+| Tool family | Worker execution policy |
 |---|---|
-| `completed` | `completed`; success |
-| `max-tokens` | `max-tokens`; incomplete, not success |
-| `blocked` | `blocked`; not success |
-| `aborted` | `aborted`; not success |
-| `error` | `error`; not success |
-| `interrupted` | `interrupted`; unknown, not success |
-| `forked` | `invalid`; a worker must not be a fork |
-| unknown future kind | `unknown`; not success |
+| All DS Bot team tools, including future team registrations | Deny |
+| `run_worker`, `worker_followup`, `cancel_worker` and aliases | Deny |
+| All DSH native subagent/delegation/control tools and configured aliases | Deny |
+| `create_goal`, `update_goal`, `get_goal` and aliases | Deny |
+| Schedule creation/change, including update, resume and removal | Deny; v1 allows no schedule tool as a convenience exception |
+| `plugin_manager` | Deny the entire tool, all actions/targets, including self-change |
+| MCP tools, whether attached to a Bot or exposed by the default profile | Deny in v1; no worker MCP capability is granted |
+| Unknown, replaced or unclassified tool definitions | Deny until proven to be an ordinary permitted execution capability |
+| Vetted native file/shell/search/cd capabilities | Allow only subject to worker sandbox, root, approval and lifecycle policy |
 
-The rendered result is one stable message:
+A name list alone cannot prove that an arbitrary alias is safe. Resolve the
+current public `tools.get(name, agent)` definition at execution, admit only
+verified ordinary capability definitions, and deny unknown wrappers, aliases
+or same-name replacements. Classify trusted native registrations by definition
+identity/callable identity through their supported registration surface;
+never infer authority from description text. A new dynamic tool defaults to
+denied, including a harmless-looking alias of a forbidden tool. No custom
+preset or general plugin-classification service is required.
+
+The policy runs on scoped tools and every PTC sub-call; outer `run_code` is
+only a transport and cannot authorize a denied inner call. Cosmetic
+`tools.restrict` hides registered inherited deny names when possible. A scoped
+tool remaining visible does not weaken execution denial; restrictions do not
+establish the hard guarantee.
+
+Allowed shell tools can still run CLIs, spawn processes or call services inside
+their available sandbox. That is outside this tool-policy guarantee. Trusted
+preset/plugin code itself is also outside the threat model; a hostile native
+plugin can execute host code without a model tool call.
+
+### Creation, cold resume and HMR gate
+
+Persist the worker marker and exact reserved native Session id under the task
+**before** creating or resuming it. Load ownership before installing any
+prompt-capable worker; unknown/malformed claims stay denied. Creation uses the
+default Agent preset, including any extra scoped tools. The execution deny
+makes forbidden preset tools unusable; there is no worker-specific preset.
+
+The minimal worker setup helper installs policy, permissions, model route and
+listeners during unpublished `ctx.agents.create` setup. Its final publication
+check revalidates the task, reservation and generation. Awaited serial
+`agent/created` also restores policy for controller/native UI cold resumes;
+it does not start detached work or wait for `whenIdle()` inside creation.
+Failure is propagated as a controlled creation/resume error with diagnostics,
+not an unhandled listener rejection or app-boot fatal.
+
+For HMR-surviving live Agents, reattach before permitting another tool or
+coordinator prompt. Keep a deny-all transition barrier in the Agent scope
+until the new generation has loaded and verified ownership/policy; a stopped
+generation cannot leave an unguarded execution window. Worker-scoped effects
+are owned by the Agent scope, with explicit takeover/cleanup on generation
+replacement. An unready or failed replacement remains denied. Each prompt has
+a final policy/permission/generation check too; `agent/pre-step` alone is too
+late to establish the first schema surface.
+
+### Bidirectional ownership
+
+Check both sides of every claim using persisted records, independent of
+index-load order:
+
+- Worker creation/reconciliation refuses any Bot, group, part, DSH Agent,
+  legacy branch, task endpoint or other worker Session.
+- DSH Agent adoption and Bot/task endpoint assignment refuse a worker-marked
+  Session, including cold/archived Sessions and unresolved creation intents.
+- A native fork of a worker is not adopted as a Bot/Agent/task endpoint by
+  DS Bot; DS Bot ownership paths inspect fork provenance before adoption.
+- Removing/archiving history never removes the worker ownership tombstone.
+
+Only these worker-conflict checks are added to existing ownership paths.
+The existing DSH Agent gate retrofit is tracked separately in Issue #43 and
+must ship in its own PR with its own acceptance. W1 does not replace its retry
+or alter DSH Agent create/adopt/resolve behavior when no worker is involved.
+
+## Admission and correlation
+
+Use short `withTask`/`commitTask` transactions to reserve/check/commit. Do not
+hold the task lane while creating an Agent, awaiting prompt admission,
+`whenIdle()`, cancellation or a completion callback that needs the same lane.
+Every continuation reacquires it and rechecks durable state.
+
+1. Validate eligibility/inputs and resolve route, sandbox, root and live cd.
+2. In the task lane, reserve worker id, Session id and initial run id. Lazily
+   create `task.workers` here. Persist the `pending` run, stable admission key
+   from the caller Session/tool invocation, `promptRequestId`, prompt digest
+   and exact requester Session. Tool replay returns this reservation; it
+   never creates a second worker.
+3. Create the ordinary root through the supported factory with its default
+   preset, `agentOptions`, root metadata and unpublished setup. Save/flush
+   the configured Session before driving it. Unknown creation is reconciled
+   against the reserved id; absence of a response never authorizes recreation.
+4. Install inbox/turn listeners before prompt. Persist the prompt admission
+   intent before calling `sessionController.prompt(request, signal)`. Initial
+   `requestId === workerId`; follow-up n uses `<workerId>:followup:<n>`.
+   Call `signal.throwIfAborted()` immediately before entry.
+5. Observe the inserted inbox message with matching `source.rpcId`, save its
+   actual DSH `message.id` and insertion splice seq, and flush the worker log.
+   Record the accepted receipt only after durable evidence.
+6. After prompt returns, recheck generation, cancellation and task state.
+   A stale/cancelled admission is cancelled/drained, not reported as a run
+   start or allowed to enqueue unowned future work.
+
+The prompt's signal owns admission only and DSH has an internal await after
+its entry check. Cancellation therefore cannot rely on aborting that signal.
+Track the in-flight admission Promise until it settles; after a stale await,
+the only permitted old-generation action is compensating cancellation of
+that exact admitted operation. It cannot save, deliver or retry. The successor
+reconciles the durable intent. A pending late enqueue remains fenced against
+tool dispatch, is cancelled and accounted for; it is not treated as absent.
+
+### Bind the exact turn
+
+Use `agent/inbox/claimed { message, turn }` for the matching message id to
+bind the run to its turn. This notification comes after a durable deletion
+splice and before assemble/pre-step/model preparation. Persist the claim and
+turn reference. Do not wait for `user/message`.
+
+On recovery replay the raw inbox splice history, reconstruct the pending lists
+and match that message's insertion and non-cancelled deletion to the enclosing
+turn boundary. A deletion with `outcome: 'canceled'` proves dropped input,
+not claimed execution. Match any later `user/message.rpcId` as corroboration.
+Never guess the latest turn when the exact message/turn relationship is
+unreadable or ambiguous.
+
+Pre-step rejection (`blocked`), assembly/prepare failure (`error`), cancellation
+before user-message admission and a completed turn with no final assistant
+text all settle that exact run. Only `turn/end.reason.kind === "completed"`
+is success. All other/unknown reasons remain non-success and preserve the
+reason; no final text is rendered as `(no final text)`.
+
+### Outside input
+
+The native worker Session belongs to the user, so direct UI/API input and
+steering are allowed. Record other user-message/inbox identities since the
+run's admission, excluding known runtime context, and include the literal
+notice `worker received outside input` in its result. Input claimed into the
+same turn can affect the result; input in a separate turn is not mistaken for
+this run. Outside activity may keep the Session busy and block follow-up or
+cancellation confirmation; it never grants another coordinator worker rights.
+
+## Run states, cancellation and recovery
+
+Each run follows:
 
 ```text
-[Worker <state>: <title>]
-<final assistant text, or "(no final text)">
-Session: session:<worker-session-id>
-Finish: <turn/end reason>
+pending -> running -> completed | failed | unknown
+pending | running -> cancelling -> cancelled
 ```
 
-The complete rendered message, including the header and Session link, is at
-most 4000 Unicode code points. The final assistant text is truncated only as
-needed to preserve that bound. The full transcript remains in the worker
-Session.
+`pending` covers creation/setup and unsettled prompt admission. `running`
+requires accepted/claimed evidence. A synchronous failure may settle pending
+as failed without a model call. DSH completed maps to completed; blocked,
+error, max-tokens or an unrelated abort maps to failed with its exact reason.
+Host restart without terminal evidence maps to unknown. `cancelled` requires
+stop/drain evidence, not an API acknowledgement. State on the worker row/UI
+is derived from its current run; idle is a native Agent fact, not a second
+persisted run state. No automatic retry creates another run.
 
-The result id is:
+### Cancel and drain
 
-- `<workerId>:result` for the initial run;
-- `<workerId>:followup:<n>:result` for follow-up run `n`.
+1. Under the task lane, persist cancellation intent, fence further admissions
+   and set the unsettled run to cancelling. Release the lane.
+2. Request cancellation of the exact live Agent/turn. Drain in-flight prompt
+   admission within the same bounded attempt; if it returns after cancellation,
+   request stop again and account for its matching inserted message.
+3. Give the whole attempt, including admission drain, at most 20 seconds for
+   `whenIdle()`/Agent-idle and matched
+   terminal evidence, or proof the matching message never ran and no admission
+   remains. Terminal turn evidence does not make a still-running Session idle.
+4. Only after quiescence, clear pending worker input with the documented inbox
+   API and flush the worker log. User input accepted during the cancellation
+   window is included in that cleared queue, like the native stop action.
+   Recheck idle/queue/admission identities before committing cancellation.
+5. Reacquire the lane and record cancelled plus its one result/settlement.
+   An open task gets the bounded cancelled result; a terminal task gets a late
+   record. Once acknowledged, that cancelled run has no outstanding dependency.
 
-Delivery is idempotent by this id. Before enqueueing, the task lane checks the
-exact requester Session's inbox and consumed log for the id, persists a pending
-delivery, enqueues with `followup()`, then flushes before marking it delivered.
-A result never falls back to a trunk, another participant Session, or another
-task.
+A timeout, including an admission Promise that has not settled, returns a
+bounded cancelling status and keeps its durable intent.
+Do not archive or admit follow-up. Retry cleanup with bounded backoff, and
+report an unresolved stop if its budget expires. Cancellation observation and
+native waiting never depend on a listener acquiring the lane held by cancel.
+Cancellation of an idle worker closes its future admissions while preserving
+already-delivered successful/failed runs.
+If a matched terminal event predates the cancellation request, preserve its
+completed/failed finish rather than rewriting history as cancelled.
 
-The synthetic result source is:
+### Plugin-only HMR
+
+First inspect whether the exact native Agent is still live and whether the
+matching turn has ended. If it is running, reinstall the policy barrier and
+listeners and continue observing that same run. Do not mark it unknown,
+clear its accepted input or issue another prompt. If it already ended while
+the plugin was absent, flush/read the log and settle once. A cancelling live
+Agent stays cancelling until quiescence.
+
+If DSH tears an Agent down during recomposition, use its actual abort/terminal
+evidence. Missing evidence during plugin replacement remains reconciliation
+pending; it is not proof of host restart. Preserve HMR generation checks after
+every await, with only the exact admission-compensation exception above.
+
+### Host restart
+
+Reconcile terminal tasks before considering result delivery. For an open task,
+flush/inspect the exact raw worker history without waking model work. Matched
+terminal evidence settles the run. Only a confirmed host restart with no such
+evidence marks the old run unknown and reports `unknown outcome; not rerun`.
+Cancel/drop leftover accepted worker input before any explicit new run can
+start. If history is unreadable, retain reconciliation pending with a
+diagnostic rather than inventing success or absence.
+
+Follow-up is admitted only from completed/failed/unknown after result
+settlement, no admission in flight, no pending worker input and an actually
+idle Session. It reuses the route and current cd, not the old prompt.
+
+## Result durability and delivery
+
+Reuse task delivery and conclusion machinery instead of adding a worker
+outbox implementation:
+
+1. Flush the worker's accepted inbox and matching terminal log **before**
+   committing the settled run/result. A session/event callback is post-append,
+   not disk acknowledgement. Inspect the raw log and save the exact message,
+   turn and end seqs used as evidence. Synthetic setup/unknown/cancel outcomes
+   identify their evidence honestly.
+2. Under `withTask`/`commitTask`, store the bounded result and its stable id:
+   `<workerId>:result` or `<workerId>:followup:<n>:result`. The existing
+   `task.sends[resultId]` delivery ledger owns target/state/ack; the run only
+   references it. The target is the saved requesting task Session.
+3. Extend `task-lifecycle.js` `prepare`, `destination`, `matches`, `observe`,
+   `alreadyPresent`, `atBoundary`, `acknowledge`, `runDelivery` and
+   `attemptConclusion` to handle worker-result sources/ids with the same
+   guards and retry budget. Do not weaken Bot delivery or conclusion checks.
+4. Persist target+id before enqueue. Inspect that exact Session's raw inbox
+   splice and consumed-message log plus its live inbox. An existing copy must
+   be flushed before acknowledgement too; compaction does not erase the
+   raw-log dedupe evidence.
+5. After all awaits, synchronously recheck task open/ready, exact endpoint,
+   run/result identity, active attempt and generation, with no await before
+   the next-turn enqueue. Enqueue with `followup`, flush receiver, then ack.
+   An HMR-skipped delivery is still pending.
+
+Use the existing 20-second attempt deadline, at most five attempts per retry
+budget and exponential backoff. Temporary inspect/save/flush failure retries
+while the plugin runs, rather than requiring restart. After exhaustion retain
+pending+diagnostic, release all lanes, and allow a bounded explicit recovery
+attempt or the next generation to reconcile. Expired attempts cannot later
+save or enqueue. This budget also bounds source flush/reconciliation attempts;
+it never resends a prompt.
+
+A task-owned endpoint has one Session id and compacts in place. An unexpected
+deleted/archived/moved endpoint remains pending with diagnostics; it never
+migrates to a trunk or another participant. A terminal task always takes the
+late-result path before delivery, including on restart.
+
+The complete rendered result is at most 4000 Unicode code points, reserving
+room for title, exact finish reason, Session link and outside-input notice.
+Use the final text-bearing assistant message of the matched turn, truncated
+within the remaining budget. Reasoning/tool output is not a fabricated final
+answer; the full transcript stays in its native Session.
 
 ```js
 {
@@ -441,510 +546,327 @@ The synthetic result source is:
 }
 ```
 
-It is model-visible in the task Session, classified as a private task trigger,
-and rendered as a worker result rather than a user decision or Bot exchange.
-The turn/inbox/recovery code must recognize it as next-turn work and must not
-route it through `answerSender()`.
+This is private task input and next-turn work. `turns.js` does not pass it to
+`answerSender`; `delivery-id.js` and raw-log matching preserve its result id.
+There is one logical delivered result, not an exactly-once claim for file
+writes or other external effects.
 
-## Cancellation, failure, and restart
+## Task close and late results
 
-### Explicit cancel
+Keep the approved close protocol. In the task lane re-read state/dependencies
+and atomically persist terminal state, `closedAt`, conclusion and the existing
+`${taskId}:closed` summary id **first**. New worker/run/send admissions are
+refused after that commit. Only the root requester's task Session can close.
 
-For a live worker:
+`done` is refused while any run is pending, running or cancelling, any prompt
+admission/cleanup is unresolved, or any worker result is unsettled. Preserve
+the rule excluding the closing caller turn from its own dependency check.
 
-1. Persist `cancelling`.
-2. Call `sessionController.cancel({ sessionId })`.
-3. Clear all pending worker inbox entries and flush.
-4. Persist `cancelled`, the cancellation time, and a diagnostic if the Agent
-   was no longer live.
-5. Never deliver a cancelled run as successful. A later `turn/end` may be kept
-   as history but cannot revive the worker.
+After any terminal commit, a narrow, idempotent settlement path fences
+admissions, cancels/drains workers and records cleanup. Use it from
+`close_task`, `removeTaskBot`, task setup failure, recovery failure and startup
+reconciliation. Host-generated failure conclusions keep their existing
+authority; they do not invent another Bot closer.
 
-### Task close
+Release the task lane while awaiting native stop; return only to record
+settlement evidence. Cancellation timeout cannot undo terminal state or
+replace the conclusion. A crash halfway through cancellation resumes cleanup
+from the durable terminal record and cancel intents. Settlement never adds a
+worker/run, changes the conclusion, or creates another summary id.
 
-`done` is refused while any worker is:
+A result arriving after terminal is appended once to `lateReplies` by its
+stable result id, never delivered or used to revive the task. A not-yet-queued
+result is suppressed/late-recorded. An already-enqueued result cannot be made
+absent merely by marking it suppressed: withdraw it only if its exact pending
+identity is still present, and flush. If consumed or racing consumption, keep
+the source and record it as late. It may start a task Session turn, as existing
+queued task work can, but terminal admission checks deny new task/worker work
+and prevent a second conclusion.
 
-- `starting`, `running`, or `cancelling`;
-- has an accepted run whose result is not yet delivered; or
-- has a pending result delivery.
+Archive a worker Session only after the task is terminal, all admissions are
+drained, its Agent is idle and result/late bookkeeping has settled. Persist
+archive/cleanup confirmations and retry failed archives without deleting
+history. Idle workers on open tasks stay unarchived for explicit follow-up.
 
-This extends the existing open-dependency rule. Idle or settled workers do not
-block `done` after their result has been delivered.
+## Data model and compatibility
 
-For `blocked`, `cancelled`, or `failed`:
+Persist workers only under `state.tasks[taskId].workers`. Add this optional map
+only when the first run is reserved; ordinary tasks are not rewritten with
+`workers: {}`. Absent/empty maps mean no worker history. In-memory lookup and
+permission-propagation indexes are derived; there is no second worker table.
 
-1. Acquire the task lane and set the task phase to `closing`.
-2. Mark all nonterminal workers `cancelling`.
-3. Cancel each live worker and clear its inbox.
-4. Persist each worker as cancelled, or retain `interrupted` when the exact
-   outcome cannot be established.
-5. Suppress any still-pending result delivery. It remains in the worker record
-   but is not sent to the task Session after the terminal commit.
-6. Commit the task terminal state.
-
-After the worker has no live turn, its Session is archived. Archiving keeps the
-Session link readable and removes the worker from active execution; it does
-not delete the transcript.
-
-### Host restart or HMR
-
-Every worker job captures the plugin generation and stopped flag and checks
-both after every await before a save, creation, prompt, cancel, result enqueue,
-or delivery acknowledgement.
-
-On restart or plugin replacement:
-
-- workers with a completed matching turn are settled and their pending result
-  is delivered idempotently;
-- a worker in `starting` or `running` with no terminal matching turn becomes
-  `interrupted`; its result reports an unknown outcome;
-- matching pending input is cleared and flushed;
-- no worker is automatically prompted again;
-- an explicit `worker_followup` may continue an interrupted worker only after
-  the coordinator has the unknown result and chooses that continuation;
-- a creation whose Session id was not saved may be adopted only by a unique
-  documented marker lookup. Ambiguity or unavailable lookup marks the worker
-  `interrupted`; it never creates a replacement automatically.
-
-An old generation may finish a native model turn, but it may not commit a
-result, deliver a message, or schedule another worker job after stop. The new
-generation reconciles from persisted state and the Session log.
-
-## Data model
-
-Worker records are persisted under each task in `task.workers`. There is no
-separate `state.workers` source of truth.
+Example of one settled run (optional lifecycle timestamps omitted):
 
 ```js
 {
   id: "worker-id",
+  kind: "native-worker",
   taskId: "task-id",
-  requestedBy: "bot-id",
-  requesterSessionId: "task-session-id",
-  title: "Check the archive",
-  mode: "execute",                         // execute | verify
-  state: "running",                        // see below
-  creationMarker: "worker:worker-id",
-  sessionId: "native-session-id",
-  workdir: "<current-task-folder>",
-  model: {
-    provider: "provider-id",
-    model: "model-id",
-    reasoningEffort: "medium"
-  },
-  permission: "workspace-write",
+  requestedBy: "historical-bot-id",
+  requesterSessionId: "requesting-task-session-id",
+  sessionId: "reserved-native-session-id",
+  marker: "worker:task-id:worker-id",
+  title: "Verify the change",
+  mode: "verify",
+  sandboxRoot: "<requester-header-cwd>",
+  initialWorkdir: "<checked-directory-inside-root>",
+  sandbox: "read-only",
+  approval: "never",
+  model: { provider: "provider-id", model: "model-id", reasoningEffort: "medium" },
   followupCount: 0,
   currentRunId: "worker-id",
+  admissionsClosed: false,
   runs: {
     "worker-id": {
       id: "worker-id",
       ordinal: 0,
-      kind: "initial",                     // initial | followup
+      state: "completed",
+      admissionKey: "caller-session:turn:tool-call-id",
       promptRequestId: "worker-id",
-      promptPreview: "Check the archive...",
-      acceptedAt: 1790000000000,
+      promptDigest: "<digest>",
+      admission: { state: "settled", insertedSeq: 8, messageId: "dsh-message-id" },
       turn: 1,
-      finish: "completed",
-      result: {
-        id: "worker-id:result",
-        state: "delivered",                // pending | enqueued | delivered | suppressed
-        text: "[Worker completed: ...]\n...",
-        enqueuedAt: 1790000001000,
-        deliveredAt: 1790000001001
-      }
+      claimSeq: 10,
+      endSeq: 24,
+      outsideInput: false,
+      finish: { kind: "completed" },
+      result: { id: "worker-id:result", text: "<bounded-result>" }
     }
   },
-  createdAt: 1790000000000,
-  startedAt: 1790000000100,
-  updatedAt: 1790000001001,
-  finishedAt: 1790000001001,
-  archivedAt: null,
-  diagnostic: null
+  cleanup: { state: "none", cancelRequestedAt: null, confirmedIdleAt: null },
+  archivedAt: null
 }
 ```
 
-Worker states:
+The existing task send ledger, not a duplicate field on the run, stores result
+delivery state, fixed target, retry observations and acknowledgement. Runtime
+Promise/generation/Agent handles are not serialized. Full accepted prompts
+and transcripts stay in native logs; the admission key/digest identifies an
+attempt without pretending a missing accepted prompt can safely be rerun.
 
-| State | Meaning |
-|---|---|
-| `starting` | Creation or pre-prompt setup is in progress |
-| `running` | A run has an accepted prompt or an open matching turn |
-| `idle` | The last run settled; another follow-up may be accepted |
-| `cancelling` | Cancellation was requested and is not yet recorded as terminal |
-| `cancelled` | Terminal; no follow-up is allowed |
-| `interrupted` | The host lost the exact outcome; no automatic rerun |
-| `failed` | Setup failed before a usable worker Session existed |
+Validation depends only on stored structure and immutable historical
+references: identity strings, nonnegative counts, unique message/run/Session
+ids, legal transitions and links to that task's persisted participant record.
+It never requires the Bot to remain in the live roster, checks current config
+limits, or resolves current files/presets to read history. Bot removal retains
+the recorded requester/task endpoint ids.
 
-`completed` is a run finish, not a worker state. A run with `error`,
-`blocked`, `aborted`, or `max-tokens` leaves the worker `idle` and records the
-non-success finish, so the coordinator may decide whether to follow up.
+Separate admission validation uses current limits/capability/Bot/policy.
+Cross-ownership claims are rejected in both directions without erasing either
+historical record; a malformed worker claim denies execution and reports a
+diagnostic instead of being dropped from the security lookup.
 
-The full prompt is not duplicated in `state.json`; the native Session log holds
-it after acceptance. `promptPreview` is bounded diagnostic text. The rendered
-result is stored because it must be delivered idempotently after restart. Token
-usage is not copied into this record: the Session id is the attribution key
-used by the usage ledger.
+Terminal mutation allowlist is narrow: settle existing pending/running/
+cancelling runs, append their result/late evidence, advance existing delivery
+acks, record cancel/idle/queue-flush/archive confirmations and diagnostics.
+Never add a worker or run, increase follow-up counts, reopen state, alter
+requester/root identity, or rewrite conclusion/summaryId.
 
-For old tasks without `workers`, readers treat the map as empty. New worker
-maps are always present on newly written tasks. Task validation must reject:
+**Non-empty workers data implies a worker-aware rollback target**, even if
+every run is terminal. Absent/empty maps do not trigger that gate. Lowered
+limits, gate-off and deleted Bots keep historical records valid and readable.
 
-- a worker whose task id does not match its parent task;
-- an unknown requester Bot or requester Session;
-- a Session that already belongs to another task or Bot identity;
-- duplicate worker Session ids;
-- a follow-up count above the configured limit;
-- a result id or delivery target that does not match the run; and
-- a new worker or new run added after the task became terminal.
+## UI, usage and memory
 
-A terminal task may change existing worker bookkeeping only through the narrow
-settlement path: `cancelling` to `cancelled`, `running` to `interrupted`, a
-run finish/result append for an already-started run, and
-`pending -> suppressed` for a result. It can never add a worker, add a
-follow-up, or revive a worker.
+The task header lists worker title/mode, current run state, elapsed time,
+result/cleanup state and native Session link. Reuse DSH's own Session UI, like
+the DSH Agent view, without adopting the worker into `state.agents`. Show no
+worker row on trunks, Bot parts, participant lists or groups. DSH's native
+root-Session list may expose it to its user.
 
-`task.workers` is indexed into in-memory `workerById` and `workerBySession`
-maps. Worker Sessions are deliberately excluded from `taskOwners`,
-`chatOwners`, `groupOwners`, `branchOwners`, `taskSessions`, and every Bot
-identity lookup. They are not trunk endpoints and not Bot parts.
+Keep English UI source labels with localization in `i18n.js` and the existing
+UI standard. No worker approval UI is added.
 
-## UI
+Usage is tokens only through the existing usage ledger: map worker Session
+calls to `task:<taskId>`/worker kind and retain per-run/raw-log attribution.
+Count failed/cancelled work too; incomplete provider usage is unknown, not
+zero. Aggregate task-owned Session calls without double counting inherited
+fork history or shared trunks. Do not invent monetary cost.
 
-The task header is the only team surface that lists workers. For each worker
-it shows:
+`worker-result` stays in the coordinator's history through `parts.js`
+`historyEntry`/`partLines` and in `memory.js` `chatBatch`/review provenance as
+worker/task evidence, never a user decision. Preserve its task, worker, run
+and result ids and exact Session anchor through compaction/review. Worker
+transcripts themselves never enter Bot memory review or Bot identity indexes.
+`capabilities.js` must not mount a Bot's MCP/skills into a worker or call
+`ensureCapabilities` for it; the coordinator supplies self-contained inputs.
+MCP definitions inherited from a default profile remain denied by execution
+policy as well; workers start no MCP capability mounts of their own.
 
-- mode and title;
-- current state;
-- elapsed time since the current run started, using the existing elapsed
-  component;
-- a link that opens the native DSH worker Session, like a DSH Agent Session;
-- a compact finish/result state when settled.
-
-Worker rows are not appended to a Bot's trunk dock, Bot part list, participant
-list, or group view. DSH's own root-Session sidebar may still list the worker
-Session because it is a native root Session; that is not a Bot trunk entry.
-
-The result line in a task Session is rendered as a worker result with a
-distinct label. It is not rendered as a user decision or a normal Bot message.
-The task header uses the existing theme variables, type scale, corner radii,
-and motion conventions in `docs/design/ui-standard.md`.
-
-## Usage and diagnostics
-
-Usage is attributed to the task, not to a fabricated worker Bot:
-
-- `usage.js` indexes every worker Session as owner `task:<task-id>` and kind
-  `worker`;
-- both the usage page and the task header aggregate the worker Session,
-  requester Session, and participant Sessions under the task;
-- provider usage comes from the existing DSH `tokenUsage` fold, not from a
-  separate estimator;
-- the task view must show token usage even when a worker never completed, and
-  must distinguish unknown usage after an interrupted run.
-
-The current DS Bot usage ledger records tokens, not money. Tokens are the
-complete usage contract for this design. It records and displays per-task
-token usage and does not calculate or display monetary cost.
-
-Diagnostics record:
-
-- worker id, task id, mode, configured/default model, and permission;
-- whether the hard gate succeeded and which deny names were applied;
-- prompt acceptance and correlation id;
-- matching turn number and finish reason;
-- result delivery state and exact requester Session;
-- cancellation, restart, marker ambiguity, and generation-stop outcomes.
-
-Diagnostics must not contain the full prompt, transcript, or credentials.
+Diagnostics record ids, lifecycle/finish evidence, policy/sandbox failures,
+model setup, outside-input flag, delivery retry state and unknown outcomes.
+Use existing redaction; do not publish prompts, private transcripts or
+credentials. Minimal diagnostics suffice in W1; richer UI can wait.
 
 ## Invariants
 
-1. A worker belongs to exactly one task and exactly one requesting task
-   Session.
-2. A worker Session is never a Bot Session, Bot part, group Session, legacy
-   branch, or task participant endpoint.
-3. Worker control tools exist only in eligible task-owned Sessions.
-4. A worker has no Bot identity, no Bot memory review, and no Bot
-   capabilities.
-5. Every team tool, every worker control tool, and every DSH native delegation
-   tool is denied before the first worker prompt.
-6. A worker also receives the existing `plugin_manager` self-change denial.
-7. The hard gate fails closed; it never allows a prompt while restriction is
-   missing or unresolved.
-8. Model, effort, permission, workdir, and gate are applied and verified
-   before every run.
-9. Worker permission never exceeds the requesting Bot's permission.
-10. A worker cannot create another worker, spawn a DSH subagent, or call team
-    tools.
-11. At most `maxWorkersPerTask` workers exist for a task.
-12. At most `maxWorkerFollowups` follow-ups exist for a worker.
-13. A worker has at most one active run.
-14. Only a matching `rpcId` and matching `turn/end` settle a run.
-15. Only `completed` is a successful finish.
-16. Every result is at most 4000 Unicode code points including its wrapper and
-    Session link.
-17. Every result is delivered only to the requesting task Session.
-18. Result delivery is idempotent by a stable run result id.
-19. A terminal task cannot revive a worker or accept a new run.
-20. A restart never automatically reruns a worker.
-21. HMR cannot allow an old generation to commit a worker transition after
-    stop.
-22. `done` is refused while a worker is active or its result is pending.
-23. Non-`done` close cancels running workers and suppresses undelivered
-    results.
-24. Worker usage is counted under its task.
-25. Worker Sessions are archived, not deleted, after settlement.
-26. Delivery dedupe does not claim exactly-once external side effects.
+1. One worker has one task, one requesting task-owned Session and one native
+   root Session; ownership is checked bidirectionally.
+2. New runs require current task capability; historical validation does not.
+3. Workers have no Bot identity, memory review or Bot MCP capabilities.
+4. Approval is always never; sandbox is at most workspace-write and no wider
+   than the effective requester. Verify is read-only through the native API.
+5. Worker header cwd equals requester header cwd; realpath cd stays inside it.
+6. Execution policy denies team/worker/delegation/goal/schedule/plugin tools,
+   including scoped/dynamic/aliased/PTC cases; presentation is not authority.
+7. Persisted ownership and awaited gates apply before creation/resume work,
+   across HMR and before every dispatch. Lookup failure denies.
+8. Each admission has durable identity before prompt; each run has at most one
+   in-flight prompt. A stale accepted prompt is cancelled/drained, not rerun.
+9. Inbox identity/claim binds the exact turn, including pre-user-message errors.
+10. Only completed is success. Cancellation ack is not cancelled; a live HMR
+    turn is not unknown.
+11. Worker log flush precedes result settlement; task delivery uses raw-log
+    dedupe, fixed target, flush-before-ack and bounded recovery.
+12. A result only reaches its requesting task Session and preserves provenance.
+13. Terminal task+conclusion commit precedes cancellation settlement at every
+    entry point. Late results never revive or create another conclusion.
+14. Done refuses unsettled runs/results; open-task idle workers stay available
+    for explicit follow-up.
+15. Gate-off with no worker data has zero existing-feature behavior changes.
+16. Non-empty worker history requires worker-aware code on rollback.
 
-## File and function changes
+## File and function change map
 
-The following is the implementation map, not a change made by this document.
+This table describes implementation work, not code shipped by this docs PR.
 
-| Area | File and current symbols | Required change |
+| File / functions | Change |
+|---|---|
+| `ds-bot/src/host/workers.js` (new): admission, `runWorker`, `followupWorker`, `cancelWorker`, recovery | Minimal worker policy/setup, durable runs, claim correlation, admission compensation and bounded cancellation; reuse task lanes and delivery |
+| `ds-bot/src/host/tasks.js`: `validateTask`, `commitTask` | Optional workers map, structural/history validation, narrow terminal settlement allowlist; current limits only on admissions |
+| `ds-bot/src/host/store.js`: `indexSessions`, `validateTaskSessions` | Derived worker ownership and permission indexes; bidirectional conflicts; never add workers to `selfOf`/`isBotSession` |
+| `ds-bot/src/host/task-routing.js`: `withTask`, creation failure/recovery paths | Short reservation/commit phases; all terminal failures invoke common post-commit settlement |
+| `ds-bot/src/host/task-lifecycle.js`: `dependencies`, `closeTask`, `settleTerminal`, `removeTaskBot`, `recover` | Done dependency gate; terminal-first close from every entry point; shared worker cancel/late/archive settlement |
+| Same file: `prepare`, `destination`, `matches`, `observe`, `alreadyPresent`, `atBoundary`, `acknowledge`, `runDelivery`, `attemptConclusion` | Extend existing machinery for worker-result source/id and fixed task Session, same deadlines/backoff; no separate outbox |
+| `ds-bot/src/host/models.js`: model/effort resolution, selection serialization | Route precedence including configured effort; use public native initial options/scoped model helper without default writes |
+| `ds-bot/src/host/permissions.js`: `setPermission`, worker permission propagation | Read effective Session policy, forced never, direct sandbox setter/readback, mid-run tightening/cancel |
+| `ds-bot/src/host/folders.js`: `sessionFolder`, `folderAt`, guarded-root helpers; `tools.js`: cd path | Preserve immutable sandbox root; initial/live realpath containment and worker cd validation before Bot-only return; no folder approval |
+| `ds-bot/src/host/tools.js`: `registerTaskTools`, execution policy, `list_tasks` | Task-only worker tools; final deny using S1b hooks for worker Sessions; dynamic/scoped/PTC policy |
+| `ds-bot/src/host/constants.js`: `TEAM_TOOLS` and worker deny names | Cover team/worker/delegation/goal/schedule/plugin/MCP families; names aid hiding/diagnostics, definition policy remains authoritative |
+| `ds-bot/src/host/agents.js`: `adoptAgentSession`; `roster.js`/task endpoint claims | Refuse worker/provenance ownership conflicts only. DSH Agent gate retrofit is Issue #43, a separate implementation PR |
+| `ds-bot/src/host/turns.js`, `resume.js`, `delivery-id.js` | Recognize worker-result, preserve exact ids and task trigger; no `answerSender` or auto worker retry |
+| `ds-bot/src/host/parts.js`, `memory.js`, `capabilities.js` | Retain coordinator result provenance; exclude raw worker review and Bot capability mounts |
+| `ds-bot/src/host/usage.js`, `channel.js` | Token attribution, worker/task state and minimal diagnostics |
+| `ds-bot/src/client/branch-dock.js`: `TaskHeader`; `sources.js`, `cells.js`, `i18n.js`, native-surface routing | Task-only rows, native worker Session link, outside-input/result presentation |
+| `ds-bot/index.js`: module installation | Install worker hooks only when enabled or non-empty data needs recovery; establish policy before resume; zero empty flag-off effects |
+| `ds-bot/test/workers*.test.js` (new) and existing task/lifecycle/model/permission/memory/usage/UI tests | Matrix below and regressions of reused functions; rebuild generated `client.js` only for client implementation |
+
+## Slices and acceptance matrix
+
+Keep `nativeWorkers: false` by default in every slice. No enabling in a user
+profile until W1-W3 and their target-runtime safety criteria pass. Docs review,
+implementation, automated checks, isolated acceptance and release are distinct.
+
+### W1: flag-off core and first-result safety
+
+Implement model/config/admission, data, policy, setup, correlation and durable
+result delivery, with the worker-count limit. Internal cancellation/drain,
+terminal settlement and cold/HMR recovery are part of this core safety chain;
+they cannot wait for the control-tool UI slice. Use the smallest worker-only
+helper, without an unused allow branch or generic native-session framework.
+
+Real DSH checks of cold-resume policy, early-failure correlation, cancellation
+and admission fencing are **W1 exit criteria**. Run matrix A1-A10 below with
+the mock model on a fixed real DSH in an isolated profile, plus applicable
+unit regressions. A unit fake that repeats the design's assumptions is not
+evidence for those API boundaries.
+
+When disabled with no worker data, compare tools/schemas, task creation/
+closure, DSH Agent create/adopt/resolve and Bot model/permission behavior
+against the base. There must be no behavior or data-shape change. Existing
+worker data still installs its recovery/deny policy when the flag is off.
+
+The DSH Agent gate fix is outside W1: Issue #43 gets its own implementation
+PR and independent real-DSH create/adopt/cold-resume/HMR/PTC acceptance. It may
+later reuse a small compatible helper; no shared-framework dependency is
+required by workers.
+
+### W2: explicit follow-up and cancellation controls
+
+Expose `worker_followup`/`cancel_worker`, apply the follow-up limit at call
+time, and finish control/list formatting. Reuse W1's settlement/drain path.
+Exit requires A1-A10 rerun for follow-up and every control/close race, with
+completed/failed/unknown plus actual idle checked; cancelled remains closed.
+Both lowered limits and flag/capability removal preserve readable history.
+
+### W3: task-header UI and provenance
+
+Implement worker rows/state/elapsed/Session links and worker-result messages.
+Add task token display and retain worker provenance in history/memory review.
+Exit requires A11-A12, native Session navigation, desktop/mobile checks,
+and all affected lifecycle regressions. Build `client.js` from `src/client/`
+and commit both; never edit the generated bundle directly.
+
+### W4: isolated release and rollback
+
+Repeat the full matrix on the exact release runtime with synthetic data and
+the mock model. This is a regression/release rehearsal, not the first proof of
+W1 APIs. Use the
+[out-of-band procedure](2026-10-30-release-procedure.md), record loaded
+DS Bot/DSH versions, commit and compatible rollback target, and stop every
+bench/process started for acceptance. No live Desktop or private user data.
+
+### Required matrix
+
+These are required outcomes to prove, not a report of tests already passed.
+All safety rows use the pinned real DSH plus mock and isolated data.
+
+| ID / review | Scenario and exit evidence | Slice exit |
 |---|---|---|
-| Module order | `ds-bot/index.js` `MODULES` | Install the worker module after task routing, task lifecycle, folders, permissions, and models, and before tools restore their scoped surfaces |
-| Tool names | `ds-bot/src/host/constants.js` `TEAM_TOOLS` | Add worker control names and a `DSH_DELEGATION_TOOLS` set covering shipped native delegation tools and configured aliases; test that every composed model-facing delegation tool is covered |
-| Shared gate | `ds-bot/src/host/native-gate.js` (new) `applyNativeSessionToolGate` | Apply, guard, and verify one restriction mask with no retry; used by both DSH Agent sessions and workers |
-| Worker runtime | `ds-bot/src/host/workers.js` (new) `install`, `runWorker`, `followupWorker`, `cancelWorker`, `settleRun`, `deliverResult`, `recoverWorkers`, `cancelTaskWorkers`, `archiveSettledWorkers` | Own worker records, creation intent, the shared tool gate, turn listener, lifecycle, restart, and result delivery |
-| Tools | `ds-bot/src/host/tools.js` `registerTaskTools`, `syncTaskTool`, `listTasks`, task tool registry | Register the three worker tools only in eligible task Sessions; extend `list_tasks`; extend the `plugin_manager` managed-Session predicate to worker Sessions |
-| Task validation | `ds-bot/src/host/tasks.js` `validateTask`, `commitTask` | Validate `task.workers`, worker/run identity, limits, and the narrow terminal settlement transitions |
-| Indexes | `ds-bot/src/host/store.js` `indexSessions`, `selfOf`, `isBotSession`, task maps | Add `workerById`/`workerBySession`, keep workers out of all Bot indexes, and expose lookup helpers |
-| Task lane | `ds-bot/src/host/task-routing.js` `withTask`, `taskContext`, `routeTask` | Reuse the per-task lane for worker creation/results; make task-owned requester verification available to the worker module |
-| Close | `ds-bot/src/host/task-lifecycle.js` `dependencies`, `settleTerminal`, `closeTask`, `recover` | Block `done` on active/pending workers and cancel/suppress workers for other terminal states |
-| Models | `ds-bot/src/host/models.js` `resolveModel`, `resolveEffort`, `selectSessionModel` | Resolve worker/verifier routes and apply them without changing the profile default or Bot record |
-| Permissions | `ds-bot/src/host/permissions.js` `permissionCatalog`, `applyPermission`, `checkPreset` | Add permission-within-Bot comparison and apply/read back the selected worker preset |
-| Folders | `ds-bot/src/host/folders.js` `cleanWorkDir`, `workFolder`, `approveFolder`, `sessionFolder` | Resolve the current task workdir, approval, create cwd, and Session-only worker directory changes |
-| Agent setup | `ds-bot/src/host/agents.js` `restrictTeamTools`, `createAgentSession`, `adoptAgentSession`, `agentOf` | Replace the asynchronous retry with the shared gate; await it before create/adopt returns, during startup reconciliation, and before any prompt-capable DSH Agent Session is published |
-| Turn source | `ds-bot/src/host/turns.js` `turnInput`, session-event tracking | Recognize `worker-result` as private task input and never route it through `answerSender` |
-| Inbox/recovery | `ds-bot/src/host/parts.js`, `resume.js` inbox target, forwarding, resume paths | Keep worker results on next-turn delivery, preserve task scope, and restore exact result delivery after HMR/restart |
-| State view | `ds-bot/src/host/channel.js` `state`, `live.work.tasks` | Expose worker state, elapsed data, result state, and task usage |
-| Usage | `ds-bot/src/host/usage.js` `liveOwners`, `usageView` | Attribute worker Sessions to `task:<id>` and kind `worker` |
-| Task UI | `ds-bot/src/client/branch-dock.js` `TaskHeader`, `BRANCH_CSS` | Render worker rows in the task header only |
-| Message UI | `ds-bot/src/client/cells.js`, `sources.js`, `i18n.js` | Distinguish a worker-result source and add English/Chinese labels |
-| Tests | `ds-bot/test/workers.test.js` (new), `agents.test.js`, `tasks.test.js`, `task-lifecycle.test.js`, `task-dock.test.js`, `self-maintenance.test.js` | Cover the cases below, including the shared DSH Agent gate; rebuild `client.js` if the UI changes |
+| A1 / R6 | Pre-step rejects; assemble/prepare fails before rpcId user-message; prompt remains in inbox; claim precedes user-message; completed with no text. Exact splice/message/claim/turn yields one correct result, never permanent running | W1; W2 follow-up variants |
+| A2 / R7 | Pause every create/setup/prompt-admission/save/flush await; race run, follow-up, cancel, close, Bot deletion and HMR. Durable intents fence and drain late admission; no unaccounted enqueue, ghost worker, duplicate run or lane deadlock. There is no approval await | W1 internal controls; W2 tool controls |
+| A3 / R7 | Plugin-only HMR with still-running native Agent, ended-but-missed event, and cancel not yet idle. Reattach exact run; no unknown/re-prompt. Host crash without terminal evidence produces unknown once, never replay | W1; W2 |
+| A4 / R3 | Native UI/API cold resume has policy before tool dispatch; default/overridden preset includes scoped forbidden tools. Gate errors reject/deny with bounded diagnostic and no app-boot fatal; HMR takeover has no unguarded window | W1; W2 |
+| A5 / R2-R3 | Team/worker/subagent/goal/schedule/plugin-manager calls through scoped tools, delayed registration, aliases, same-name replacement and PTC are denied. Unknown definitions fail closed. Shell launching a CLI is explicitly outside the guarantee, not falsely reported as blocked | W1; W2 |
+| A6 / R1,R4,R5,R13 | Requester ask/never and read-only/workspace-write/full-access combinations; no named read-only preset; forced never with no answerers/UI or with UI disconnected; explicit full access rejected; implicit execute capped at workspace-write; verify uses direct read-only API or refuses. Tighten running Bot/task permission. Different cd/header.cwd, cross-root/symlink/guarded roots and worker cd are checked; follow-up retains current cd | W1; W2 |
+| A7 / R9 | Crash after accepted/turn-end before worker flush, and before/after each result intent/enqueue/receiver-flush/ack. Raw-log compaction/dedupe; transient inspect/save/flush failure retries; deleted/archived/unexpected endpoint stays pending. One resultId, no duplicate delivery or trunk fallback | W1; W2 |
+| A8 / R7-R8 | Terminal commit followed by half-completed cancellation failure/crash; every terminal entry point; already-queued unconsumed result; late success/error. Resume narrow cleanup, settle cancelled results, never revive; conclusion and summaryId unchanged with no second admission | W1; W2 |
+| A9 / R10 | Two concurrent worker routes with configured/explicit/Bot/default efforts, interleaved UI default-model changes, follow-up and cold resume before/after first request. Worker route matches persisted selection; no worker-caused write to profile default or another Bot/task route. Cover existing S2 restore-failure behavior separately, without claiming it fixed | W1; W2 |
+| A10 / R11-R13 | Empty flag-off schemas/tasks/DSH Agent paths match base; on-to-off recovery; lower both limits; delete requester Bot; old/absent/empty/non-empty workers round-trip. Historical validation remains valid, no unnecessary empty map, non-empty data blocks unaware rollback. Bidirectional worker/Bot/Agent/task/fork adoption fails | W1; W2; W4 rollback |
+| A11 / R6,R13 | Human outside input/steer allowed and flagged in result; exact worker Session UI link; no trunk/participant worker rows; follow-up denied while outside activity keeps Agent busy; cancelled state waits for idle | W3 |
+| A12 / R9,R13 | Worker-result survives parts/compaction and memory classification as worker/task evidence with ids/anchor; no raw worker memory review or Bot MCP mount; usage counts tokens only, handles missing usage and inherited history without double count | W3 |
 
-The existing `client.js` remains generated. Any UI implementation changes
-`src/client/`, runs `npm run build`, and commits both files.
-
-## Tests
-
-### Unit tests
-
-- Tool registration: absent when `nativeWorkers` is false, absent on trunks
-  and workers, present on eligible task Sessions.
-- `run_worker` returns immediately and never waits for a turn.
-- `maxWorkersPerTask`, `maxWorkerFollowups`, and all refusal paths are exact;
-  refusals do not consume budget.
-- Model precedence, effort validation, `verifierModel` with `workerModel`
-  fallback, no family inference, and invalid configured routes.
-- Permission precedence and comparison; verify defaults to read-only; full
-  access requires the Bot's own full access and an explicit request.
-- A follow-up after the Bot lowers its permission clamps the worker and never
-  raises it.
-- Default workdir follows live task Session cd; explicit workdir checks
-  realpath, guarded roots, and approval.
-- Hard-gate ordering: create, persist id, apply model/permission/workdir,
-  shared restrict/guard/verify helper, listener, then prompt. A restriction
-  failure must observe zero worker prompts.
-- The same helper gates DSH Agent create/adopt/resolve; a failure or ambiguity
-  must not publish a prompt-capable DSH Agent Session.
-- Worker scope cannot see or execute team tools, worker control tools, or DSH
-  native delegation tools.
-- `plugin_manager` self-change is denied in a worker Session.
-- `rpcId` correlation ignores a concurrent or unrelated turn.
-- Every terminal reason maps to the correct result state; only `completed`
-  succeeds.
-- 4000-code-point truncation includes the wrapper and Session link.
-- Result source targets the exact task Session, never a trunk.
-- Result delivery is idempotent across repeated events and restart.
-- Follow-up is refused while running; accepted follow-ups reuse the Session.
-- Cancel clears queued worker input and does not cancel another task.
-- `done` refuses active or result-pending workers; non-`done` close cancels and
-  suppresses.
-- Restart with a mid-turn worker marks `interrupted`, preserves the unknown
-  outcome, and never prompts automatically.
-- HMR generations cannot save, enqueue, or mark delivered after stop.
-- Terminal worker bookkeeping cannot add workers, runs, or follow-ups.
-- Usage is token-only and attributed to `task:<id>`, not to a Bot; no monetary
-  cost is computed.
-
-### Isolated integration
-
-Run in `ds-bot/`:
+Repository implementation checks in `ds-bot/` remain:
 
 ```sh
 npm test
 node scripts/build-client.mjs --check
 npm run lint
-CONTEXT_WINDOW=100000 CHECK_RATIO=0.45 dev/bench.sh smoke 3096 8796 reset &&
-  node dev/smoke.mjs smoke 3096
-dev/bench.sh smoke 3096 8796 stop
 ```
 
-Use the mock model and an isolated `.dsh-test-worker-*` data directory. Never
-point a test at a user's DSH data, a Desktop profile, or a running Desktop.
+Host implementation also runs the documented smoke command with a free port,
+isolated `.dsh-test-worker-*` data and the mock model. UI implementation adds
+real demonstration evidence under the repository workflow. This docs-only PR
+claims source/contract inspection and document checks, not these runtime exits.
 
-W4 also runs the built worker slice against the pinned real DSH runtime from
-the documented installation, with the mock model and synthetic data. This
-proves the actual `sessionController.create`, `prompt(request, signal)`,
-`rpcId`, `turn/end`, `cancel`, `tools.restrict`, `tools.guard`,
-`workingDirectory`, and permission APIs on the target version. It does not use
-a live user profile.
+## Rollback and known limits
 
-## Acceptance scenarios
+Disable new admissions with `nativeWorkers: false` and keep a worker-aware
+build while existing work/result/cleanup settles. Use terminal-first task
+closure and the same cleanup path; do not delete records to pass preflight.
+Before a stopped-profile switch, require no pending/running/cancelling run,
+in-flight admission, unsettled delivery or archive cleanup.
 
-1. From one task Session, start two execute workers with independent prompts.
-   Both create native Sessions, run concurrently, and each result appears only
-   in the requesting task Session.
-2. A third `run_worker` is refused by `maxWorkersPerTask`, even after one of
-   the first two becomes idle.
-3. An execute worker asks its model to call every team tool, worker control
-   tool, and DSH native delegation tool. None is visible or executable, and a
-   prompt that tries anyway produces a denied tool result rather than a team
-   or subagent action.
-4. A fake setup failure after Session creation but before restriction results
-   in no prompt, no model usage, and one bounded failure result.
-5. A verify worker defaults to read-only. It uses a configured `verifierModel`
-   when present and otherwise uses `workerModel`, with no family inference. An
-   explicit escalation beyond the Bot's permission is refused.
-6. The task Session changes directory after opening. A new worker inherits
-   that current directory, not the original task folder.
-7. The first worker completes, receives one follow-up, and its result is
-   correlated to the follow-up prompt. A third follow-up is refused.
-8. `cancel_worker` while running cancels the exact worker, drops queued input,
-   leaves another worker and task work running, and records a cancelled run.
-9. `close_task({ status: "done" })` is refused while one result is pending;
-   after delivery it succeeds. Closing `cancelled`, `blocked`, or `failed`
-   cancels all active workers and suppresses their remaining results.
-10. The host is restarted while a worker is mid-turn. The worker becomes
-    `interrupted`, the result says the outcome is unknown, and no new prompt is
-    sent automatically.
-11. HMR replaces the plugin between prompt acceptance and turn/end. The next
-    generation settles from the log once, delivers one result, and does not
-    prompt again.
-12. A crash after result enqueue but before delivery acknowledgement does not
-    enqueue a second copy.
-13. The task header lists worker state, elapsed time, and a working native
-    Session link. The worker is absent from the Bot trunk dock and participant
-    rows.
-14. The usage page and task view count worker tokens under the task and show no
-    monetary cost; a worker with an interrupted run is marked as having
-    unknown usage rather than zero.
-15. A worker attempts `plugin_manager` changes for `ds-bot`; the execution
-    guard refuses it.
-16. Turning `nativeWorkers` off stops new worker tools and creation while a
-    worker-aware build still settles, cancels, and closes existing records.
-17. Creating or adopting a DSH Agent with the shared gate forced to fail
-    publishes no prompt-capable Session; a race that would otherwise allow a
-    first prompt observes zero prompts.
+Non-empty `task.workers` requires a worker-aware rollback target. Absent/empty
+worker maps alone do not. Gate-off, lowering limits and deleting Bots do not
+erase that compatibility requirement. Preserve current data on code rollback;
+restore snapshots only through the separate operator recovery decision.
 
-## Rollback
+Known limits:
 
-Normal operational rollback:
-
-1. Set `nativeWorkers: false`.
-2. Stop admitting new worker work.
-3. Keep a worker-aware DS Bot build installed while existing workers settle
-   or are cancelled and existing tasks close.
-4. Verify no `starting`, `running`, or `cancelling` workers and no pending
-   worker result remain.
-5. Archive settled worker Sessions.
-
-Once any `task.workers` record exists, rollback to a build that does not
-understand worker records is refused. Such a build could ignore active worker
-Sessions, strand results, or close a task without cancelling its workers. A
-worker-aware build is required even when the rollout gate is off.
-
-If a worker-aware build fails during a release, follow the out-of-band release
-procedure. Do not restore an older `state.json` unless the operator explicitly
-accepts losing later work; keep the failed current data for diagnosis.
-
-This document adds no release helper and does not change the rule that a Bot
-Session cannot supervise replacement of its own plugin.
-
-## Delivery slices
-
-All worker code ships behind `nativeWorkers: false` until its slice and
-acceptance criteria pass.
-
-### W1: model, tools, gate, and first result
-
-- Add the shared `applyNativeSessionToolGate()` helper and use it to replace
-  the DSH Agent's asynchronous restriction retry in create, adopt, and startup
-  reconciliation.
-- Add `workers.js`, worker data validation/indexes, `run_worker`, model and
-  permission setup, workdir handling, the shared hard gate, turn correlation,
-  and bounded result delivery.
-- Deny team tools, worker control tools, and DSH native delegation tools in
-  workers; workers never dispatch.
-- Enforce the absolute `maxWorkersPerTask` safety cap.
-- Add the `worker-result` source and query formatting to `list_tasks`.
-- Extend `plugin_manager` self-change management to workers.
-- Keep worker tools absent when the gate is false.
-
-Acceptance:
-
-- unit tests for setup, gate order, result truncation, exact routing, no trunk
-  wake, no prompt after a gate failure, and the DSH Agent gate pass;
-- the isolated mock smoke flow starts and completes one worker;
-- no Bot identity, memory review, or Bot capability is observable in the
-  worker.
-
-### W2: follow-up, cancel, limits, close, and recovery
-
-- Add `worker_followup`, `cancel_worker`, follow-up accounting, exact inbox
-  clearing, task-close integration, generation checks, and restart
-  reconciliation.
-- Finalize all limit and refusal messages.
-- Add terminal worker bookkeeping and result suppression.
-
-Acceptance:
-
-- follow-up, cancel, close, crash, HMR, and idempotent result scenarios pass;
-- a nonterminal task cannot close `done` past an active/pending worker;
-- no automatic rerun occurs after restart.
-
-### W3: task-header UI
-
-- Render worker state, elapsed time, Session link, result state, and usage in
-  `TaskHeader`.
-- Add the worker-result message presentation and localized labels.
-- Rebuild and commit `client.js`.
-
-Acceptance:
-
-- the UI checks and task-dock tests pass;
-- a real isolated task shows worker rows only in the task header;
-- mobile and desktop layouts follow the UI standard.
-
-### W4: isolated acceptance and release
-
-- Run the full unit, client, lint, smoke, real-DSH-with-mock, restart, HMR,
-  cancellation, and permission acceptance matrix.
-- Exercise the out-of-band release and rollback procedure with synthetic data.
-- Enable `nativeWorkers` only after W1-W3 are present and W4 acceptance is
-  recorded.
-
-Acceptance:
-
-- all W1-W3 checks pass on the target DSH runtime;
-- the release records the loaded DS Bot version, DSH version, worker data
-  compatibility, and rollback target;
-- no live user profile, private DSH data, or running Desktop is used in
-  acceptance.
-
-## Known limits
-
-- A worker is a same-host Session and does not survive host exit.
-- A result can report an interrupted/unknown outcome; it cannot prove that a
-  worker made no external side effect.
-- Delivery dedupe is not exactly-once execution of tools or file writes.
-- A worker cannot inherit Bot memory or capabilities by design.
-- The full transcript remains in the native Session and is not reproduced in
-  `state.json`.
-- Verifier independence is configuration-based; the design does not infer a
-  model family.
-- Usage is token-only; no monetary cost is calculated or displayed.
-- Worker result delivery can start one model turn in the requesting task
-  Session and consumes tokens.
-- A task's worker count is lifetime-bound; a task that needs more independent
-  jobs must close and open a new task under the existing task-session rules.
+- Same-host Sessions do not survive host exit. Unknown outcome is not proof
+  of no external side effect, and delivery dedupe is not exactly-once execution.
+- DSH tool policy cannot stop an allowed shell from launching another CLI,
+  background process or service call. It is not a process/container sandbox.
+- A preset is trusted host code, not a security boundary. Arbitrary malicious
+  plugin code or a host without the worker policy is outside the guarantee.
+- Permission tightening controls subsequent operations and requests cancel;
+  it cannot undo already-started writes or terminate all external descendants.
+- Direct user input is allowed and disclosed; a user can change what the
+  worker does. It does not become authority for another coordinator.
+- Existing S2 `selectSessionModel` still has profile-default write/restore
+  races. Workers use documented native Session-scoped APIs instead.
+- Verification has fresh-Session independence only unless an explicit
+  verifier model is configured. Usage is tokens only; no money estimate.
+- Target-runtime incompatibility or unprovable execution/correlation gates
+  refuses worker admission; there is no DSH patch or private API workaround.
