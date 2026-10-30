@@ -321,6 +321,8 @@ test('all forbidden/unknown scoped names are denied even after replacement and H
     assert.equal(result.isError, true, name)
     dispose()
     agent.ctx.tools.register(defineTool(definition))
+    const replaced = await h.ctx.tools.execute({ agent, name, arguments: {}, callId: randomId(), signal: AbortSignal.timeout(2000) })
+    assert.equal(replaced.isError, true, `re-registered ${name}`)
   }
   assert.equal(calls, 0)
   agent.ctx.tools.register(defineTool({ name: 'read', parameters: {},
