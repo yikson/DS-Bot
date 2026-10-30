@@ -101,25 +101,65 @@ test('packs expand only to MCP and skill items', () => {
   assert.throws(() => expandCapabilityNames(['bad'], { ...items, bad: { kind: 'pack', items: ['team'] } }), /unavailable capability/)
 })
 
-for (const outcome of ['ready', 'error', 'needs-approval', 'timeout']) {
-  test(`required Session capability setup keeps trunk availability behavior: ${outcome}`, async t => {
+const TASK = 'chief-task'
+const mounts = {
+  ready: async () => {},
+  needsApproval: async () => {},
+  error: async () => { throw new Error('mount failed') },
+  timeout: () => new Promise(() => {}),
+}
+
+// Serves the Bot's trunk and its task Session, each mounting on its own.
+function serveSessions(env, awaitMountOf) {
+  const agents = new Map()
+  env.rt.resolveAgent = async id => {
+    if (!agents.has(id)) agents.set(id, testAgent(id, env.mounts, env.skills, { awaitMount: awaitMountOf(id) }))
+    return agents.get(id)
+  }
+  // DSH reports the task endpoint as a Session of the same Bot.
+  const isBotSession = env.rt.isBotSession
+  env.rt.isBotSession = id => id === TASK || isBotSession(id)
+  const selfOf = env.rt.selfOf
+  env.rt.selfOf = id => (id === TASK ? 'chief' : selfOf(id))
+}
+
+async function attachEcho(env, { approved = true } = {}) {
+  await env.rt.capabilitySave(mcp('echo'), { botId: 'chief' })
+  if (approved) await env.rt.capabilityEndpoint('capability-approve', { name: 'echo' })
+  env.rt.state.bots.chief.capabilities = ['echo']
+}
+
+for (const outcome of ['ready', 'needs-approval', 'error', 'timeout']) {
+  test(`a task Session keeps the availability state its Bot trunk has: ${outcome}`, async t => {
     const env = await setup()
     t.after(() => env.dispose())
-    await env.rt.capabilitySave(mcp('echo'), { botId: 'chief' })
-    if (outcome !== 'needs-approval') await env.rt.capabilityEndpoint('capability-approve', { name: 'echo' })
-    env.rt.state.bots.chief.capabilities = ['echo']
-    const agent = testAgent('chief', env.mounts, env.skills, { awaitMount: async () => {
-      if (outcome === 'error') throw new Error('mount failed')
-      if (outcome === 'timeout') await new Promise(() => {})
-    } })
-    env.rt.resolveAgent = async () => agent
+    await attachEcho(env, { approved: outcome !== 'needs-approval' })
+    serveSessions(env, () => mounts[outcome === 'needs-approval' ? 'needsApproval' : outcome])
     env.rt.capabilityEnsureTimeoutMs = 5
-    await env.rt.ensureCapabilities('chief', { required: true })
+    await env.rt.ensureCapabilities('chief')
     const state = outcome === 'timeout' ? 'connecting' : outcome
     assert.equal(env.rt.capabilityStatusesView().chief.echo.state, state)
-    const warnings = (await env.rt.diagnostics.entries()).filter(entry => entry.text.startsWith('task capabilities for chief unavailable:'))
+    await env.rt.ensureCapabilities(TASK, { required: true })
+    const warnings = (await env.rt.diagnostics.entries())
+      .filter(entry => entry.text.startsWith(`task capabilities for ${TASK} unavailable as in the Bot trunk:`))
     assert.equal(warnings.length, Number(outcome !== 'ready'))
-    if (warnings.length) assert.ok(warnings[0].text.includes(`echo (${state}); continuing as in Bot chats`))
+    if (warnings.length) assert.ok(warnings[0].text.includes(`echo (${state}); continuing`))
+  })
+}
+
+for (const [trunk, trunkMount, prepareTrunk] of [
+  ['ready', mounts.ready, true],
+  ['connecting', mounts.timeout, true],
+  ['unmounted', mounts.ready, false],
+]) {
+  test(`a task Session refuses a capability the Bot trunk does not fail: ${trunk} trunk`, async t => {
+    const env = await setup()
+    t.after(() => env.dispose())
+    await attachEcho(env)
+    serveSessions(env, id => (id === TASK ? mounts.error : trunkMount))
+    env.rt.capabilityEnsureTimeoutMs = 5
+    if (prepareTrunk) await env.rt.ensureCapabilities('chief')
+    await assert.rejects(env.rt.ensureCapabilities(TASK, { required: true }), /Task capabilities are not ready: echo/)
   })
 }
 

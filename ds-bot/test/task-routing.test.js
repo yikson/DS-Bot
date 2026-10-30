@@ -73,7 +73,7 @@ test('an assignee with an approval-pending MCP can receive a task with a diagnos
   assert.equal(f.rt.state.capabilities.items.pending.approved, false)
   const warnings = await f.rt.diagnostics.entries()
   assert.ok(warnings.some(entry => entry.level === 'warn'
-    && entry.text === `task capabilities for ${task.sessions.b} unavailable: pending (needs-approval); continuing as in Bot chats`))
+    && entry.text === `task capabilities for ${task.sessions.b} unavailable as in the Bot trunk: pending (needs-approval); continuing`))
 })
 
 for (const failure of ['tools', 'permissions']) {
