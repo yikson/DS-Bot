@@ -276,6 +276,28 @@ export function install(rt) {
     return linesFor({ window: info.context?.contextWindow, reserve: route.maxTokens ?? info.defaultMaxTokens, checkRatio: config.checkRatio })
   }
 
+  const skippedSummaries = new WeakSet()
+  const SUMMARY_OVERFLOW = 'bot/summary-overflow'
+  async function summaryRoute(session, prompt) {
+    const selected = await rt.summaryRoute?.()
+    const route = selected ?? session.requestHeader()?.config
+    if (!route?.provider || !route?.model) throw new Error('the Session has not called a model yet')
+    const info = selected ?? await ctx.llm.resolveModelInfo(route.provider, route.model)
+    const window = linesFor({ window: selected?.contextWindow ?? info.context?.contextWindow }).window
+    const tokens = tokensOf(session)
+    const room = tokens === undefined ? undefined : Math.floor(window - tokens - estimateTokens(prompt))
+    if (room !== undefined && room <= 0) {
+      const error = Object.assign(new Error('summary input exceeds the model context window'), { code: SUMMARY_OVERFLOW })
+      if (!skippedSummaries.has(session)) {
+        skippedSummaries.add(session)
+        rt.warn('ds-bot: skipping summaries for %s on %s/%s: input exceeds its %d-token window; using the existing fallback', session.id, route.provider, route.model, window)
+      }
+      throw error
+    }
+    const limit = route.maxTokens ?? info.defaultMaxTokens
+    return { ...route, maxTokens: room === undefined ? limit : Math.min(limit ?? room, room) }
+  }
+
   // The backend's own entry points leave Bot Sessions alone, earlier parts and group
   // records included: automatic pressure and overflow compaction do nothing, and
   // /compact and explicit ranges are refused. Only DS Bot condenses a Bot Session,
@@ -458,14 +480,13 @@ export function install(rt) {
   async function writeNote(agent, signal, { folder = false } = {}) {
     const session = agent.session
     const header = session.requestHeader()
-    const route = header?.config
-    if (!route?.provider || !route?.model) throw new Error('the Session has not called a model yet')
     const messages = session.deriveMessages()
     const base = folder ? FOLDER_PROMPT : HANDOFF_PROMPT
     let retry
     let problem
     for (let attempt = 1; attempt <= NOTE_ATTEMPTS; attempt += 1) {
       const prompt = retry === undefined ? base : `${base}\n\n${retry}`
+      const route = await summaryRoute(session, prompt)
       const assembler = new BlockAssembler()
       for await (const chunk of ctx.llm.stream({
         provider: route.provider,
@@ -473,7 +494,7 @@ export function install(rt) {
         ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
         messages: [...messages, { role: 'user', content: [{ type: 'text', text: prompt }] }],
         toolHistory: session.toolHistory(),
-        ...(header.tools ? { tools: [...header.tools] } : {}),
+        ...(header?.tools ? { tools: [...header.tools] } : {}),
         maxTokens: Math.min(NOTE_MAX_TOKENS, route.maxTokens ?? NOTE_MAX_TOKENS),
         sessionId: session.id,
         purpose: 'compaction',
@@ -523,18 +544,14 @@ export function install(rt) {
   }
 
   // DS Bot's summary for a Bot Session, in place of the backend's. Like the backend's
-  // own, it is one request on the conversation's own prefix, so the provider serves
-  // that from cache.
+  // own, it replays the conversation's prefix; summaryModel can route it separately.
   async function writeCheckpoint(input, agent, signal) {
     const session = agent.session
-    const route = session.requestHeader()?.config
-    if (!route?.provider || !route?.model) throw new Error('the Session has not called a model yet')
-    // The results list grows with the work, so the checkpoint may write as much as one
-    // of the Bot's own replies.
-    const maxTokens = route.maxTokens
     const head = input.messages
     const tail = checkpointTail(head, session.deriveMessages())
     const prompt = tail.length === 0 ? CHECKPOINT_PROMPT : `${CHECKPOINT_PROMPT}\n\n${checkpointTailNote(tail)}`
+    const route = await summaryRoute(session, prompt)
+    const maxTokens = route.maxTokens
     const assembler = new BlockAssembler()
     for await (const chunk of ctx.llm.stream({
       provider: route.provider,
@@ -638,7 +655,7 @@ export function install(rt) {
       if (result === null) return false
     } catch (error) {
       if (!inTurn && (error?.code === 'busy' || error?.code === 'cancelled')) return undefined
-      rt.warn('ds-bot: condensing %s failed: %s', agent.id, error)
+      if (error?.code !== SUMMARY_OVERFLOW) rt.warn('ds-bot: condensing %s failed: %s', agent.id, error)
       return false
     } finally {
       condensing.delete(sessionId)
@@ -977,7 +994,7 @@ export function install(rt) {
       rt.warn('ds-bot: handoff note for %s failed (%d in a row); part %d goes on, next try in %ds: %s', bot.name, count, number, wait / 1000, failure)
       return
     }
-    if (failure !== undefined) rt.warn('ds-bot: handoff note for %s failed past the hard line; moving on with the earlier note: %s', bot.name, failure)
+    if (failure !== undefined && failure.code !== SUMMARY_OVERFLOW) rt.warn('ds-bot: handoff note for %s failed past the hard line; moving on with the earlier note: %s', bot.name, failure)
     const previous = parts.at(-2)
     const noted = written !== undefined ? { note: written.note }
       : { fallback: whole ? 'whole' : job.failed !== undefined ? 'failure' : job.overflow ? 'overflow' : 'failed', ...(previous?.note ? { note: previous.note, noteFrom: previous.noteFrom ?? previous.number } : {}) }
