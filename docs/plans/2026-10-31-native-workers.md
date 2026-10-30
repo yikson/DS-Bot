@@ -43,8 +43,8 @@ execution:
 - A worker does not inherit the coordinator's context, Bot memory, Bot
   capabilities, or long-term identity. The coordinator must write a complete
   prompt.
-- A worker cannot call team tools, create tasks, message Bots, or control other
-  workers.
+- A worker cannot call team tools or DSH native delegation tools, create
+  tasks, message Bots, spawn helpers, or control other workers.
 - A worker's result returns only to the requesting task Session. It never wakes
   a Bot trunk directly.
 - A worker is short-lived. Its Session may be followed up a bounded number of
@@ -88,13 +88,26 @@ lineage, completion notices, and optional continuation. Native workers need a
 plain root Session owned by exactly one DS Bot task Session, exact routing back
 to that Session, DS Bot's task commit lane, and DS Bot's team-tool deny set.
 Using the subagent provider directly would add a second ownership and routing
-model.
+model. Workers deny the composed DSH delegation tools; the subagent package is
+comparison material only.
 
-The existing "DSH Agent" in `agents.js` also creates plain native Sessions and
-uses `tools.restrict`, but its restriction retry is asynchronous and can allow
-the first prompt before the deny lands. Native workers must not reuse that
-retry path. Worker setup completes and verifies the gate before the first
-prompt, or the worker fails closed without prompting.
+One helper, `applyNativeSessionToolGate(agent, { allow, deny })`, is shared by
+workers and the existing DSH Agent sessions. The helper:
+
+- requires the scoped tool runtime and a usable tool snapshot;
+- applies the requested `restrict` mask;
+- installs the matching execution-time guard;
+- verifies that every denied name is absent;
+- throws instead of scheduling a retry when any step is unavailable or
+  ambiguous.
+
+W1 uses this helper for worker setup and for DSH Agent create/adopt/resolve.
+The DSH Agent's asynchronous retry that can allow a first prompt before
+restriction lands is removed. A failed gate fails the create/adopt operation:
+a newly created Session is archived, and an adopted Session is left unowned.
+It never becomes a prompt-capable DSH Agent Session. Workers call the same
+helper after model, permission, and workdir setup and before their first
+prompt, and fail closed on any error.
 
 ## Tool surface
 
@@ -275,12 +288,11 @@ The selected route is applied with `selectSessionModel()` and verified before
 the first prompt. A worker never writes its route back to the Bot or another
 task Session.
 
-`mode: "verify"` should use a different model family when the deployment
-configures `verifierModel`. The current DSH model catalog exposes provider,
-model, and display metadata, but no generic model-family field. The design
-therefore uses `verifierModel` as the explicit family-separation mechanism and
-records a diagnostic when the verifier uses the same provider as the
-coordinator. Automatic family inference remains an open question.
+There is no model-family inference. `verifierModel` is explicit configuration.
+When it is set, verify mode uses it; when it is unset, verify mode uses
+`workerModel`. Verification independence therefore relies on the fresh worker
+Session and its read-only default, not on an inferred relationship between
+model names.
 
 ### Permissions
 
@@ -331,14 +343,13 @@ Setup is ordered and fail closed:
    prompt.
 7. Apply and verify the permission preset, model/effort, working directory,
    and absence of Bot identity, Bot capabilities, and memory review.
-8. Apply the team-tool deny:
-   - obtain the registered global tool names for this Agent;
-   - call `restrict({ deny })` for the intersection of those names and
-     `TEAM_TOOLS`;
-   - install a worker-scoped execution guard that denies every name in
-     `TEAM_TOOLS` plus every worker control tool, whether or not it is
-     currently visible;
-   - verify that none of those names is visible;
+8. Apply the shared native-session tool gate:
+   - build the worker deny set from `TEAM_TOOLS`, every worker control tool,
+     and every DSH native delegation tool, including shipped names and
+     configured aliases;
+   - call the shared `applyNativeSessionToolGate()` helper;
+   - let the helper apply `restrict` to the registered names, install the
+     execution guard for the complete deny set, and verify visibility;
    - extend the existing `plugin_manager` self-change guard so a worker is a
      managed Session.
 9. If any tool runtime is missing, any name cannot be denied, any gate is
@@ -630,9 +641,9 @@ Usage is attributed to the task, not to a fabricated worker Bot:
 - the task view must show token usage even when a worker never completed, and
   must distinguish unknown usage after an interrupted run.
 
-The current DS Bot usage ledger records tokens, not money. This design does not
-invent a currency conversion. It records and displays per-task token usage;
-adding monetary cost is a separate question.
+The current DS Bot usage ledger records tokens, not money. Tokens are the
+complete usage contract for this design. It records and displays per-task
+token usage and does not calculate or display monetary cost.
 
 Diagnostics record:
 
@@ -654,15 +665,16 @@ Diagnostics must not contain the full prompt, transcript, or credentials.
 3. Worker control tools exist only in eligible task-owned Sessions.
 4. A worker has no Bot identity, no Bot memory review, and no Bot
    capabilities.
-5. Every team tool and every worker control tool is denied before the first
-   worker prompt.
+5. Every team tool, every worker control tool, and every DSH native delegation
+   tool is denied before the first worker prompt.
 6. A worker also receives the existing `plugin_manager` self-change denial.
 7. The hard gate fails closed; it never allows a prompt while restriction is
    missing or unresolved.
 8. Model, effort, permission, workdir, and gate are applied and verified
    before every run.
 9. Worker permission never exceeds the requesting Bot's permission.
-10. A worker cannot create another worker or call team tools.
+10. A worker cannot create another worker, spawn a DSH subagent, or call team
+    tools.
 11. At most `maxWorkersPerTask` workers exist for a task.
 12. At most `maxWorkerFollowups` follow-ups exist for a worker.
 13. A worker has at most one active run.
@@ -690,8 +702,9 @@ The following is the implementation map, not a change made by this document.
 | Area | File and current symbols | Required change |
 |---|---|---|
 | Module order | `ds-bot/index.js` `MODULES` | Install the worker module after task routing, task lifecycle, folders, permissions, and models, and before tools restore their scoped surfaces |
-| Tool names | `ds-bot/src/host/constants.js` `TEAM_TOOLS` | Include the worker control tools in the deny set and add a test that every DS Bot model-facing tool is covered |
-| Worker runtime | `ds-bot/src/host/workers.js` (new) `install`, `runWorker`, `followupWorker`, `cancelWorker`, `settleRun`, `deliverResult`, `recoverWorkers`, `cancelTaskWorkers`, `archiveSettledWorkers` | Own worker records, creation intent, hard gate, turn listener, lifecycle, restart, and result delivery |
+| Tool names | `ds-bot/src/host/constants.js` `TEAM_TOOLS` | Add worker control names and a `DSH_DELEGATION_TOOLS` set covering shipped native delegation tools and configured aliases; test that every composed model-facing delegation tool is covered |
+| Shared gate | `ds-bot/src/host/native-gate.js` (new) `applyNativeSessionToolGate` | Apply, guard, and verify one restriction mask with no retry; used by both DSH Agent sessions and workers |
+| Worker runtime | `ds-bot/src/host/workers.js` (new) `install`, `runWorker`, `followupWorker`, `cancelWorker`, `settleRun`, `deliverResult`, `recoverWorkers`, `cancelTaskWorkers`, `archiveSettledWorkers` | Own worker records, creation intent, the shared tool gate, turn listener, lifecycle, restart, and result delivery |
 | Tools | `ds-bot/src/host/tools.js` `registerTaskTools`, `syncTaskTool`, `listTasks`, task tool registry | Register the three worker tools only in eligible task Sessions; extend `list_tasks`; extend the `plugin_manager` managed-Session predicate to worker Sessions |
 | Task validation | `ds-bot/src/host/tasks.js` `validateTask`, `commitTask` | Validate `task.workers`, worker/run identity, limits, and the narrow terminal settlement transitions |
 | Indexes | `ds-bot/src/host/store.js` `indexSessions`, `selfOf`, `isBotSession`, task maps | Add `workerById`/`workerBySession`, keep workers out of all Bot indexes, and expose lookup helpers |
@@ -700,14 +713,14 @@ The following is the implementation map, not a change made by this document.
 | Models | `ds-bot/src/host/models.js` `resolveModel`, `resolveEffort`, `selectSessionModel` | Resolve worker/verifier routes and apply them without changing the profile default or Bot record |
 | Permissions | `ds-bot/src/host/permissions.js` `permissionCatalog`, `applyPermission`, `checkPreset` | Add permission-within-Bot comparison and apply/read back the selected worker preset |
 | Folders | `ds-bot/src/host/folders.js` `cleanWorkDir`, `workFolder`, `approveFolder`, `sessionFolder` | Resolve the current task workdir, approval, create cwd, and Session-only worker directory changes |
-| Agent setup | `ds-bot/src/host/agents.js` `restrictTeamTools`, `agentOf` | Reuse the native Session lifecycle idea only. Do not call the asynchronous retry helper as the worker gate |
+| Agent setup | `ds-bot/src/host/agents.js` `restrictTeamTools`, `createAgentSession`, `adoptAgentSession`, `agentOf` | Replace the asynchronous retry with the shared gate; await it before create/adopt returns, during startup reconciliation, and before any prompt-capable DSH Agent Session is published |
 | Turn source | `ds-bot/src/host/turns.js` `turnInput`, session-event tracking | Recognize `worker-result` as private task input and never route it through `answerSender` |
 | Inbox/recovery | `ds-bot/src/host/parts.js`, `resume.js` inbox target, forwarding, resume paths | Keep worker results on next-turn delivery, preserve task scope, and restore exact result delivery after HMR/restart |
 | State view | `ds-bot/src/host/channel.js` `state`, `live.work.tasks` | Expose worker state, elapsed data, result state, and task usage |
 | Usage | `ds-bot/src/host/usage.js` `liveOwners`, `usageView` | Attribute worker Sessions to `task:<id>` and kind `worker` |
 | Task UI | `ds-bot/src/client/branch-dock.js` `TaskHeader`, `BRANCH_CSS` | Render worker rows in the task header only |
 | Message UI | `ds-bot/src/client/cells.js`, `sources.js`, `i18n.js` | Distinguish a worker-result source and add English/Chinese labels |
-| Tests | `ds-bot/test/workers.test.js` (new), `tasks.test.js`, `task-lifecycle.test.js`, `task-dock.test.js`, `self-maintenance.test.js` | Cover the cases below; rebuild `client.js` if the UI changes |
+| Tests | `ds-bot/test/workers.test.js` (new), `agents.test.js`, `tasks.test.js`, `task-lifecycle.test.js`, `task-dock.test.js`, `self-maintenance.test.js` | Cover the cases below, including the shared DSH Agent gate; rebuild `client.js` if the UI changes |
 
 The existing `client.js` remains generated. Any UI implementation changes
 `src/client/`, runs `npm run build`, and commits both files.
@@ -721,8 +734,8 @@ The existing `client.js` remains generated. Any UI implementation changes
 - `run_worker` returns immediately and never waits for a turn.
 - `maxWorkersPerTask`, `maxWorkerFollowups`, and all refusal paths are exact;
   refusals do not consume budget.
-- Model precedence, effort validation, verifier default, and invalid configured
-  routes.
+- Model precedence, effort validation, `verifierModel` with `workerModel`
+  fallback, no family inference, and invalid configured routes.
 - Permission precedence and comparison; verify defaults to read-only; full
   access requires the Bot's own full access and an explicit request.
 - A follow-up after the Bot lowers its permission clamps the worker and never
@@ -730,9 +743,12 @@ The existing `client.js` remains generated. Any UI implementation changes
 - Default workdir follows live task Session cd; explicit workdir checks
   realpath, guarded roots, and approval.
 - Hard-gate ordering: create, persist id, apply model/permission/workdir,
-  restrict/guard, verify, listener, then prompt. A restriction failure must
-  observe zero prompts.
-- Worker scope cannot see or execute team tools or worker control tools.
+  shared restrict/guard/verify helper, listener, then prompt. A restriction
+  failure must observe zero worker prompts.
+- The same helper gates DSH Agent create/adopt/resolve; a failure or ambiguity
+  must not publish a prompt-capable DSH Agent Session.
+- Worker scope cannot see or execute team tools, worker control tools, or DSH
+  native delegation tools.
 - `plugin_manager` self-change is denied in a worker Session.
 - `rpcId` correlation ignores a concurrent or unrelated turn.
 - Every terminal reason maps to the correct result state; only `completed`
@@ -748,7 +764,8 @@ The existing `client.js` remains generated. Any UI implementation changes
   outcome, and never prompts automatically.
 - HMR generations cannot save, enqueue, or mark delivered after stop.
 - Terminal worker bookkeeping cannot add workers, runs, or follow-ups.
-- Usage is attributed to `task:<id>`, not to a Bot.
+- Usage is token-only and attributed to `task:<id>`, not to a Bot; no monetary
+  cost is computed.
 
 ### Isolated integration
 
@@ -780,14 +797,15 @@ a live user profile.
    in the requesting task Session.
 2. A third `run_worker` is refused by `maxWorkersPerTask`, even after one of
    the first two becomes idle.
-3. An execute worker asks its model to call every team tool. No team tool is
-   visible or executable, and a prompt that tries anyway produces a denied
-   tool result rather than a team action.
+3. An execute worker asks its model to call every team tool, worker control
+   tool, and DSH native delegation tool. None is visible or executable, and a
+   prompt that tries anyway produces a denied tool result rather than a team
+   or subagent action.
 4. A fake setup failure after Session creation but before restriction results
    in no prompt, no model usage, and one bounded failure result.
-5. A verify worker defaults to read-only and a different configured
-   `verifierModel`; an explicit escalation beyond the Bot's permission is
-   refused.
+5. A verify worker defaults to read-only. It uses a configured `verifierModel`
+   when present and otherwise uses `workerModel`, with no family inference. An
+   explicit escalation beyond the Bot's permission is refused.
 6. The task Session changes directory after opening. A new worker inherits
    that current directory, not the original task folder.
 7. The first worker completes, receives one follow-up, and its result is
@@ -808,13 +826,16 @@ a live user profile.
 13. The task header lists worker state, elapsed time, and a working native
     Session link. The worker is absent from the Bot trunk dock and participant
     rows.
-14. The usage page and task view count worker tokens under the task; a worker
-    with an interrupted run is marked as having unknown usage rather than
-    zero.
+14. The usage page and task view count worker tokens under the task and show no
+    monetary cost; a worker with an interrupted run is marked as having
+    unknown usage rather than zero.
 15. A worker attempts `plugin_manager` changes for `ds-bot`; the execution
     guard refuses it.
 16. Turning `nativeWorkers` off stops new worker tools and creation while a
     worker-aware build still settles, cancels, and closes existing records.
+17. Creating or adopting a DSH Agent with the shared gate forced to fail
+    publishes no prompt-capable Session; a race that would otherwise allow a
+    first prompt observes zero prompts.
 
 ## Rollback
 
@@ -847,9 +868,14 @@ acceptance criteria pass.
 
 ### W1: model, tools, gate, and first result
 
+- Add the shared `applyNativeSessionToolGate()` helper and use it to replace
+  the DSH Agent's asynchronous restriction retry in create, adopt, and startup
+  reconciliation.
 - Add `workers.js`, worker data validation/indexes, `run_worker`, model and
-  permission setup, workdir handling, the hard gate, turn correlation, and
-  bounded result delivery.
+  permission setup, workdir handling, the shared hard gate, turn correlation,
+  and bounded result delivery.
+- Deny team tools, worker control tools, and DSH native delegation tools in
+  workers; workers never dispatch.
 - Enforce the absolute `maxWorkersPerTask` safety cap.
 - Add the `worker-result` source and query formatting to `list_tasks`.
 - Extend `plugin_manager` self-change management to workers.
@@ -858,7 +884,7 @@ acceptance criteria pass.
 Acceptance:
 
 - unit tests for setup, gate order, result truncation, exact routing, no trunk
-  wake, and no prompt after a gate failure pass;
+  wake, no prompt after a gate failure, and the DSH Agent gate pass;
 - the isolated mock smoke flow starts and completes one worker;
 - no Bot identity, memory review, or Bot capability is observable in the
   worker.
@@ -906,25 +932,6 @@ Acceptance:
 - no live user profile, private DSH data, or running Desktop is used in
   acceptance.
 
-## Open questions
-
-1. **Model family metadata.** DSH exposes provider and model identity but no
-   generic family field. Is provider identity the intended definition of
-   "different model family", or should DSH grow explicit family metadata?
-   Until decided, `verifierModel` is the explicit preference and the worker
-   records a same-provider diagnostic.
-2. **DSH Agent retrofit.** The existing DSH Agent retry can leave its first
-   prompt eligible before restriction lands. Native workers fail closed, but
-   should the DSH Agent feature be hardened in a separate issue using the same
-   awaited gate?
-3. **Monetary cost.** The current usage ledger counts tokens and has no price
-   field. Should a later costing slice add provider pricing to per-task usage,
-   or is token accounting the contract?
-4. **Native DSH delegation tools.** If the deployment composes DSH's own
-   `subagent` family, those tools are outside DS Bot's task routing. Should a
-   worker deny them as well to make "workers do not dispatch" absolute, or is
-   the DS Bot team-tool boundary sufficient?
-
 ## Known limits
 
 - A worker is a same-host Session and does not survive host exit.
@@ -934,6 +941,9 @@ Acceptance:
 - A worker cannot inherit Bot memory or capabilities by design.
 - The full transcript remains in the native Session and is not reproduced in
   `state.json`.
+- Verifier independence is configuration-based; the design does not infer a
+  model family.
+- Usage is token-only; no monetary cost is calculated or displayed.
 - Worker result delivery can start one model turn in the requesting task
   Session and consumes tokens.
 - A task's worker count is lifetime-bound; a task that needs more independent
