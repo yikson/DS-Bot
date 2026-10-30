@@ -585,6 +585,14 @@ export function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnCl
 
   function triggerBody() {
     if (source.kind === 'bot') {
+      if (source.role === 'task-conclusion') {
+        const task = roster.tasks?.find(task => task.id === source.taskId)
+        const sessionId = task?.sessions?.[task.requester]
+        return h('div', { className: 'bt-branch-summary' },
+          h('strong', null, t('Task closed')),
+          h('div', null, stripHeader(contentText(data.content))),
+          sessionId ? h('button', { type: 'button', className: 'bt-mini', onClick: () => actions.openBranch(sessionId) }, t('Open task')) : null)
+      }
       if (source.role === 'branch-summary') {
         const branch = Object.values(roster.byId[selfId]?.workBranches ?? {}).find(item => item.summaryId === source.exchangeId)
         return h('div', { className: 'bt-branch-summary' },
@@ -592,6 +600,11 @@ export function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnCl
           h('div', null, stripHeader(contentText(data.content))),
           branch ? h('button', { type: 'button', className: 'bt-mini', onClick: () => actions.openBranch(branch.sessionId) },
             `${t('Open branch')} · ${elapsedLabel(branch.closedAt - branch.openedAt)}`) : null)
+      }
+      if (source.taskId && roster.taskSessions?.[sessionId]) {
+        return h('div', { className: 'bt-branch-summary' },
+          h('strong', null, `${t(source.role === 'reply' ? 'Reply from' : 'Message from')} ${source.senderName ?? t('a Bot')}`),
+          h('div', null, stripHeader(contentText(data.content))))
       }
       // A part opens with its handoff package, so the earlier parts go right above it.
       if (source.handoff === true) return roster.roomsById[sessionId] ? null : h(EarlierParts, { sessionId, roster, actions })

@@ -5,6 +5,16 @@
 export const NAMESPACE = 'ds-bot'
 
 const ZH = {
+  Tasks: '任务',
+  'Task closed': '任务已关闭',
+  'Open task': '打开任务',
+  'Task Session': '任务会话',
+  'Main chat': '主聊天',
+  'Late results': '迟到结果',
+  done: '已完成',
+  blocked: '已阻塞',
+  cancelled: '已取消',
+  failed: '已失败',
   'Work branches': '任务分支',
   'Work branch closed': '任务已闭合',
   'Open branch': '打开分支',

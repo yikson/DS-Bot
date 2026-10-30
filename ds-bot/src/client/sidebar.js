@@ -595,7 +595,7 @@ function useLandOnMainBot(roster, useSessions, actions) {
     if (bot !== undefined) {
       lastBot.current = { botId: bot.id, sessionId: id }
       // A work branch keeps the view: the dock opens it, and a closed branch stays readable.
-      if (currentPart(bot) !== id && !isWorkBranch(bot, id)) actions.landOn(bot.id)
+      if (currentPart(bot) !== id && !isWorkBranch(bot, id) && !roster.taskSessions?.[id]) actions.landOn(bot.id)
       return undefined
     }
     // A DSH Agent Session, blank or not, is a real destination: it stays.

@@ -65,6 +65,7 @@ export function install(rt) {
     sideChats: rt.sideView?.() ?? {},
     // The team's DSH Agent (at most one): plain dsh Sessions, not Bots.
     agents: Object.values(state.agents),
+    ...(rt.taskById.size ? { tasks: [...rt.taskById.values()] } : {}),
     // Key names and who may use them; values never leave the host.
     secrets: rt.secretsView(),
     capabilities: rt.capabilityLibraryView(),
@@ -90,6 +91,11 @@ export function install(rt) {
   const live = () => ({
     activity: rt.activityView(),
     work: { bots: rt.workView(), rooms: rt.roomWorkView(), approvals: rt.approvalsView(), waiting: rt.waitingView?.() ?? {}, turns: rt.turnsView?.() ?? {}, steered: rt.steeredView?.() ?? {},
+      ...(rt.taskById.size ? { tasks: Object.fromEntries([...rt.taskById.values()].map(task => [task.id, {
+        state: task.state, lateCount: task.lateReplies.count, delivery: task.delivery?.state,
+        status: task.state !== 'open' ? task.state : Object.values(task.sessions).some(id => rt.live.get(id)?.turn !== undefined && rt.taskOfTurn(id) === task.id)
+          ? 'Working' : Object.values(state.works ?? {}).some(work => work.taskId === task.id) ? 'Waiting' : 'Needs close',
+      }])) } : {}),
       branches: Object.fromEntries(Object.values(state.bots).flatMap(bot => Object.values(bot.workBranches ?? {}).filter(branch => branch.sessionId).map(branch => [branch.sessionId,
         Object.values(state.works ?? {}).some(work => work.pendingAnswer?.failed
           && (work.sessionId === branch.sessionId || work.replySessionId === branch.sessionId)) ? 'Delivery failed; retry pending'
@@ -424,6 +430,8 @@ export function install(rt) {
           // A Bot id or an earlier part of its own chat means the current part.
           const past = rt.pastOwners.get(body.sessionId)
           const sessionId = rt.botOf(body.sessionId) ? rt.chatOf(body.sessionId) : past && past.roomId === undefined ? rt.chatOf(past.botId) : body.sessionId
+          const task = rt.taskForSession(sessionId)
+          if (task && task.phase !== 'ready') return fail('Task Session setup is incomplete; its history remains readable', 'bot/not-ready')
           await rt.ensureCapabilities(sessionId)
           await ctx.sessionController.prompt({
             requestId: randomUUID(),

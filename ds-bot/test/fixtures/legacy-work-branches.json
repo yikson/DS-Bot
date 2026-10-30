@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "mainBotIds": ["a"],
+  "bots": {
+    "a": {
+      "id": "a", "name": "ADA", "sessionId": "a", "createdAt": 1,
+      "workBranches": {
+        "br-open": {
+          "id": "br-open", "sessionId": "sess-open", "trunkSessionId": "a", "targetBotId": "b",
+          "title": "Check the pack", "brief": "Check the pack", "workIds": ["br-open"],
+          "state": "open", "openedAt": 1000, "inheritedThrough": 7
+        },
+        "br-other": {
+          "id": "br-other", "sessionId": "sess-other", "trunkSessionId": "a", "targetBotId": "b",
+          "title": "Another pack", "brief": "Another pack", "workIds": ["br-other"],
+          "state": "open", "openedAt": 1100, "inheritedThrough": 7
+        },
+        "br-closed": {
+          "id": "br-closed", "sessionId": "sess-closed", "trunkSessionId": "a", "targetBotId": "b",
+          "title": "Old task", "brief": "Old task", "workIds": ["br-closed"], "state": "closed",
+          "openedAt": 500, "inheritedThrough": 3, "closedAt": 900,
+          "summaryId": "br-closed:closed", "summaryDelivered": true,
+          "conclusion": { "status": "done", "text": "[Work branch closed] Old task\nBranch: br-closed\nStatus: done\nConclusion: ok\nLink: none" }
+        },
+        "br-failed": {
+          "id": "br-failed", "trunkSessionId": "a", "targetBotId": "b",
+          "title": "Never forked", "brief": "x", "workIds": [], "state": "failed", "openedAt": 400
+        }
+      }
+    },
+    "b": { "id": "b", "name": "Cardpack", "sessionId": "b", "createdAt": 1 },
+    "c": { "id": "c", "name": "Other", "sessionId": "c", "createdAt": 1 }
+  },
+  "rooms": {},
+  "exchanges": [],
+  "works": {
+    "br-open": { "from": "b", "to": "a", "open": [], "results": [], "at": 1000 },
+    "br-other": { "from": "a", "to": "b", "open": [], "results": [], "at": 1100 }
+  }
+}

@@ -3,6 +3,8 @@
 // set one preset for all its members there, in place of each member's own, as it may
 // set one working folder.
 // DSH offers Auto review for the current Session only, so neither a Bot nor a group keeps it.
+import { asyncScope } from './async.js'
+
 const SESSION_ONLY = 'auto'
 
 export function install(rt) {
@@ -22,6 +24,7 @@ export function install(rt) {
 
   async function setPreset(sessionId, name) {
     const agent = await rt.resolveAgent(sessionId)
+    if (rt.taskOwners?.has(sessionId) && asyncScope(rt).stopped) throw new Error('Task permission setup stopped')
     presets().set(agent.session, name)
   }
 
@@ -45,6 +48,7 @@ export function install(rt) {
   async function setPermission(bot, name) {
     const wanted = checkPreset(name, 'a Bot\'s')
     await applyPermission({ ...bot, permission: wanted }, rt.chatOf(bot.id))
+    for (const sessionId of rt.taskSessionsOf(bot.id)) await applyPermission({ ...bot, permission: wanted }, sessionId)
     bot.permission = wanted
     for (const sessionId of [...rt.groupSessionsOf(bot.id), ...Object.values(bot.workBranches ?? {}).map(branch => branch.sessionId).filter(Boolean)]) {
       if (roomOfSession(sessionId)?.permission) continue

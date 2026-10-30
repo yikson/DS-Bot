@@ -101,6 +101,24 @@ test('packs expand only to MCP and skill items', () => {
   assert.throws(() => expandCapabilityNames(['bad'], { ...items, bad: { kind: 'pack', items: ['team'] } }), /unavailable capability/)
 })
 
+for (const outcome of ['ready', 'error', 'needs-approval', 'timeout']) {
+  test(`required Session capability setup fails closed unless ready: ${outcome}`, async t => {
+    const env = await setup()
+    t.after(() => env.dispose())
+    await env.rt.capabilitySave(mcp('echo'), { botId: 'chief' })
+    if (outcome !== 'needs-approval') await env.rt.capabilityEndpoint('capability-approve', { name: 'echo' })
+    env.rt.state.bots.chief.capabilities = ['echo']
+    const agent = testAgent('chief', env.mounts, env.skills, { awaitMount: async () => {
+      if (outcome === 'error') throw new Error('mount failed')
+      if (outcome === 'timeout') await new Promise(() => {})
+    } })
+    env.rt.resolveAgent = async () => agent
+    env.rt.capabilityEnsureTimeoutMs = 5
+    if (outcome === 'ready') await env.rt.ensureCapabilities('chief', { required: true })
+    else await assert.rejects(env.rt.ensureCapabilities('chief', { required: true }), /capabilities are not ready/)
+  })
+}
+
 test('state migration adds an empty library and Bot attachment lists', async t => {
   const old = team()
   delete old.capabilities

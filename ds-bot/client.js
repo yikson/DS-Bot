@@ -42,6 +42,16 @@ module.exports = __toCommonJS(index_exports);
 // src/client/i18n.js
 var NAMESPACE = "ds-bot";
 var ZH = {
+  Tasks: "任务",
+  "Task closed": "任务已关闭",
+  "Open task": "打开任务",
+  "Task Session": "任务会话",
+  "Main chat": "主聊天",
+  "Late results": "迟到结果",
+  done: "已完成",
+  blocked: "已阻塞",
+  cancelled: "已取消",
+  failed: "已失败",
   "Work branches": "任务分支",
   "Work branch closed": "任务已闭合",
   "Open branch": "打开分支",
@@ -1500,11 +1510,20 @@ function createSource(initial) {
 }
 var EMPTY_ROSTER = { revision: -1, mainBotId: null, mainBotIds: [], bots: [], rooms: [], agents: [], exchangeTurns: {}, questions: {}, btwCards: {}, sideChats: {}, secrets: [], capabilities: [], capabilityStatuses: {}, secretRequests: {}, models: [], defaultModel: null, modelsKey: null, prefs: {}, byId: {}, roomsById: {}, agentsById: {}, agentOf: {}, ready: false };
 var isMainOf = (roster, id) => id !== void 0 && (roster.mainBotIds ?? []).includes(id);
+var conversationTarget = (roster, id) => roster.taskSessions?.[id] ? id : roster.byId[id]?.sessionId ?? roster.byId[id]?.id ?? id;
 function indexRoster(value) {
   const byId = {};
   for (const bot of value.bots) {
     for (const id of [...bot.parts ?? [], bot.sessionId ?? bot.id, bot.id]) byId[id] = bot;
     for (const branch of Object.values(bot.workBranches ?? {})) if (branch.sessionId) byId[branch.sessionId] = bot;
+  }
+  const taskSessions = {};
+  for (const task of value.tasks ?? []) {
+    for (const [botId, sessionId] of Object.entries(task.sessions)) {
+      if (task.participants[botId].kind === "trunk") continue;
+      taskSessions[sessionId] = task.id;
+      if (byId[botId]) byId[sessionId] = byId[botId];
+    }
   }
   const roomsById = {};
   for (const room2 of value.rooms) roomsById[room2.id] = room2;
@@ -1514,7 +1533,7 @@ function indexRoster(value) {
     agentsById[agent.id] = agent;
     for (const sessionId of agent.sessions ?? []) agentOf[sessionId] = agent.id;
   }
-  return { ...value, agents: value.agents ?? [], byId, roomsById, agentsById, agentOf, ready: true };
+  return { ...value, tasks: value.tasks ?? [], taskSessions, agents: value.agents ?? [], byId, roomsById, agentsById, agentOf, ready: true };
 }
 function isAgentSession(roster, cache, sessionId) {
   if (sessionId === void 0 || sessionId === null || sessionId === "") return false;
@@ -2008,6 +2027,7 @@ function summaryBlocks(text) {
 }
 function isHiddenTurn(roster, sessionId, turn) {
   if (sessionId === void 0 || turn === void 0) return false;
+  if (roster.taskSessions?.[sessionId]) return false;
   return (roster.exchangeTurns[sessionId] ?? []).includes(turn);
 }
 var toolName = (root) => root.name || root.call?.name;
@@ -7838,6 +7858,17 @@ function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnClock, us
   return unreadOpening ? (0, import_react13.createElement)(import_react13.Fragment, null, (0, import_react13.createElement)("div", { className: "bt-open-new" }, (0, import_react13.createElement)(NewDivider), (0, import_react13.createElement)("div", { className: "bt-time-sep", role: "separator" }, unreadOpening)), body) : body;
   function triggerBody() {
     if (source.kind === "bot") {
+      if (source.role === "task-conclusion") {
+        const task = roster.tasks?.find((task2) => task2.id === source.taskId);
+        const sessionId2 = task?.sessions?.[task.requester];
+        return (0, import_react13.createElement)(
+          "div",
+          { className: "bt-branch-summary" },
+          (0, import_react13.createElement)("strong", null, t("Task closed")),
+          (0, import_react13.createElement)("div", null, stripHeader(contentText(data.content))),
+          sessionId2 ? (0, import_react13.createElement)("button", { type: "button", className: "bt-mini", onClick: () => actions.openBranch(sessionId2) }, t("Open task")) : null
+        );
+      }
       if (source.role === "branch-summary") {
         const branch = Object.values(roster.byId[selfId]?.workBranches ?? {}).find((item) => item.summaryId === source.exchangeId);
         return (0, import_react13.createElement)(
@@ -7850,6 +7881,14 @@ function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnClock, us
             { type: "button", className: "bt-mini", onClick: () => actions.openBranch(branch.sessionId) },
             `${t("Open branch")} · ${elapsedLabel(branch.closedAt - branch.openedAt)}`
           ) : null
+        );
+      }
+      if (source.taskId && roster.taskSessions?.[sessionId]) {
+        return (0, import_react13.createElement)(
+          "div",
+          { className: "bt-branch-summary" },
+          (0, import_react13.createElement)("strong", null, `${t(source.role === "reply" ? "Reply from" : "Message from")} ${source.senderName ?? t("a Bot")}`),
+          (0, import_react13.createElement)("div", null, stripHeader(contentText(data.content)))
         );
       }
       if (source.handoff === true) return roster.roomsById[sessionId] ? null : (0, import_react13.createElement)(EarlierParts, { sessionId, roster, actions });
@@ -9243,7 +9282,7 @@ function useLandOnMainBot(roster, useSessions, actions) {
     const bot = id === "" ? void 0 : roster.byId[id];
     if (bot !== void 0) {
       lastBot.current = { botId: bot.id, sessionId: id };
-      if (currentPart(bot) !== id && !isWorkBranch(bot, id)) actions.landOn(bot.id);
+      if (currentPart(bot) !== id && !isWorkBranch(bot, id) && !roster.taskSessions?.[id]) actions.landOn(bot.id);
       return void 0;
     }
     if (id !== "" && (roster.roomsById[id] || (actions.isAgentSession?.(id) ?? roster.agentOf[id] !== void 0) || blank3 !== "1")) {
@@ -9724,6 +9763,11 @@ function ComposerPlus({ sessionId, inputActions, useRoster, actions }) {
       window.removeEventListener("keydown", onKey, true);
     };
   }, [open]);
+  const place = (0, import_react17.useMemo)(() => {
+    if (!shown || !button.current) return null;
+    const rect = button.current.getBoundingClientRect();
+    return { left: rect.left, bottom: viewBottom() - rect.top + 8 };
+  }, [shown, open, tick]);
   const target = roster.byId?.[sessionId]?.id ?? roster.roomsById?.[sessionId]?.id;
   if (sessionId === void 0 || target === void 0) return null;
   const fileInput = () => button.current?.closest("[data-composer-card]")?.querySelector("input[type=file]");
@@ -9747,11 +9791,6 @@ function ComposerPlus({ sessionId, inputActions, useRoster, actions }) {
     actions.referenceChat(sessionId, inputActions?.captureInsertion?.());
   };
   const canReference = typeof inputActions?.captureInsertion === "function" && actions.canReferenceChat();
-  const place = (0, import_react17.useMemo)(() => {
-    if (!shown || !button.current) return null;
-    const rect = button.current.getBoundingClientRect();
-    return { left: rect.left, bottom: viewBottom() - rect.top + 8 };
-  }, [shown, open, tick]);
   return (0, import_react17.createElement)(
     import_react17.Fragment,
     null,
@@ -19183,8 +19222,36 @@ function BranchDock({ sessionId, useRoster, useWork, actions }) {
   const bot = roster.byId[sessionId];
   if (!bot || sessionId !== (bot.sessionId ?? bot.id)) return null;
   const branches = Object.values(bot.workBranches ?? {}).filter((branch) => branch.state !== "closed");
-  if (!branches.length) return null;
-  return (0, import_react47.createElement)("div", { className: "bt-branch-dock", "aria-label": t("Work branches") }, branches.map((branch) => {
+  const tasks = (roster.tasks ?? []).filter((task) => task.participants[bot.id] && (task.state === "open" || task.lateReplies.count > 0));
+  if (!branches.length && !tasks.length) return null;
+  return (0, import_react47.createElement)("div", { className: "bt-branch-dock", "aria-label": t("Tasks") }, ...tasks.map((task) => {
+    const participant = task.participants[bot.id];
+    const endpoint = participant.kind === "trunk" ? bot.sessionId ?? bot.id : task.sessions[bot.id];
+    const status = work.tasks?.[task.id]?.status ?? (task.state === "open" ? task.phase === "ready" ? "Needs close" : "Creating" : task.state);
+    const target = roster.byId[task.requester === bot.id ? task.assignee : task.requester];
+    const suffix = participant.kind === "trunk" ? t("Main chat") : t("Task Session");
+    return (0, import_react47.createElement)(
+      "button",
+      {
+        key: task.id,
+        type: "button",
+        className: "bt-mw-pill",
+        disabled: !endpoint || task.phase !== "ready",
+        "aria-label": `${t("Open task")}: ${task.title}`,
+        onClick: () => actions.openBranch(endpoint),
+        title: `${task.id}
+${task.title}
+${endpoint ?? t("Creating")}`
+      },
+      (0, import_react47.createElement)(
+        "span",
+        { className: "bt-mw-pill-in" },
+        target ? (0, import_react47.createElement)(BotMark, { bot: target, size: 24 }) : null,
+        (0, import_react47.createElement)("span", { className: "bt-branch-label" }, `${task.title} · ${t(status)} · ${suffix}${task.lateReplies.count ? ` · ${t("Late results")}: ${task.lateReplies.count}` : ""}`),
+        (0, import_react47.createElement)(Elapsed, { at: task.openedAt })
+      )
+    );
+  }), ...branches.map((branch) => {
     const target = roster.byId[branch.targetBotId];
     const status = branch.state === "open" ? work.branches?.[branch.sessionId] ?? "Needs close" : branch.state === "failed" ? "Failed" : "Creating";
     return (0, import_react47.createElement)(
@@ -19553,10 +19620,7 @@ function apply(ctx) {
     });
     return value;
   });
-  const partFor = (id) => {
-    const bot = roster.getSnapshot().byId[id];
-    return bot ? currentPart(bot) : id;
-  };
+  const partFor = (id) => conversationTarget(roster.getSnapshot(), id);
   const agentSessions = (agentId) => {
     const ids = [...roster.getSnapshot().agentsById[agentId]?.sessions ?? []];
     for (const [id, owner] of pendingAdopt) if (owner === agentId && !ids.includes(id)) ids.push(id);

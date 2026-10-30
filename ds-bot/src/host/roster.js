@@ -78,7 +78,7 @@ export function install(rt) {
 
   // `dir` is a working folder outside the team workspace. Such a Session is made by cwd
   // alone, so it joins no DSH workspace and the user's own project lists stay as they are.
-  async function createSession(title, { dir } = {}) {
+  async function createSession(title, { dir, onCreated } = {}) {
     // A Bot's tools run here too; while another dsh holds the team, a new Session would
     // belong to no saved Bot.
     const readOnly = rt.readOnly()
@@ -86,8 +86,12 @@ export function install(rt) {
     const usable = dir !== undefined && await rt.isFolder(dir)
     if (dir !== undefined && !usable) rt.warn('ds-bot: the working folder %s is gone; %s starts in the team workspace', dir, title)
     const place = usable ? { cwd: dir } : { workspaceId: await ensureWorkspace() }
-    const { sessionId } = await ctx.sessionController.create({ ...place, ...await botPreset() })
+    const preset = await botPreset()
+    if (onCreated && safe.stopped) throw new Error('Task Session creation stopped')
+    const { sessionId } = await ctx.sessionController.create({ ...place, ...preset })
+    if (onCreated) await onCreated(sessionId)
     const agent = await rt.resolveAgent(sessionId)
+    if (onCreated && safe.stopped) throw new Error('Task Session setup stopped')
     await ctx.sessionTitle.rename(agent.session, title)
     return sessionId
   }
@@ -613,12 +617,14 @@ export function install(rt) {
     const bot = rt.botOf(id)
     if (bot === undefined) throw new Error('Unknown Bot')
     if (rt.isMain(id)) throw new Error('A Main Bot cannot be deleted; remove its Main Bot role first')
+    await rt.removeTaskBot?.(id)
     // Before the Bot and its group Sessions leave the state, which the archive reads.
     const archived = rt.archiveBotMemory(id)
     const current = rt.chatOf(id)
     // Session state and armed tasks belong to branches too, including closed ones.
     const parts = new Set([id, current, ...(bot.segments ?? []).map(segment => segment.sessionId),
-      ...Object.values(bot.workBranches ?? {}).map(branch => branch.sessionId).filter(Boolean)])
+      ...Object.values(bot.workBranches ?? {}).map(branch => branch.sessionId).filter(Boolean),
+      ...[...rt.taskOwners].filter(([, owner]) => owner.botId === id).map(([sessionId]) => sessionId)])
     await rt.releaseBot(id, [...parts, ...rt.groupSessionsOf(id)])
     delete state.bots[id]
     for (const part of parts) {

@@ -60,7 +60,11 @@ async function setup(t, { enabled = true, seed, logs = new Map(), notes } = {}) 
   const rt = createRuntime(ctx, { home, memory: false, workBranches: enabled ? [['ADA', 'Cardpack']] : [] })
   await rt.load()
   const tool = (name, args, id = 'a') => ctx.registeredTools.get(name).execute(args, { agent: agentOf(id) })
-  const send = (message = 'Check the pack', id = 'a', extra = {}) => tool('message_bot', { to: id === 'b' ? 'ADA' : 'Cardpack', message, ...extra }, id)
+  const send = (message = 'Check the pack', id = 'a', extra = {}) => tool('message_bot', {
+    to: id === 'b' ? 'ADA' : 'Cardpack', message,
+    ...(rt.config.workBranches.length && !rt.branchOf(id) && !rt.relatedBranch(id, id === 'b' ? 'a' : 'b') ? { work: 'new' } : {}),
+    ...extra,
+  }, id)
   const branches = () => Object.values(rt.state.bots.a.workBranches ?? {})
   const status = async () => {
     const response = await api.fetch(new Request('http://localhost/api/bot', {
@@ -204,7 +208,7 @@ test('close delivers exactly one conclusion of at most 1000 Unicode code points'
   await assert.rejects(f.tool('close_work_branch', { status: 'done', conclusion: 'no' }, 'a'), /Only a work branch/)
 })
 
-test('closed but undelivered summary is recovered once on restart', async t => {
+test('closed legacy branch with an undelivered summary stays display-only on restart', async t => {
   const f = await setup(t)
   await f.send()
   const branch = f.branches()[0]
@@ -215,8 +219,8 @@ test('closed but undelivered summary is recovered once on restart', async t => {
   const restarted = await setup(t, { enabled: false, seed, logs: f.logs })
   await restarted.rt.resumeAll()
   await restarted.rt.resumeAll()
-  assert.equal(restarted.agentOf('a').calls.length, 1)
-  assert.equal(restarted.branches()[0].summaryDelivered, true)
+  assert.equal(restarted.agentOf('a').calls.length, 0)
+  assert.equal(restarted.branches()[0].summaryDelivered, false)
 })
 
 test('summary persisted in inbox before its flag is recovered without a second delivery', async t => {
@@ -228,7 +232,7 @@ test('summary persisted in inbox before its flag is recovered without a second d
   const restarted = await setup(t, { enabled: false, seed: structuredClone(f.rt.state), logs: f.logs })
   await restarted.rt.resumeAll()
   assert.equal(restarted.agentOf('a').calls.length, 0)
-  assert.equal(restarted.branches()[0].summaryDelivered, true)
+  assert.equal(restarted.branches()[0].summaryDelivered, false)
 })
 
 test('turn answer is persisted before delivery and closed only after flush, with restart recovery', async t => {
@@ -533,7 +537,7 @@ test('trunk: close once', async t => {
   assert.equal(f.agentOf('a-next').calls[0].source.exchangeId, branch.summaryId)
 })
 
-test('trunk: recover once', async t => {
+test('closed legacy summary is not sent to a rotated trunk during recovery', async t => {
   const f = await setup(t)
   await f.send()
   f.rt.deliver = async () => { throw new Error('offline') }
@@ -544,7 +548,7 @@ test('trunk: recover once', async t => {
   await restarted.rt.resumeAll()
   await restarted.rt.resumeAll()
   assert.equal(restarted.agentOf('a').calls.length, 0)
-  assert.equal(restarted.agentOf('a-next').calls.length, 1)
+  assert.equal(restarted.agentOf('a-next').calls.length, 0)
 })
 
 test('trunks: deduplicate', async t => {
@@ -568,17 +572,17 @@ test('trunks: deduplicate', async t => {
       const restarted = await setup(t, { enabled: false, seed: structuredClone(f.rt.state), logs: f.logs })
       await restarted.rt.resumeAll()
       assert.equal(restarted.agentOf('a').calls.length + restarted.agentOf('a-next').calls.length, 0)
-      assert.equal(restarted.branches()[0].summaryDelivered, true)
+      assert.equal(restarted.branches()[0].summaryDelivered, false)
     })
   }
 })
 
-test('inbound: reuse one', async t => {
+test('inbound: explicitly select one legacy branch', async t => {
   const f = await setup(t)
   await f.send('Task one')
   const branch = f.branches()[0]
   f.rt.live.set('b', { info: { role: 'request', senderSessionId: 'c', exchangeId: 'unrelated' } })
-  await f.send('Clarify the requirement', 'b')
+  await f.send('Clarify the requirement', 'b', { work: branch.id })
   assert.equal(f.forks.length, 1)
   assert.equal(f.agentOf(branch.sessionId).calls.length, 1)
   assert.equal(f.agentOf('a').calls.length, 0)
@@ -586,17 +590,12 @@ test('inbound: reuse one', async t => {
   assert.match(f.agentOf('b').calls.at(-1).content[0].text, /Details$/)
 })
 
-test('inbound: require work', async t => {
+test('inbound root without selector uses trunk even with multiple open legacy branches', async t => {
   const f = await setup(t)
   await f.send('Task one')
   await f.send('Task two')
-  await assert.rejects(f.send('Clarify', 'b'), error => {
-    for (const branch of f.branches()) {
-      assert.ok(error.message.includes(branch.id))
-      assert.ok(error.message.includes(branch.title))
-    }
-    return /Specify message_bot work/.test(error.message)
-  })
+  await f.tool('message_bot', { to: 'ADA', message: 'Clarify' }, 'b')
+  assert.equal(f.agentOf('a').calls.length, 1)
   assert.equal(f.forks.length, 2)
   for (const branch of f.branches()) assert.equal(f.agentOf(branch.sessionId).calls.length, 0)
 })
@@ -626,12 +625,11 @@ test('work id: select/replay', async t => {
   await assert.rejects(f.send('Clarify', 'b', { work: 'missing' }), /Specify message_bot work/)
 })
 
-test('work: ignored if off', async t => {
+test('explicit legacy selectors require a configured pair or saved branch', async t => {
   const f = await setup(t, { enabled: false })
-  const receipt = await f.send('Normal request', 'b', { work: 'new', request_id: 'normal' })
-  assert.equal(await f.send('Normal request', 'b', { work: 'ignored-id', request_id: 'normal' }), receipt)
-  assert.equal(f.agentOf('a').calls.length, 1)
-  assert.equal(f.agentOf('a').calls[0].source.replySessionId, undefined)
+  await assert.rejects(f.send('Normal request', 'b', { work: 'new' }), /No configured legacy/)
+  await assert.rejects(f.send('Normal request', 'b', { work: 'missing' }), /No configured legacy/)
+  assert.equal(f.agentOf('a').calls.length, 0)
   assert.equal(f.forks.length, 0)
 })
 

@@ -9,6 +9,8 @@ import { within } from './folders.js'
 import { absoluteLinks } from './links.js'
 import { NAME_MAX } from './requests.js'
 import { unquote } from './text.js'
+import { taskBrief } from './task-routing.js'
+import { deliveryId } from './delivery-id.js'
 import { SELF_UPDATE_REFUSAL } from './update.js'
 import { mentionSpans } from '../shared/mentions.js'
 import { checkShownView } from '../shared/views.js'
@@ -137,11 +139,53 @@ export function install(rt) {
     },
   }))
 
+  const listTasks = defineTool({
+    name: 'list_tasks',
+    description: 'List your open tasks with their ids, titles and participant endpoints.',
+    parameters: {},
+    output,
+    async execute(_args, exec) {
+      await rt.load()
+      const self = rt.taskOwners.get(exec.agent?.id)?.botId ?? rt.selfOf(exec.agent?.id)
+      const tasks = self === undefined ? [] : rt.openTasksOf(self)
+      if (tasks.length === 0) return 'No open tasks.'
+      return tasks.map(task => [
+        `- ${task.id} — ${task.title} (${task.state}; ${task.phase})`,
+        ...Object.entries(task.participants).map(([botId, participant]) =>
+          `  ${rt.botOf(botId)?.name ?? botId}: ${participant.role}, ${participant.kind}, ${task.sessions[botId] ?? 'not created'}`),
+      ].join('\n')).join('\n')
+    },
+  })
+  // Scoped registration keeps the flag-off global tool list byte-for-byte unchanged.
+  const taskToolAgents = new Map()
+  const syncTaskTool = (agent) => {
+    const self = rt.taskOwners.get(agent.session?.id)?.botId ?? rt.selfOf(agent.session?.id)
+    const eligible = rt.botOf(self) !== undefined
+      && ((rt.config.taskSessionsEnabled === true && rt.taskCapabilities().has(self))
+        || [...rt.taskById.values()].some(task => Object.hasOwn(task.participants, self)))
+    const dispose = taskToolAgents.get(agent)
+    const task = rt.taskForSession(agent.session?.id)
+    const closer = rt.botOf(self) !== undefined && (task?.requester === self && task !== undefined || rt.branchOf(agent.session?.id))
+    const mode = `${eligible ? 1 : 0}:${closer ? 1 : 0}`
+    if (dispose?.mode === mode) return
+    dispose?.()
+    const stops = []
+    if (eligible) stops.push(agent.ctx.tools.register(listTasks), agent.ctx.tools.register(taskMessageBot))
+    if (closer) stops.push(agent.ctx.tools.register(closeTaskTool))
+    taskToolAgents.set(agent, stops.length ? Object.assign(() => stops.forEach(stop => stop()), { mode }) : undefined)
+  }
+  rt.syncTaskTools = () => { for (const agent of taskToolAgents.keys()) syncTaskTool(agent) }
+  safe.effect(() => () => {
+    for (const dispose of taskToolAgents.values()) dispose?.()
+    taskToolAgents.clear()
+  }, 'ds-bot: task tools')
+
   // Sessions a Bot is running in right now, including its open work branches.
   const activeSessions = (botId) => {
     const branches = Object.values(rt.botOf(botId)?.workBranches ?? {})
       .filter(branch => branch.state === 'open').map(branch => branch.sessionId).filter(Boolean)
-    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId), ...branches])]
+    const tasks = [...rt.taskOwners].filter(([, owner]) => owner.botId === botId).map(([sessionId]) => sessionId)
+    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId), ...branches, ...tasks])]
       .filter(sessionId => rt.live.get(sessionId)?.turn !== undefined)
     return { running, idle: running.length === 0 }
   }
@@ -156,7 +200,8 @@ export function install(rt) {
     for (const message of [...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])]) {
       const source = message.source
       if (source?.kind === SOURCE_KIND && source.role === 'request' && source.senderSessionId === senderId
-        && (source.audience === 'user') === toUser && !source.deferred && !source.resumed) return { message }
+        && (source.audience === 'user') === toUser && !source.deferred && !source.resumed
+        && deliveryId(source) === source.exchangeId) return { message }
     }
     return undefined
   }
@@ -164,7 +209,11 @@ export function install(rt) {
   const bodyOf = (message) => {
     const content = Array.isArray(message.content) ? message.content : []
     const first = content.find(block => block?.type === 'text')?.text ?? ''
-    return { text: first.slice(first.indexOf('\n') + 1), files: content.filter(block => block?.type === 'file' && block.attachment !== undefined).map(block => block.attachment) }
+    let text = first.slice(first.indexOf('\n') + 1)
+    const task = message.source?.taskId && rt.taskOf(message.source.taskId)
+    const prefix = task && `${taskBrief(task)}\n`
+    if (prefix && text.startsWith(prefix)) text = text.slice(prefix.length)
+    return { text, files: content.filter(block => block?.type === 'file' && block.attachment !== undefined).map(block => block.attachment) }
   }
 
   // A tool that throws shows as failed in the chat, instead of as sent or stopped.
@@ -197,7 +246,7 @@ export function install(rt) {
   const calledInPosts = new Map()
   const turnOf = exec => rt.live.get(exec.agent?.id)?.turn
 
-  ctx.tools.register(defineTool({
+  const messageBot = {
     name: 'message_bot',
     description: 'Send a message to another Bot on the team. It reads a private message at its next step only while working privately on the same task and work; otherwise the message queues for its next turn. If it is idle, it starts on it right away. Its reply arrives later as a new message to you; with reply_to "user" it answers the user in its own chat instead. In a group chat it reaches only members of that group, as writing "@Name" there does. With request_id you name the request yourself: a repeat of that name with the same message is not sent again, but gives the receipt of the first call back.',
     parameters: {
@@ -236,13 +285,17 @@ export function install(rt) {
       const text = absoluteLinks(String(args.message), rt.sessionFolder?.(exec.agent?.session ?? exec.agent))
       const room = rt.roomOf(rt.groupOwners.get(exec.agent?.id)?.roomId)
       const branchContext = rt.branchOf?.(exec.agent?.id) ?? rt.relatedBranch?.(exec.agent?.id, target.id)
-      const workChoice = room === undefined && args.reply_to !== 'user' && !branchContext
-        && exec.agent?.id === rt.chatOf(sender.id) && rt.workBranchPair?.(sender, target) !== undefined
-        ? args.work : undefined
+      const choice = rt.selectTaskRoute(sender, target, exec.agent?.id, args, room)
+      if (args.workdir !== undefined && (choice.kind !== 'new' || typeof args.workdir !== 'string' || !args.workdir.trim())) {
+        refuse('workdir is a full folder path used only when opening a new task')
+      }
+      const workdir = args.workdir === undefined ? undefined
+        : await rt.cleanWorkDir(args.workdir) ?? await rt.real(rt.teamFolder())
+      const workChoice = choice.kind === 'legacy' ? choice.work : undefined
       // The request the caller named: it is admitted once, and a repeat of it is not sent again.
       const request = name === '' ? undefined : rt.requestIdentity({
         caller: sender.id,
-        context: room === undefined ? (branchContext ? `branch:${branchContext.sessionId}` : 'chat') : `room:${room.id}`,
+        context: choice.id ? `task:${choice.id}` : room === undefined ? (branchContext ? `branch:${branchContext.sessionId}` : 'chat') : `room:${room.id}`,
         name,
         payload: {
           to: target.id,
@@ -250,6 +303,8 @@ export function install(rt) {
           reply_to: args.reply_to === 'user' ? 'user' : 'me',
           when: args.when === 'queue' ? 'queue' : 'now',
           ...(workChoice === undefined ? {} : { work: workChoice }),
+          ...(choice.id || choice.kind === 'new' ? { task: choice.id ?? 'new' } : {}),
+          ...(workdir === undefined ? {} : { workdir }),
         },
       })
       // What the caller gets for a request that was admitted before.
@@ -285,8 +340,11 @@ export function install(rt) {
       const send = async () => {
         const toUser = args.reply_to === 'user'
         const work = toUser ? undefined : works[0]
-        const taskId = toUser ? undefined : rt.live.get(exec.agent?.id)?.info?.taskId
-        const route = await rt.routeBranch?.(sender, target, exec.agent?.id, text, toUser, workChoice) ?? {}
+        const route = choice.kind === 'legacy'
+          ? await rt.routeBranch(sender, target, exec.agent?.id, text, toUser, choice.inherited ? undefined : workChoice)
+          : await rt.routeTask(choice, sender, target, exec.agent?.id, text, { ...args, ...(workdir === undefined ? {} : { workdir }) })
+        const taskId = route.task?.id
+        if (request && taskId) rt.bindRequestTask(request, taskId)
         const chat = route.sessionId ?? rt.chatOf(target.id)
         const agent = await rt.resolveAgent(chat)
         const status = rt.statusOf(target.id)
@@ -308,21 +366,26 @@ export function install(rt) {
         const merge = combined === undefined ? undefined : { ...candidate, ...combined, files: [...combined.files, ...before.files] }
         const steer = args.when !== 'queue' && !toUser
         const exchangeId = route.exchangeId ?? randomUUID()
+        if (route.task) {
+          rt.taskLifecycleCheck()
+          if (rt.taskOf(taskId)?.state !== 'open') throw new Error('This task is not open')
+        }
         if (route.replySessionId && route.branch && !route.branch.workIds.includes(exchangeId)) {
           route.branch.workIds.push(exchangeId)
           rt.indexSessions()
         }
-        if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work })
-        if (route.branch && state.works[exchangeId]) {
+        if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work, taskId })
+        if ((route.branch || route.task) && state.works[exchangeId]) {
           Object.assign(state.works[exchangeId], { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) })
         }
         const receipt = {}
         try {
-          const delivery = { fromId: sender.id, toId: target.id, text: long.text, files: long.files, ...(long.length === undefined ? {} : { length: long.length }), role: 'request', steer, exchangeId, ...(taskId ? { taskId } : {}), ...(route.branch ? { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) } : {}), ...(merge ? { merge } : {}), ...(toUser ? { audience: 'user' } : {}) }
-          if (route.branch) await rt.sendBranchTask(route.branch, delivery, receipt)
+          const delivery = { fromId: sender.id, toId: target.id, text: long.text, files: long.files, ...(long.length === undefined ? {} : { length: long.length }), role: 'request', steer, exchangeId, ...(taskId ? { taskId } : {}), ...((route.branch || route.task) ? { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) } : {}), ...(merge ? { merge } : {}), ...(toUser ? { audience: 'user' } : {}) }
+          if (route.task) await rt.sendTask(taskId, delivery, receipt)
+          else if (route.branch) await rt.sendBranchTask(route.branch, delivery, receipt)
           else await rt.deliver(delivery, receipt)
         } catch (error) {
-          if (!route.branch) rt.dropWork(exchangeId)
+          if (!route.branch && !route.task) rt.dropWork(exchangeId)
           throw error
         }
         const sent = toUser
@@ -338,7 +401,8 @@ export function install(rt) {
           status === 'idle' ? '' : `${target.name} now: ${status}.`,
           asker ? `When you have handed on everything, end your turn: each reply brings you back to this work, and your answer goes to ${asker} once all of it is back.` : '',
         ].filter(Boolean)
-        const out = [sent, ...notes, ...(route.branch ? [`Work branch: ${route.branch.id} (${route.branch.sessionId}). Follow up there; its conclusion returns to the main chat.`] : [])].join(' ')
+        if (receipt.skipped) refuse('Not delivered: this host stopped; the task send remains pending.')
+        const out = [sent, ...notes, ...(route.task ? [`Task: ${taskId}. Caller Session: ${route.replySessionId}.`] : []), ...(route.branch ? [`Work branch: ${route.branch.id} (${route.branch.sessionId}). Follow up there; its conclusion returns to the main chat.`] : [])].join(' ')
         // Messages reach a Bot's own chat only; work in a group goes on without them.
         const groups = activeSessions(target.id).running.filter(sessionId => sessionId !== chat)
         if (groups.length === 0) return out
@@ -347,7 +411,36 @@ export function install(rt) {
       }
       return request === undefined ? await send() : answer(await rt.admitRequest(request, send))
     },
-  }))
+  }
+  ctx.tools.register(defineTool(messageBot))
+  const taskMessageBot = defineTool({
+    ...messageBot,
+    parameters: {
+      ...messageBot.parameters,
+      work: {
+        type: 'string',
+        description: 'Explicit legacy work-branch id, or "new" for a configured legacy pair. Root calls never implicitly reuse a legacy branch. Ignored when task is supplied.',
+      },
+      task: {
+        type: 'string',
+        description: 'An open task id from list_tasks, or "new" from an eligible root trunk. Inside a task, omit this or use its current id; new or different tasks are refused. Takes precedence over work.',
+      },
+      workdir: { ...WORK_DIR_PARAM, description: 'Initial full folder path for every new task-owned participant Session. Only when opening a new task; later Session cd does not synchronize it.' },
+    },
+  })
+  const closeTaskTool = defineTool({
+    name: 'close_task',
+    description: 'Root requester task Session only. Close the task and deliver one concise conclusion to its requester main chat. Done requires evidence and no other open work. In a legacy work branch this is an alias for close_work_branch.',
+    parameters: {
+      task: { type: 'string', description: 'Current task id; omit only in this task Session or a legacy work branch.' },
+      status: { type: 'string', required: true, enum: ['done', 'blocked', 'cancelled', 'failed'] },
+      conclusion: { type: 'string', required: true, description: 'Concise conclusion; the complete rendered conclusion is at most 1000 Unicode code points.' },
+      evidence: { type: 'string', description: 'PR, commit, test or path evidence; required for done.' },
+      link: { type: 'string', description: 'One URL, absolute path or Session link.' },
+    },
+    output,
+    execute: (args, exec) => rt.closeTask(exec.agent?.id, args),
+  })
 
   ctx.tools.register(defineTool({
     name: 'stop_bot',
@@ -468,8 +561,20 @@ export function install(rt) {
     const session = exec.agent?.session
     if (cd === '' || session === undefined) return next()
     await rt.load()
-    const bot = callerBot(exec)
+    const task = rt.taskForSession?.(exec.agent.id)
+    const bot = task === undefined ? callerBot(exec) : rt.botOf(Object.keys(task.sessions).find(id => task.sessions[id] === exec.agent.id))
     if (bot === undefined) return next()
+    if (task !== undefined) {
+      const target = await rt.folderAt(rt.sessionFolder(session), cd)
+      if (target === undefined || !(await rt.isFolder(target))) return next()
+      const readOnly = rt.readOnly()
+      if (readOnly !== undefined) throw new Error(`Your working folder cannot change now: ${readOnly}`)
+      const workDir = await rt.workFolder(target)
+      await rt.approveFolder(exec, { path: workDir, sessions: [session.id], who: { en: bot.name, zh: ` ${bot.name} ` } })
+      if (safe.stopped) throw new Error('The host stopped during folder approval')
+      exec.signal?.throwIfAborted()
+      return next()
+    }
     const room = rt.roomOf(rt.groupOwners.get(exec.agent.id)?.roomId)
     const home = rt.workDirOf({ botId: bot.id, roomId: room?.id }) ?? rt.teamFolder()
     const target = await rt.folderAt(rt.sessionFolder(session), cd)
@@ -817,14 +922,48 @@ export function install(rt) {
     ? `Bots cannot use ${BLOCKING_QUESTION_TOOL}. Ask with ask_user in your own chat, or ask in your reply.`
     : undefined))
   // Creation waits for this listener, so the Agent's first step already lacks the tool.
+  const registerTaskTools = agent => {
+    if (safe.stopped) return
+    hideBotUnusedTools(agent)
+    if (typeof agent?.ctx?.tools?.register !== 'function') return
+    if (!taskToolAgents.has(agent)) {
+      taskToolAgents.set(agent, undefined)
+      safe.effect(() => () => {
+        taskToolAgents.get(agent)?.()
+        taskToolAgents.delete(agent)
+      }, 'ds-bot: task tool scope', agent.ctx)
+    }
+    syncTaskTool(agent)
+  }
   safe.on('agent/created', async ({ agent }) => {
     try {
       await rt.load()
-      hideBotUnusedTools(agent)
+      if (safe.stopped) return
+      registerTaskTools(agent)
     } catch (error) {
       rt.warn('ds-bot: hiding %s on agent/created failed: %s', HIDDEN_TOOLS.join(', '), error)
     }
   })
+
+  const restoredTaskTools = Symbol('restored task tools')
+  const taskToolNames = new Set(['message_bot', 'list_tasks', 'close_task'])
+  const taskSchemas = schemas => JSON.stringify(schemas.filter(tool => taskToolNames.has(tool.name))
+    .sort((a, b) => a.name.localeCompare(b.name)))
+  safe.on('system-prompt/assemble', async (assembly, context, next) => {
+    const agent = context.agent
+    if (agent === undefined || context[restoredTaskTools]) return next()
+    await rt.load()
+    safe.signal.throwIfAborted()
+    context.signal?.throwIfAborted()
+    if (!rt.isBotSession(agent.id)) return next()
+    registerTaskTools(agent)
+    if (assembly.tools.some(tool => tool.name === 'run_code')) {
+      if (!taskToolAgents.get(agent)) return next()
+    } else if (taskSchemas(assembly.tools) === taskSchemas(ctx.tools.schemas(agent))) return next()
+    // DSH collects schemas (and the PTC SDK) before this awaited hook. Reassemble
+    // once after restoring this Agent, including when another assembly restored it.
+    return ctx.systemPrompt.assemble({ ...context, [restoredTaskTools]: true })
+  }, { prepend: true })
 
   // The /goal command stays open in every Session, so a goal started in a Bot chat or a
   // group is blocked at once; DSH's round driver then starts no round for it.
@@ -969,5 +1108,18 @@ export function install(rt) {
     },
   }))
 
-  Object.assign(rt, { pickRoom, hideBotUnusedTools })
+  Object.assign(rt, { pickRoom, hideBotUnusedTools, registerTaskTools })
+  safe.effect(() => {
+    rt.taskToolsReady = rt.load().then(async () => {
+      const enabled = rt.config.taskSessionsEnabled === true ? rt.taskCapabilities() : new Set()
+      const ids = new Set([...rt.chatOwners.keys(), ...rt.groupOwners.keys(), ...rt.branchOwners.keys(), ...rt.taskOwners.keys()])
+      for (const id of ids) {
+        if (safe.stopped) return
+        const botId = rt.selfOf(id)
+        if (!enabled.has(botId) && ![...rt.taskById.values()].some(task => Object.hasOwn(task.participants, botId)) && rt.branchOf(id)?.state !== 'open') continue
+        await rt.resolveAgent(id).catch(error => { if (!safe.stopped) rt.warn('ds-bot: restoring tools for %s failed: %s', id, error) })
+      }
+    })
+    rt.taskToolsReady.catch(error => { if (!safe.stopped) rt.warn('ds-bot: restoring task tools failed: %s', error) })
+  }, 'ds-bot: restore task tools')
 }

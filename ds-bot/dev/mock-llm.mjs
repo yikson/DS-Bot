@@ -238,6 +238,7 @@ function decide(body) {
         return [text(`${name} 已就位。`), tool('message_bot', { to: name, message: `用户刚让我建了你。请用三条要点回我：你打算先做什么、需要用户提供什么、第一周节奏。没有的写“尚未聊过”。` })]
       }
       case 'message_bot': return [text(used.input.reply_to === 'user' ? `去 ${used.input.to} 的对话框看它说吧。` : '我已经把需求转过去了，有结果我马上告诉你。')]
+      case 'close_task': return [text('Task closed.')]
       // The user's answer can ride in the same message as the card's tool result.
       case 'ask_user': if (textOf(last.content).trim() === '') return [text('')]
         break
@@ -413,6 +414,9 @@ function decide(body) {
   }
   // Group management in a Bot's own chat, in a fixed command form the tests use.
   let order
+  if ((order = /^关闭任务\s+(done|blocked|cancelled|failed)\s*[:：]\s*(.+)$/.exec(userText)) && tools.has('close_task')) {
+    return [tool('close_task', { status: order[1], conclusion: order[2], ...(order[1] === 'done' ? { evidence: 'mock task replies checked' } : {}) })]
+  }
   if ((order = /^建群\s*(\S+?)\s*[:：]\s*(.+)$/.exec(userText))) {
     return [text('我来建这个群。'), tool('create_group', { name: order[1], members: order[2].split(/[,，、\s]+/).filter(Boolean) })]
   }

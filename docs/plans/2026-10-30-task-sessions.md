@@ -284,13 +284,25 @@ The root requester's task Session is created as follows:
    ```js
    sessionController.fork({
      sessionId: rt.chatOf(requesterId),
+     atSeq: admittedTurnEndSeq,
      allowMigration: false
    })
    ```
 
-   DSH chooses its default boundary, the last completed turn.
+   At admission, inspect the requester trunk and capture the inclusive seq
+   of its last `turn/end`. Persist that source Session and boundary before
+   forking; concurrent trunk writes must not change the admitted prefix.
+   Do not use DSH's omitted-boundary default, which can include standalone
+   events after that ending.
 
-2. Only a confirmed DSH "no completed turn" fork error permits a fresh
+   A pending inbox enqueue can also precede `turn/end` while its consumption
+   follows it. Clear the fork's inherited inbox through the public Agent API,
+   flush, and verify it is empty before setup can become ready or task input
+   is delivered. The explicit brief is the only new task input. Never clear
+   or consume the original trunk's queue.
+
+2. A readable admission snapshot with no `turn/end`, or a confirmed DSH
+   "no completed turn" fork error, permits a fresh
    requester Session instead. A transport error, timeout, HMR stop or unknown
    fork result is not this condition and never permits a blind fresh fallback.
 3. Record the actual `inheritedThrough` boundary when a fork succeeds. Record
@@ -350,6 +362,12 @@ Every fresh participant Session is configured before any prompt or followup:
 
 The fresh Session has the Bot's identity, permissions and capabilities but
 not the other side's trunk history. Its task provenance is explicit.
+
+An installed generation reattaches scoped task tools to existing live Agents,
+including before a resolved or resumed Agent's first step. Bot permission,
+model and reasoning-effort changes propagate to all that Bot's task-owned
+Sessions even after capability/gate removal; shared trunks keep their own
+Bot's settings.
 
 ### Initial workdir and native cd
 
@@ -439,6 +457,14 @@ task Session/cursor. HMR interruption is recovered by the next review using
 the persisted cursor, not by replaying a completed task twice.
 
 ### Unified task commit protocol
+
+An exchange identifies the work and reply relationship. Each retry or
+continuation has a separate durable admission identity, carried in its
+message source and outbox key (including its stable continuation id and
+retry/failure/restart attributes). Replaying one continuation is idempotent;
+the original request's consumption does not prove that continuation ran.
+Unread updates cannot replace a queued continuation as if it were the
+original request. Existing exchange-only send records remain readable.
 
 Every task mutation goes through one per-task serialized commit path:
 
@@ -624,6 +650,17 @@ including S2's already-consumed log, before any resend. Only absence from all
 verified target histories permits enqueue at the now-current part; unreadable
 or uncertain history leaves delivery pending with a diagnostic. Neither a
 stale S0 address nor an unrecorded fresh S2 send is an acceptable shortcut.
+
+For conclusion recovery, a recorded target that is no longer the requester's
+current part may be marked `cleared` only after its readable log and inbox
+both prove the summary id absent. Persist each proof as it is obtained; retain
+the target id and never scan that target again, including after restart.
+Archived targets cannot receive another copy of that conclusion, including
+through forwarding, and delivery cannot return to a cleared target. Cleared
+proofs cannot be reverted.
+This prunes the active scan set without a capacity limit on recorded targets.
+The 20-second attempt deadline and bounded retries with backoff still apply;
+incomplete scans resume from their persisted proofs on a later attempt/startup.
 
 Delivery dedupe means one logical conclusion, with forwarded copies sharing
 the same id and no repeated admission at a destination. It does not mean
@@ -820,8 +857,9 @@ Session-owner lookup.
 4. A task has at most one endpoint per Bot.
 5. Only fork/fresh task-owned Sessions enter exclusive task indexes.
 6. A trunk endpoint never becomes a task-owned Session.
-7. A requester fork uses DSH's default boundary with
-   `allowMigration: false`; first-turn/no-completed-turn falls back to fresh.
+7. A requester fork uses its admitted inclusive `turn/end` boundary with
+   `allowMigration: false`, and clears and flushes inherited pending input before
+   ready; first-turn/no-completed-turn falls back to fresh.
 8. The current delegation is carried explicitly in the brief; inherited
    prefix content is never assumed to contain it.
 9. A recipient participant starts in a fresh Session.

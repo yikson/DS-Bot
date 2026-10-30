@@ -49,6 +49,9 @@ export const failureLine = failure => `${failure.code}${failure.status ? ` ${fai
 // for closes, and the answer goes up to the Bot that asked. `id` is the Session the
 // answer comes from; `source` is the trigger the turn answered.
 export function answerSender(rt, id, source, text, long) {
+  if (source.taskId || rt.state.works?.[source.exchangeId]?.taskId) {
+    return rt.sendTaskAnswer(id, source, text, long).catch(error => rt.warn('ds-bot: task reply delivery failed: %s', error))
+  }
   if (rt.branchOf?.(id) || rt.branchForWork?.(source.exchangeId) || rt.branchOf?.(source.replySessionId)) {
     return rt.sendAnswer(id, source, text, long).catch(error => rt.warn('ds-bot: reply delivery failed: %s', error))
   }
@@ -99,8 +102,9 @@ export function install(rt) {
 
   // The retry goes where the turn's trigger came from: a group round's waiter or a
   // Bot's request keeps its exchange; anything else is a nudge in the Bot's own chat.
-  const retryWrittenCall = (id, info) => {
+  const retryWrittenCall = (id, info, turn) => {
     const keeps = info !== undefined && (info.role === 'room' || expectsReply(info))
+    const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
     return rt.deliver({
       ...(keeps && info.senderSessionId ? { fromId: info.senderSessionId } : {}),
       toId: rt.selfOf(id),
@@ -109,6 +113,9 @@ export function install(rt) {
       ...(keeps && info.roomId ? { roomId: info.roomId } : {}),
       ...(keeps && info.exchangeId ? { exchangeId: info.exchangeId } : {}),
       ...(info?.work ? { work: info.work } : {}),
+      ...(taskId ? { taskId, continuationId: `written:${id}:${turn}` } : {}),
+      ...(info?.failureResumes === undefined ? {} : { failureResumes: info.failureResumes }),
+      ...(info?.resumed ? { resumed: true } : {}),
       ...(keeps && info.audience ? { audience: info.audience } : {}),
       ...(keeps && info.askedBy ? { askedBy: info.askedBy } : {}),
       ...(keeps && info.senderRoomId ? { fromRoomId: info.senderRoomId } : {}),
@@ -121,8 +128,9 @@ export function install(rt) {
 
   // The turn runs again on the trigger it failed on: a Bot that waits keeps its
   // exchange, and a turn of the Bot's own chat starts a plain one there.
-  const resumeFailedTurn = (id, info, failure) => {
+  const resumeFailedTurn = (id, info, failure, turn) => {
     const keeps = info !== undefined && expectsReply(info)
+    const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
     const args = {
       ...(keeps && info.senderSessionId ? { fromId: info.senderSessionId } : {}),
       toId: rt.selfOf(id),
@@ -130,6 +138,7 @@ export function install(rt) {
       role: keeps ? info.role : 'retry',
       ...(keeps && info.exchangeId ? { exchangeId: info.exchangeId } : {}),
       ...(info?.work ? { work: info.work } : {}),
+      ...(taskId ? { taskId, continuationId: `failure:${id}:${turn}` } : {}),
       ...(keeps && info.audience ? { audience: info.audience } : {}),
       ...(keeps && info.askedBy ? { askedBy: info.askedBy } : {}),
       ...(keeps && info.senderRoomId ? { fromRoomId: info.senderRoomId } : {}),
@@ -636,6 +645,7 @@ export function install(rt) {
             exchangeId: result.info.exchangeId,
             replyTo: result.info.replyTo,
             work: result.info.work,
+            ...(result.info.taskId ? { taskId: result.info.taskId } : {}),
             ...(result.info.replySessionId ? { replySessionId: result.info.replySessionId } : {}),
             ...(result.info.roomId ? { roomId: result.info.roomId } : {}),
             deferred: true,
@@ -651,15 +661,17 @@ export function install(rt) {
         // round or sender gets the real answer; a second time, the text goes on without
         // the call.
         const wroteCall = failure === undefined && reason?.kind === 'completed' && lastCalled !== true && writesToolCall(lastText)
-        const retry = wroteCall && info?.retried !== true && !(info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))
-        if (retry) safe.run('turns background job', () => retryWrittenCall(id, info).catch(error => rt.warn('ds-bot: asking %s to run its written tool call failed: %s', id, error)))
+        const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
+        const terminalTask = taskId && rt.taskOf(taskId)?.state !== 'open'
+        const retry = !terminalTask && wroteCall && info?.retried !== true && !(info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))
+        if (retry) safe.run('turns background job', () => retryWrittenCall(id, info, event.data.turn).catch(error => rt.warn('ds-bot: asking %s to run its written tool call failed: %s', id, error)))
         // A model call that failed on a transient fault is run again on the same trigger,
         // so whoever waits keeps waiting instead of hearing that the Bot gave up. A group
         // member's turn is left as it is: its round has a failure path of its own.
         const resumes = info?.failureResumes ?? 0
-        const resumeFailure = failure !== undefined && !rt.groupOwners.has(id) && info?.role !== 'room'
+        const resumeFailure = !terminalTask && failure !== undefined && !rt.groupOwners.has(id) && info?.role !== 'room'
           && TRANSIENT_FAILURE_CODES.has(failure.code) && resumes < FAILURE_RESUME_MAX
-        if (resumeFailure) resumeFailedTurn(id, info, failure)
+        if (resumeFailure) resumeFailedTurn(id, info, failure, event.data.turn)
         // What is still said about the failure, to whoever waits for the reply.
         const failed = failure !== undefined && !resumeFailure
         const replyText = () => {
@@ -738,6 +750,7 @@ export function install(rt) {
             text: request.text,
             role: request.info.role,
             exchangeId: request.info.exchangeId,
+            ...(request.info.taskId ? { taskId: request.info.taskId } : {}),
             ...(request.info.role === 'room' ? { roomId: request.info.roomId, askedBy: request.info.askedBy, note: 'you read this call during your last task; answer it now' } : {}),
             ...(request.info.senderRoomId ? { fromRoomId: request.info.senderRoomId } : {}),
             ...(request.info.replySessionId ? { replySessionId: request.info.replySessionId } : {}),
