@@ -4,7 +4,8 @@
 - Related: Issue #41, PR #42; reviewed at `2365efda`
 - DS Bot base examined: `3c34c2dd9e9951a7fba8f357b92e795b25a5fc06`
 - DSH source examined: `687f282e8625c6b8d11ff58211a90524be2e4317`
-- Revised for review R1-R13 and the maintainer's decisions on 2026-10-31
+- Revised for review R1-R13, the three-item re-review and the maintainer's
+  decisions on 2026-10-31
 
 This English note defines the implementation contract, not completed runtime
 acceptance. The review decisions below supersede the earlier text of this note.
@@ -38,20 +39,24 @@ fixed target runtime in W1; source inspection is not runtime acceptance.
 |---|---|---|
 | Creation and model | `ctx.agents.create({ sessionId, agentOptions, meta, setup })`; `packages/core/agent/README.md`, `src/index.ts` | The documented root factory accepts initial provider, model and reasoning effort without a profile-default write. Omit `parentAgent`; do not spawn a DSH subagent |
 | Default preset | `ctx.agentPresets.resolve()` and `mount(agentCtx, id)`; `packages/preset/agent-preset-registry/src/index.ts` | Resolve and mount the deployment's default preset in unpublished setup, recording its id in Session metadata. No custom worker preset is required |
-| Session-local route | Exported `installModelSelection` from `@deepseek-ai/dsh-agent`; `packages/core/agent/src/model-selection.ts` | Couples a live Agent's selection to assembly/request routing without saving the profile default; reinstall from the worker record on cold resume |
+| Durable route authority | Controller model-selection projection and `request/header`; `packages/api/session-controller/src/agent.ts` | With a request header present, controller cold resume reads the route/effort from DSH's own durable state. Workers install no second model helper; a headerless restart closes worker admissions |
 | Controller alternatives | `SessionCreateRequest`, `SessionCommandController.selectModel`; `packages/api/session-controller/src/types.ts`, `commands.ts` | Controller create has no model/effort parameter. Controller selectModel writes the profile default in the background; workers use the supported root-factory path instead |
 | Sandbox | `setSandboxMode(session, mode)` from `@deepseek-ai/dsh-sandbox-policy`; `sandboxPolicy.resolve({ session })` | Apply/read actual mode values. `workspaceRoot` uses immutable `session.header.cwd`; live cd is a separate value |
 | Approval | `setApprovalPolicy(session, 'never')` from `@deepseek-ai/dsh-user-approval` | `never` automatically rejects every operation requiring approval before answerers are consulted |
-| Execution policy | `ctx.tools.guard`, with the `tools/pre-execute`/final-guard pattern already used by S1b in `tools.js` | A monotonic execution deny covers scoped registrations and native/PTC sub-calls. `tools.restrict` only affects presentation |
+| Execution policy | `ctx.tools.guard`, with the `tools/pre-execute`/final-guard pattern already used by S1b in `tools.js` | A monotonic name-based execution deny covers scoped registrations and native/PTC sub-calls. It does not bind a tool definition across the later `tools/execute` await; `tools.restrict` only affects presentation |
 | Admission | `sessionController.prompt(request, signal)` | Signal is mandatory. `{ accepted: true }` is inbox admission, not completion or flush. The controller may await inside admission after its entry signal check |
 | Correlation | `agent/inbox/inserted`, `agent/inbox/claimed { message, turn }`; `packages/core/agent-loop/src/inbox.ts` | Persist/replay `agent/inbox/spliced`; bind the identified message to its claimed turn before any `user/message` exists |
 | Lifecycle | Awaited serial `agent/created`; `Agent.cancel`, `whenIdle` | Creation holds queued work until listeners finish. Cancellation acknowledgement is only a request; quiescence needs evidence |
 
-The root-factory creation path uses `agentOptions` for the chosen initial route
-and the public scoped model-selection helper for subsequent requests. It must
-not call `sessionController.selectModel`, write `agentDefaultModel`, or depend
-on DSH internal files. Its native Session remains addressable by the ordinary
-controller prompt/cancel/history APIs.
+The root-factory creation path supplies provider, model and reasoningEffort
+only through `agentOptions`. Prompt that newly created Agent immediately after
+its required setup/durability checks so the first DSH `request/header` records
+the actual route and effort. Workers do not install `installModelSelection`,
+append a competing model-selection event, call `sessionController.selectModel`
+or write `agentDefaultModel`. DSH's own request header and controller replay
+remain the single durable authority. Its native Session remains addressable
+by the ordinary controller prompt/cancel/history APIs, subject to the
+headerless-restart refusal below.
 
 Existing S2 task Sessions still use `models.js` `selectSessionModel`: that
 wrapper selects through the controller and attempts to restore the default.
@@ -118,12 +123,16 @@ worker_followup({ worker, message })
 Only the exact requesting task Session may continue its worker. The prior run
 must be completed, failed or unknown, its result must be settled, and the
 native Session must actually be idle with no pending worker admission/input.
-A cancelled run cannot be continued. Unknown means the prior outcome may have
-external effects; the coordinator should inspect its Session before proceeding.
+A cancelled run or worker whose admissions are closed cannot be continued.
+In particular, restart before the first request header permanently refuses
+follow-up on that Session; the PM must call `run_worker` for a new worker.
+Unknown means the prior outcome may have external effects; the coordinator
+should inspect its Session before proceeding.
 
-An accepted follow-up starts a new run in the same worker Session, preserving
-its current cd and chosen route. It never resets cd to initial workdir and
-never raises permission. No goal/automatic continuation is used.
+An accepted follow-up starts a new run in the same worker Session, retaining
+its current cd and DSH's own durable route/effort when a header exists. It
+never reapplies a route from the worker record, resets cd to initial workdir
+or raises permission. No goal/automatic continuation is used.
 
 ### `cancel_worker`
 
@@ -176,10 +185,21 @@ There is no model-family inference. Without `verifierModel`, verification
 independence relies on a fresh Session only; it does not promise a different
 model or family. Read-only is the verification permission boundary.
 
-Serialize plugin-owned worker route setup with other plugin model selection,
-without any profile-default write. Persist the selected route/effort before
-prompt and reapply the same route on cold resume and follow-up. Later config
-changes affect new workers, not an existing worker's route.
+Persist the requested initial route/effort for admission/audit and pass them
+only as `ctx.agents.create` `agentOptions`. There is no second worker model
+helper or select/restore operation to serialize. The first prompt follows
+creation immediately after setup/flush, using that live Agent; check its actual
+request header/effort in acceptance. Later config changes affect new workers
+only. Follow-up and cold resume use the controller's own header/projection;
+the initial route in the worker record is not a competing restore authority.
+
+If the host restarts after creation but before any `request/header` exists,
+record the run as unknown, set `admissionsClosed` with reason
+`restart-before-first-header`, and never prompt that worker Session again.
+Refuse follow-up and native UI/API activation before model work can run;
+history remains readable. The PM may start a new `run_worker` within the normal
+admission limits. This prevents a headerless cold resume from running on the
+profile default, without adding another model-selection middleware.
 
 Limits are nonnegative safe integers and constrain only **new admissions**:
 at most two lifetime worker records per task by default, and at most two
@@ -259,9 +279,9 @@ Add a worker branch **before** the Bot-only early return in `tools.js`'s
 native `working_directory` execution path. Every worker cd, including PTC,
 resolves realpath against its current cd, stays inside its saved root, and
 checks guarded roots before calling the native tool. The execution policy
-rejects unverified aliases of directory-changing tools. It never calls
-`updateBot`, updates the task workdir, or moves another Session. Follow-up
-retains and revalidates the worker's current cd.
+denies directory-changing names/aliases outside the supported native cd path.
+It never calls `updateBot`, updates the task workdir, or moves another Session.
+Follow-up retains and revalidates the worker's current cd.
 
 ## Execution policy and Session ownership
 
@@ -269,9 +289,10 @@ retains and revalidates the worker's current cd.
 
 Use the same documented execution hooks as the S1b `plugin_manager` deny:
 an awaited `tools/pre-execute` policy plus a monotonic `ctx.tools.guard`
-at the final execution boundary. Key it by durable worker Session ownership,
-not Bot identity, mode, schema visibility or what a preset happened to install.
-Ownership or policy lookup failure is deny, never "ordinary Session".
+at the policy boundary before dispatch. The guard is **name-based**: a denied
+name is denied whatever definition is registered. Key it by durable worker
+Session ownership, not Bot identity, mode, schema visibility or definition
+identity. Ownership or policy lookup failure is deny, never "ordinary Session".
 
 | Tool family | Worker execution policy |
 |---|---|
@@ -282,17 +303,14 @@ Ownership or policy lookup failure is deny, never "ordinary Session".
 | Schedule creation/change, including update, resume and removal | Deny; v1 allows no schedule tool as a convenience exception |
 | `plugin_manager` | Deny the entire tool, all actions/targets, including self-change |
 | MCP tools, whether attached to a Bot or exposed by the default profile | Deny in v1; no worker MCP capability is granted |
-| Unknown, replaced or unclassified tool definitions | Deny until proven to be an ordinary permitted execution capability |
-| Vetted native file/shell/search/cd capabilities | Allow only subject to worker sandbox, root, approval and lifecycle policy |
+| Unknown or unclassified tool names, including new aliases | Deny by name until included in the permitted native execution names |
+| Permitted native file/shell/search/cd names | Allow only subject to worker sandbox, root, approval and lifecycle policy |
 
-A name list alone cannot prove that an arbitrary alias is safe. Resolve the
-current public `tools.get(name, agent)` definition at execution, admit only
-verified ordinary capability definitions, and deny unknown wrappers, aliases
-or same-name replacements. Classify trusted native registrations by definition
-identity/callable identity through their supported registration surface;
-never infer authority from description text. A new dynamic tool defaults to
-denied, including a harmless-looking alias of a forbidden tool. No custom
-preset or general plugin-classification service is required.
+Include composed delegation and other forbidden aliases in the denied names;
+unknown names are denied by default. Do not infer authority from descriptions
+or claim that inspecting `tools.get()` binds a definition to later execution.
+The same denied name remains denied across scoped registration, HMR and
+re-registration, independent of the implementation installed under it.
 
 The policy runs on scoped tools and every PTC sub-call; outer `run_code` is
 only a transport and cannot authorize a denied inner call. Cosmetic
@@ -305,6 +323,15 @@ their available sandbox. That is outside this tool-policy guarantee. Trusted
 preset/plugin code itself is also outside the threat model; a hostile native
 plugin can execute host code without a model tool call.
 
+DSH runs the guard before an awaitable `tools/execute` waterfall and resolves
+the implementation by name again when dispatching the body. The guard neither
+freezes nor binds that definition. Replacing an **allowed** name with another
+implementation during that await requires an installed host plugin to
+re-register it. That is inside the trusted-host-plugin boundary and outside
+this guarantee, including ordinary HMR replacement; workers do not promise to
+reject such replacement by definition identity. Denied names cannot reach a
+body merely because their definition is replaced.
+
 ### Creation, cold resume and HMR gate
 
 Persist the worker marker and exact reserved native Session id under the task
@@ -313,13 +340,15 @@ prompt-capable worker; unknown/malformed claims stay denied. Creation uses the
 default Agent preset, including any extra scoped tools. The execution deny
 makes forbidden preset tools unusable; there is no worker-specific preset.
 
-The minimal worker setup helper installs policy, permissions, model route and
-listeners during unpublished `ctx.agents.create` setup. Its final publication
-check revalidates the task, reservation and generation. Awaited serial
-`agent/created` also restores policy for controller/native UI cold resumes;
-it does not start detached work or wait for `whenIdle()` inside creation.
-Failure is propagated as a controlled creation/resume error with diagnostics,
-not an unhandled listener rejection or app-boot fatal.
+The minimal worker setup helper installs policy, permissions and listeners
+during unpublished `ctx.agents.create` setup; initial route/effort are supplied
+only by `agentOptions`. Its final publication check revalidates the task,
+reservation and generation. Awaited serial `agent/created` restores policy
+for controller/native UI cold resumes and refuses headerless restarted workers
+before queued work is released. It never installs a second model helper,
+starts detached work or waits for `whenIdle()` inside creation. Failure is
+propagated as a controlled creation/resume error with diagnostics, not an
+unhandled listener rejection or app-boot fatal.
 
 For HMR-surviving live Agents, reattach before permitting another tool or
 coordinator prompt. Keep a deny-all transition barrier in the Agent scope
@@ -401,8 +430,11 @@ unreadable or ambiguous.
 Pre-step rejection (`blocked`), assembly/prepare failure (`error`), cancellation
 before user-message admission and a completed turn with no final assistant
 text all settle that exact run. Only `turn/end.reason.kind === "completed"`
-is success. All other/unknown reasons remain non-success and preserve the
-reason; no final text is rendered as `(no final text)`.
+is success. A matched `interrupted` reason always maps to unknown, including
+DSH's synthetic cold-resume closer with or without the original user/message.
+Preserve its exact reason and the warning `may have partially run; not re-run`.
+All other/unknown reasons remain non-success and preserve the reason; no final
+text is rendered as `(no final text)`.
 
 ### Outside input
 
@@ -427,9 +459,14 @@ pending | running -> cancelling -> cancelled
 requires accepted/claimed evidence. A synchronous failure may settle pending
 as failed without a model call. DSH completed maps to completed; blocked,
 error, max-tokens or an unrelated abort maps to failed with its exact reason.
-Host restart without terminal evidence maps to unknown. `cancelled` requires
-stop/drain evidence, not an API acknowledgement. State on the worker row/UI
-is derived from its current run; idle is a native Agent fact, not a second
+Every matched `turn/end.reason.kind === "interrupted"` maps unconditionally
+to unknown. Keep the exact reason plus `may have partially run; not re-run`;
+never classify a synthetic closer as ordinary failed or completed just because
+it is terminal evidence. This mapping also takes precedence over a pending
+cancellation result. Host restart without terminal evidence, and restart
+before the first request header, also map to unknown. `cancelled` requires
+stop/drain evidence, not an API acknowledgement. State on the worker row/UI is
+derived from its current run; idle is a native Agent fact, not a second
 persisted run state. No automatic retry creates another run.
 
 ### Cancel and drain
@@ -450,6 +487,9 @@ persisted run state. No automatic retry creates another run.
 5. Reacquire the lane and record cancelled plus its one result/settlement.
    An open task gets the bounded cancelled result; a terminal task gets a late
    record. Once acknowledged, that cancelled run has no outstanding dependency.
+   If the matched end reason is interrupted, keep unknown and its exact
+   warning instead; cancellation cleanup can confirm idle/close admissions
+   without rewriting that unknown outcome as cancelled.
 
 A timeout, including an admission Promise that has not settled, returns a
 bounded cancelling status and keeps its durable intent.
@@ -459,7 +499,7 @@ native waiting never depend on a listener acquiring the lane held by cancel.
 Cancellation of an idle worker closes its future admissions while preserving
 already-delivered successful/failed runs.
 If a matched terminal event predates the cancellation request, preserve its
-completed/failed finish rather than rewriting history as cancelled.
+completed/failed/unknown finish rather than rewriting history as cancelled.
 
 ### Plugin-only HMR
 
@@ -479,15 +519,31 @@ every await, with only the exact admission-compensation exception above.
 
 Reconcile terminal tasks before considering result delivery. For an open task,
 flush/inspect the exact raw worker history without waking model work. Matched
-terminal evidence settles the run. Only a confirmed host restart with no such
-evidence marks the old run unknown and reports `unknown outcome; not rerun`.
-Cancel/drop leftover accepted worker input before any explicit new run can
-start. If history is unreadable, retain reconciliation pending with a
-diagnostic rather than inventing success or absence.
+terminal evidence settles according to its reason: interrupted is always
+unknown with the exact reason and `may have partially run; not re-run`.
+This applies when native UI/API resumes the Session before worker recovery
+scans and DSH has already appended synthetic interrupted closers, with or
+without the original user/message. Do not skip unknown because a closer exists.
+
+A confirmed host restart with no terminal evidence marks the old run unknown
+and reports `unknown outcome; not rerun`. If no first request header exists,
+also permanently close that worker's admissions with
+`restart-before-first-header`. Even an idle Session may not receive follow-up
+or any new prompt; native UI/API activation is refused before model execution,
+and the PM must start a new `run_worker`. Preserve an exact interrupted reason
+when present rather than replacing it with the admission-block reason.
+
+With a header present, DSH's own controller restores route/effort; the worker
+does not install route middleware or reapply its initial config. Cancel/drop
+leftover accepted input before any permitted explicit follow-up. If history
+is unreadable, retain reconciliation pending with a diagnostic rather than
+inventing success or absence.
 
 Follow-up is admitted only from completed/failed/unknown after result
 settlement, no admission in flight, no pending worker input and an actually
-idle Session. It reuses the route and current cd, not the old prompt.
+idle Session whose admissions remain open. A headerless restarted worker
+always refuses. Other permitted follow-ups retain the current cd and DSH's
+own route authority, not the old prompt or an independently restored route.
 
 ## Result durability and delivery
 
@@ -530,7 +586,8 @@ migrates to a trunk or another participant. A terminal task always takes the
 late-result path before delivery, including on restart.
 
 The complete rendered result is at most 4000 Unicode code points, reserving
-room for title, exact finish reason, Session link and outside-input notice.
+room for title, exact finish reason, Session link, outside-input notice and
+the mandatory interrupted warning `may have partially run; not re-run`.
 Use the final text-bearing assistant message of the matched turn, truncated
 within the remaining budget. Reasoning/tool output is not a fabricated final
 answer; the full transcript stays in its native Session.
@@ -612,10 +669,11 @@ Example of one settled run (optional lifecycle timestamps omitted):
   initialWorkdir: "<checked-directory-inside-root>",
   sandbox: "read-only",
   approval: "never",
-  model: { provider: "provider-id", model: "model-id", reasoningEffort: "medium" },
+  initialModel: { provider: "provider-id", model: "model-id", reasoningEffort: "medium" },
   followupCount: 0,
   currentRunId: "worker-id",
   admissionsClosed: false,
+  admissionBlockReason: null,
   runs: {
     "worker-id": {
       id: "worker-id",
@@ -627,6 +685,7 @@ Example of one settled run (optional lifecycle timestamps omitted):
       admission: { state: "settled", insertedSeq: 8, messageId: "dsh-message-id" },
       turn: 1,
       claimSeq: 10,
+      requestHeaderSeq: 12,
       endSeq: 24,
       outsideInput: false,
       finish: { kind: "completed" },
@@ -643,6 +702,10 @@ delivery state, fixed target, retry observations and acknowledgement. Runtime
 Promise/generation/Agent handles are not serialized. Full accepted prompts
 and transcripts stay in native logs; the admission key/digest identifies an
 attempt without pretending a missing accepted prompt can safely be rerun.
+`initialModel` is the creation request for audit only. Actual route/effort come
+from the native request header referenced by `requestHeaderSeq`, not a second
+worker model authority. A headerless restart stores the permanent admission
+block reason without discarding its unknown result or exact finish reason.
 
 Validation depends only on stored structure and immutable historical
 references: identity strings, nonnegative counts, unique message/run/Session
@@ -715,7 +778,8 @@ credentials. Minimal diagnostics suffice in W1; richer UI can wait.
    in-flight prompt. A stale accepted prompt is cancelled/drained, not rerun.
 9. Inbox identity/claim binds the exact turn, including pre-user-message errors.
 10. Only completed is success. Cancellation ack is not cancelled; a live HMR
-    turn is not unknown.
+    turn is not unknown. Every matched interrupted end is unknown with its
+    exact reason and partial-execution warning, never an automatic rerun.
 11. Worker log flush precedes result settlement; task delivery uses raw-log
     dedupe, fixed target, flush-before-ack and bounded recovery.
 12. A result only reaches its requesting task Session and preserves provenance.
@@ -725,6 +789,8 @@ credentials. Minimal diagnostics suffice in W1; richer UI can wait.
     for explicit follow-up.
 15. Gate-off with no worker data has zero existing-feature behavior changes.
 16. Non-empty worker history requires worker-aware code on rollback.
+17. Model/effort enter only through creation agentOptions; DSH owns durable
+    route replay. Headerless restart closes worker admissions permanently.
 
 ## File and function change map
 
@@ -738,11 +804,11 @@ This table describes implementation work, not code shipped by this docs PR.
 | `ds-bot/src/host/task-routing.js`: `withTask`, creation failure/recovery paths | Short reservation/commit phases; all terminal failures invoke common post-commit settlement |
 | `ds-bot/src/host/task-lifecycle.js`: `dependencies`, `closeTask`, `settleTerminal`, `removeTaskBot`, `recover` | Done dependency gate; terminal-first close from every entry point; shared worker cancel/late/archive settlement |
 | Same file: `prepare`, `destination`, `matches`, `observe`, `alreadyPresent`, `atBoundary`, `acknowledge`, `runDelivery`, `attemptConclusion` | Extend existing machinery for worker-result source/id and fixed task Session, same deadlines/backoff; no separate outbox |
-| `ds-bot/src/host/models.js`: model/effort resolution, selection serialization | Route precedence including configured effort; use public native initial options/scoped model helper without default writes |
+| `ds-bot/src/host/models.js`: model/effort resolution | Route precedence including configured effort; pass only initial agentOptions, no worker model helper/default writes; DSH owns header replay |
 | `ds-bot/src/host/permissions.js`: `setPermission`, worker permission propagation | Read effective Session policy, forced never, direct sandbox setter/readback, mid-run tightening/cancel |
 | `ds-bot/src/host/folders.js`: `sessionFolder`, `folderAt`, guarded-root helpers; `tools.js`: cd path | Preserve immutable sandbox root; initial/live realpath containment and worker cd validation before Bot-only return; no folder approval |
 | `ds-bot/src/host/tools.js`: `registerTaskTools`, execution policy, `list_tasks` | Task-only worker tools; final deny using S1b hooks for worker Sessions; dynamic/scoped/PTC policy |
-| `ds-bot/src/host/constants.js`: `TEAM_TOOLS` and worker deny names | Cover team/worker/delegation/goal/schedule/plugin/MCP families; names aid hiding/diagnostics, definition policy remains authoritative |
+| `ds-bot/src/host/constants.js`: `TEAM_TOOLS` and worker deny names | Cover team/worker/delegation/goal/schedule/plugin/MCP names/aliases; name-based execution deny is authoritative, independent of registered definition |
 | `ds-bot/src/host/agents.js`: `adoptAgentSession`; `roster.js`/task endpoint claims | Refuse worker/provenance ownership conflicts only. DSH Agent gate retrofit is Issue #43, a separate implementation PR |
 | `ds-bot/src/host/turns.js`, `resume.js`, `delivery-id.js` | Recognize worker-result, preserve exact ids and task trigger; no `answerSender` or auto worker retry |
 | `ds-bot/src/host/parts.js`, `memory.js`, `capabilities.js` | Retain coordinator result provenance; exclude raw worker review and Bot capability mounts |
@@ -815,13 +881,13 @@ All safety rows use the pinned real DSH plus mock and isolated data.
 |---|---|---|
 | A1 / R6 | Pre-step rejects; assemble/prepare fails before rpcId user-message; prompt remains in inbox; claim precedes user-message; completed with no text. Exact splice/message/claim/turn yields one correct result, never permanent running | W1; W2 follow-up variants |
 | A2 / R7 | Pause every create/setup/prompt-admission/save/flush await; race run, follow-up, cancel, close, Bot deletion and HMR. Durable intents fence and drain late admission; no unaccounted enqueue, ghost worker, duplicate run or lane deadlock. There is no approval await | W1 internal controls; W2 tool controls |
-| A3 / R7 | Plugin-only HMR with still-running native Agent, ended-but-missed event, and cancel not yet idle. Reattach exact run; no unknown/re-prompt. Host crash without terminal evidence produces unknown once, never replay | W1; W2 |
+| A3 / R7 | Plugin-only HMR with still-running native Agent, ended-but-missed event, and cancel not yet idle: reattach, never infer unknown from live work. Host crash without terminal evidence yields unknown once. Also native UI resumes the Session before worker recovery scans: matched synthetic interrupted closer, with/without original user/message, always yields unknown, exact interrupted reason and `may have partially run; not re-run`; never auto-rerun | W1; W2 |
 | A4 / R3 | Native UI/API cold resume has policy before tool dispatch; default/overridden preset includes scoped forbidden tools. Gate errors reject/deny with bounded diagnostic and no app-boot fatal; HMR takeover has no unguarded window | W1; W2 |
-| A5 / R2-R3 | Team/worker/subagent/goal/schedule/plugin-manager calls through scoped tools, delayed registration, aliases, same-name replacement and PTC are denied. Unknown definitions fail closed. Shell launching a CLI is explicitly outside the guarantee, not falsely reported as blocked | W1; W2 |
+| A5 / R2-R3 | Denied team/worker/subagent/goal/schedule/plugin-manager names and aliases stay denied through scoped registration, HMR/re-registration and mid-await definition replacement, in ordinary and PTC calls; no replacement body executes under a denied name. Unknown names fail closed. Allowed-name replacement inside the tools/execute await by an installed host plugin, and shell-launched CLIs, are outside the guarantee; do not claim definition binding | W1; W2 |
 | A6 / R1,R4,R5,R13 | Requester ask/never and read-only/workspace-write/full-access combinations; no named read-only preset; forced never with no answerers/UI or with UI disconnected; explicit full access rejected; implicit execute capped at workspace-write; verify uses direct read-only API or refuses. Tighten running Bot/task permission. Different cd/header.cwd, cross-root/symlink/guarded roots and worker cd are checked; follow-up retains current cd | W1; W2 |
 | A7 / R9 | Crash after accepted/turn-end before worker flush, and before/after each result intent/enqueue/receiver-flush/ack. Raw-log compaction/dedupe; transient inspect/save/flush failure retries; deleted/archived/unexpected endpoint stays pending. One resultId, no duplicate delivery or trunk fallback | W1; W2 |
 | A8 / R7-R8 | Terminal commit followed by half-completed cancellation failure/crash; every terminal entry point; already-queued unconsumed result; late success/error. Resume narrow cleanup, settle cancelled results, never revive; conclusion and summaryId unchanged with no second admission | W1; W2 |
-| A9 / R10 | Two concurrent worker routes with configured/explicit/Bot/default efforts, interleaved UI default-model changes, follow-up and cold resume before/after first request. Worker route matches persisted selection; no worker-caused write to profile default or another Bot/task route. Cover existing S2 restore-failure behavior separately, without claiming it fixed | W1; W2 |
+| A9 / R10 | Two workers with explicit/configured/Bot/default efforts and interleaved UI default changes: initial route enters only through creation agentOptions, with no second helper. Cold resume with header present: assert actual subsequent request/header provider/model/effort follows DSH's durable record. Restart after creation before first header: unknown, no model request, native UI/API/follow-up refused permanently; PM must use new run_worker. Assert zero worker-caused profile-default writes and no other Bot/task route changes. Existing S2 restore behavior is not claimed fixed | W1; W2 |
 | A10 / R11-R13 | Empty flag-off schemas/tasks/DSH Agent paths match base; on-to-off recovery; lower both limits; delete requester Bot; old/absent/empty/non-empty workers round-trip. Historical validation remains valid, no unnecessary empty map, non-empty data blocks unaware rollback. Bidirectional worker/Bot/Agent/task/fork adoption fails | W1; W2; W4 rollback |
 | A11 / R6,R13 | Human outside input/steer allowed and flagged in result; exact worker Session UI link; no trunk/participant worker rows; follow-up denied while outside activity keeps Agent busy; cancelled state waits for idle | W3 |
 | A12 / R9,R13 | Worker-result survives parts/compaction and memory classification as worker/task evidence with ids/anchor; no raw worker memory review or Bot MCP mount; usage counts tokens only, handles missing usage and inherited history without double count | W3 |
@@ -860,12 +926,18 @@ Known limits:
   background process or service call. It is not a process/container sandbox.
 - A preset is trusted host code, not a security boundary. Arbitrary malicious
   plugin code or a host without the worker policy is outside the guarantee.
+- The guard denies by name, not definition identity. A trusted installed host
+  plugin can re-register an allowed name during the tools/execute await and
+  DSH may execute the replacement. This allowed-name TOCTOU is outside the
+  guarantee; denied names remain denied regardless of implementation.
 - Permission tightening controls subsequent operations and requests cancel;
   it cannot undo already-started writes or terminate all external descendants.
 - Direct user input is allowed and disclosed; a user can change what the
   worker does. It does not become authority for another coordinator.
 - Existing S2 `selectSessionModel` still has profile-default write/restore
-  races. Workers use documented native Session-scoped APIs instead.
+  races. Workers use initial agentOptions and DSH's own durable header replay,
+  without a second model helper. A headerless restarted worker cannot be
+  continued; the PM must create another worker within the admission limits.
 - Verification has fresh-Session independence only unless an explicit
   verifier model is configured. Usage is tokens only; no money estimate.
 - Target-runtime incompatibility or unprovable execution/correlation gates
