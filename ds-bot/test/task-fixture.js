@@ -66,6 +66,7 @@ export async function setup(t, config = {}, seed, notes, existingAgentOf) {
   const rt = createRuntime(ctx, { home, memory: false, taskSessionsEnabled: true, taskSessions: ['A', 'B'], ...config })
   await rt.load()
   await rt.taskToolsReady
+  const ensureCapabilities = rt.ensureCapabilities
   rt.ensureCapabilities = async sessionId => {
     assert.ok(rt.isBotSession(sessionId))
     capabilities.push(sessionId)
@@ -91,5 +92,5 @@ export async function setup(t, config = {}, seed, notes, existingAgentOf) {
     }
   }
   t.after(async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true, maxRetries: 5 }) })
-  return { rt, ctx, home, statePath, agentOf, logs, forks, fresh, selections, restores, permissions, capabilities, titles, tool, send, tasks, incoming, handling, saved, emit }
+  return { rt, ctx, home, statePath, agentOf, logs, forks, fresh, selections, restores, permissions, capabilities, ensureCapabilities, titles, tool, send, tasks, incoming, handling, saved, emit }
 }

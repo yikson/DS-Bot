@@ -421,9 +421,18 @@ export function install(rt) {
     await prepare(agent, sessionId)
     if (required) {
       if (safe.stopped) throw new Error('Task capability setup stopped')
-      const missing = [...expandCapabilityNames(bot.capabilities, library())]
-        .filter(name => sessionStatuses.get(bot.id)?.get(name)?.get(sessionId)?.state !== 'ready')
+      const trunkSessionId = rt.chatOf(bot.id)
+      const stateOf = (name, id) => sessionStatuses.get(bot.id)?.get(name)?.get(id)?.state
+      const statuses = [...expandCapabilityNames(bot.capabilities, library())].map(name => ({
+        name, state: stateOf(name, sessionId), trunk: stateOf(name, trunkSessionId),
+      }))
+      // A capability the trunk serves must serve this Session too; only the state the
+      // trunk itself is in may be shared. An unset state means setup never ran here.
+      const missing = statuses.filter(({ state, trunk }) => state !== 'ready' && (state === undefined || trunk !== state))
+        .map(({ name }) => name)
       if (missing.length) throw new Error(`Task capabilities are not ready: ${missing.join(', ')}`)
+      const unavailable = statuses.filter(({ state }) => state !== 'ready').map(({ name, state }) => `${name} (${state})`)
+      if (unavailable.length) rt.warn('ds-bot: task capabilities for %s unavailable as in the Bot trunk: %s; continuing', sessionId, unavailable.join(', '))
     }
   }
   const trackAgent = agent => {
