@@ -21,6 +21,10 @@ node_modules/
 # Browser-plugin bench output (the HTML report is written beside it and committed).
 /browser-plugins/bench/out/
 
+# Agent scratch and evidence directories that are not repository inputs.
+/.AgentWorkspace/
+/work/
+
 # Local Docker deployment data.
 /docker/data/
 /docker/workspace/
