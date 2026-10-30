@@ -7,8 +7,10 @@ import { Context } from '@deepseek-ai/cordis'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 import { createRuntime } from '../index.js'
 import { validateTask } from '../src/host/tasks.js'
+import { install as installTools } from '../src/host/tools.js'
 import { fakeContext } from './fake-ctx.js'
 
 const legacy = () => JSON.parse(readFileSync(new URL('./fixtures/legacy-work-branches.json', import.meta.url), 'utf8'))
@@ -249,6 +251,65 @@ test('DSH tool schemas isolate task registration and restore the base list on re
   for (const agent of [c, unmanaged]) assert.deepEqual(ctx.tools.schemas(agent), baseline)
   await recorded.dispose()
   for (const agent of agents) assert.equal(ctx.tools.get('list_tasks', agent), undefined)
+})
+
+for (const mode of ['native', 'ptc']) test(`first concurrent ${mode} assemblies restore task scopes without created events or background readiness`, async t => {
+  const seed = legacy()
+  seed.tasks = { t1: task() }
+  const { rt } = await setup(t, { seed })
+  const host = new Context()
+  await host.plugin(SystemPrompt)
+  await host.plugin(ToolRuntime, { mode })
+  if (mode === 'ptc') {
+    class AssemblyRuntime extends PtcRuntime { language = 'typescript' }
+    await host.plugin(AssemblyRuntime)
+  }
+  t.after(() => host.fiber.dispose())
+  const agents = ['t1-a', 't1-b', 'unmanaged'].map(id => ({ id, session: { id } }))
+  const mountAgents = inner => {
+    for (const agent of agents) agent.ctx = createScope(inner, agent).ctx
+  }
+  mountAgents.inject = ['tools']
+  await host.plugin(mountAgents)
+  const [requester, recipient, unmanaged] = agents
+  for (let generation = 0; generation < 2; generation += 1) {
+    const loaded = Promise.withResolvers(), background = Promise.withResolvers()
+    t.after(() => { loaded.resolve(); background.resolve() })
+    const mountTools = inner => installTools({
+      ...rt, ctx: inner, load: () => loaded.promise,
+      // Restoring an unrelated Agent must not hold this Agent's first assembly.
+      resolveAgent: () => background.promise,
+    })
+    mountTools.inject = ['tools', 'systemPrompt']
+    const plugin = host.plugin(mountTools)
+    await plugin
+    assert.equal(host.tools.get('close_task', requester), undefined)
+    const assemble = agent => host.systemPrompt.assemble({ agent, scope: agent })
+    const callers = [requester, requester, recipient, unmanaged]
+    const pending = callers.map(assemble)
+    loaded.resolve()
+    const results = await Promise.all(pending)
+    for (const [index, assembly] of results.entries()) {
+      const names = assembly.tools.map(tool => tool.name)
+      if (mode === 'ptc') {
+        assert.deepEqual(names, ['run_code'])
+        const sdk = assembly.sections.find(section => section.name === 'tools:sdk').text
+        assert.equal(sdk.includes('  list_tasks:'), index !== 3)
+        assert.equal(sdk.includes('  close_task:'), index < 2)
+      } else {
+        assert.equal(names.includes('list_tasks'), index !== 3)
+        assert.equal(names.includes('close_task'), index < 2)
+      }
+      const message = (mode === 'native' ? assembly.tools : host.tools.schemas(callers[index]))
+        .filter(tool => tool.name === 'message_bot')
+      assert.equal(message.length, 1)
+      assert.equal(Object.hasOwn(message[0].parameters.properties, 'task'), index !== 3)
+    }
+    assert.equal(host.tools.get('list_tasks'), undefined, 'global schema stays unchanged')
+    background.resolve()
+    await plugin.dispose()
+    assert.equal(host.tools.get('close_task', requester), undefined, 'HMR removes the old scope')
+  }
 })
 
 for (const enabled of [false, true]) {

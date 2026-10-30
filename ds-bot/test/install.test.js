@@ -80,6 +80,7 @@ test('apply registers listeners, tools, and effects in a fixed order', (t) => {
     'tool show_view',
     'tools guard',
     'on agent/created',
+    'on system-prompt/assemble (prepend)',
     'on session/event',
     'tool list_capabilities',
     'tool save_capability',

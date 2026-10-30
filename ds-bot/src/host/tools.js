@@ -945,6 +945,26 @@ export function install(rt) {
     }
   })
 
+  const restoredTaskTools = Symbol('restored task tools')
+  const taskToolNames = new Set(['message_bot', 'list_tasks', 'close_task'])
+  const taskSchemas = schemas => JSON.stringify(schemas.filter(tool => taskToolNames.has(tool.name))
+    .sort((a, b) => a.name.localeCompare(b.name)))
+  safe.on('system-prompt/assemble', async (assembly, context, next) => {
+    const agent = context.agent
+    if (agent === undefined || context[restoredTaskTools]) return next()
+    await rt.load()
+    safe.signal.throwIfAborted()
+    context.signal?.throwIfAborted()
+    if (!rt.isBotSession(agent.id)) return next()
+    registerTaskTools(agent)
+    if (assembly.tools.some(tool => tool.name === 'run_code')) {
+      if (!taskToolAgents.get(agent)) return next()
+    } else if (taskSchemas(assembly.tools) === taskSchemas(ctx.tools.schemas(agent))) return next()
+    // DSH collects schemas (and the PTC SDK) before this awaited hook. Reassemble
+    // once after restoring this Agent, including when another assembly restored it.
+    return ctx.systemPrompt.assemble({ ...context, [restoredTaskTools]: true })
+  }, { prepend: true })
+
   // The /goal command stays open in every Session, so a goal started in a Bot chat or a
   // group is blocked at once; DSH's round driver then starts no round for it.
   let goals = null
