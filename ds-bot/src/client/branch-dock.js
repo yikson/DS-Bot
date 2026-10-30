@@ -6,6 +6,8 @@ import { t } from './i18n.js'
 export function BranchDock({ sessionId, useRoster, useWork, actions }) {
   const roster = useRoster(value => value)
   const work = useWork(value => value)
+  const task = roster.tasks?.find(task => task.id === roster.taskSessions?.[sessionId])
+  if (task) return h(TaskHeader, { task, sessionId, roster, work, actions })
   const bot = roster.byId[sessionId]
   if (!bot || sessionId !== (bot.sessionId ?? bot.id)) return null
   const branches = Object.values(bot.workBranches ?? {}).filter(branch => branch.state !== 'closed')
@@ -36,7 +38,32 @@ export function BranchDock({ sessionId, useRoster, useWork, actions }) {
   }))
 }
 
+export function TaskHeader({ task, sessionId, roster, work, actions }) {
+  return h('section', { className: 'bt-task-header', 'aria-label': t('Task details') },
+    h('div', { className: 'bt-task-title' }, h('strong', null, task.title),
+      h('span', { className: 'bt-chip' }, t(task.state === 'open' ? 'In progress' : task.state))),
+    h('div', { className: 'bt-task-brief' }, task.brief),
+    h('div', { className: 'bt-task-participants', 'aria-label': t('Participants') },
+      Object.entries(task.participants).map(([botId, participant]) => {
+        const bot = roster.byId[botId]
+        const endpoint = participant.kind === 'trunk' ? bot?.sessionId ?? botId : task.sessions[botId]
+        const since = work.turns?.[endpoint]
+        const working = since !== undefined
+        const label = `${bot?.name ?? botId} · ${t(working ? 'Working' : 'Idle')}`
+        return h('div', { key: botId, className: 'bt-task-participant' },
+          endpoint && endpoint !== sessionId ? h('button', { type: 'button', className: 'bt-mini',
+            'aria-label': `${t('Open task')}: ${bot?.name ?? botId}`, onClick: () => actions.openBranch(endpoint) }, label)
+            : h('span', null, label),
+          h(Elapsed, { at: since ?? task.updatedAt ?? task.openedAt }))
+      })))
+}
+
 export const BRANCH_CSS = `
+.bt-task-header{border:1px solid var(--bt-line);background:var(--bt-card);border-radius:12px;padding:12px 16px;max-height:32vh;overflow:auto;font-size:13px;line-height:18px}
+.bt-task-title,.bt-task-participant{display:flex;align-items:center;gap:8px;overflow-wrap:anywhere}
+.bt-task-title{justify-content:space-between}
+.bt-task-brief{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0}
+.bt-task-participants{display:flex;flex-wrap:wrap;gap:8px 16px;color:var(--bt-ink-2)}
 .bt-branch-dock{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0;max-width:100%}
 .bt-branch-dock .bt-mw-pill{max-width:100%}
 .bt-branch-dock .bt-mw-pill-in{flex:1;min-width:0}

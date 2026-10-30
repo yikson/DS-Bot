@@ -46,6 +46,10 @@ var ZH = {
   "Task closed": "任务已关闭",
   "Open task": "打开任务",
   "Task Session": "任务会话",
+  "Task details": "任务详情",
+  Participants: "参与者",
+  "In progress": "进行中",
+  Idle: "空闲",
   "Main chat": "主聊天",
   "Late results": "迟到结果",
   done: "已完成",
@@ -19219,36 +19223,38 @@ var import_react47 = require("react");
 function BranchDock({ sessionId, useRoster, useWork, actions }) {
   const roster = useRoster((value) => value);
   const work = useWork((value) => value);
+  const task = roster.tasks?.find((task2) => task2.id === roster.taskSessions?.[sessionId]);
+  if (task) return (0, import_react47.createElement)(TaskHeader, { task, sessionId, roster, work, actions });
   const bot = roster.byId[sessionId];
   if (!bot || sessionId !== (bot.sessionId ?? bot.id)) return null;
   const branches = Object.values(bot.workBranches ?? {}).filter((branch) => branch.state !== "closed");
-  const tasks = (roster.tasks ?? []).filter((task) => task.participants[bot.id] && (task.state === "open" || task.lateReplies.count > 0));
+  const tasks = (roster.tasks ?? []).filter((task2) => task2.participants[bot.id] && (task2.state === "open" || task2.lateReplies.count > 0));
   if (!branches.length && !tasks.length) return null;
-  return (0, import_react47.createElement)("div", { className: "bt-branch-dock", "aria-label": t("Tasks") }, ...tasks.map((task) => {
-    const participant = task.participants[bot.id];
-    const endpoint = participant.kind === "trunk" ? bot.sessionId ?? bot.id : task.sessions[bot.id];
-    const status = work.tasks?.[task.id]?.status ?? (task.state === "open" ? task.phase === "ready" ? "Needs close" : "Creating" : task.state);
-    const target = roster.byId[task.requester === bot.id ? task.assignee : task.requester];
+  return (0, import_react47.createElement)("div", { className: "bt-branch-dock", "aria-label": t("Tasks") }, ...tasks.map((task2) => {
+    const participant = task2.participants[bot.id];
+    const endpoint = participant.kind === "trunk" ? bot.sessionId ?? bot.id : task2.sessions[bot.id];
+    const status = work.tasks?.[task2.id]?.status ?? (task2.state === "open" ? task2.phase === "ready" ? "Needs close" : "Creating" : task2.state);
+    const target = roster.byId[task2.requester === bot.id ? task2.assignee : task2.requester];
     const suffix = participant.kind === "trunk" ? t("Main chat") : t("Task Session");
     return (0, import_react47.createElement)(
       "button",
       {
-        key: task.id,
+        key: task2.id,
         type: "button",
         className: "bt-mw-pill",
-        disabled: !endpoint || task.phase !== "ready",
-        "aria-label": `${t("Open task")}: ${task.title}`,
+        disabled: !endpoint || task2.phase !== "ready",
+        "aria-label": `${t("Open task")}: ${task2.title}`,
         onClick: () => actions.openBranch(endpoint),
-        title: `${task.id}
-${task.title}
+        title: `${task2.id}
+${task2.title}
 ${endpoint ?? t("Creating")}`
       },
       (0, import_react47.createElement)(
         "span",
         { className: "bt-mw-pill-in" },
         target ? (0, import_react47.createElement)(BotMark, { bot: target, size: 24 }) : null,
-        (0, import_react47.createElement)("span", { className: "bt-branch-label" }, `${task.title} · ${t(status)} · ${suffix}${task.lateReplies.count ? ` · ${t("Late results")}: ${task.lateReplies.count}` : ""}`),
-        (0, import_react47.createElement)(Elapsed, { at: task.openedAt })
+        (0, import_react47.createElement)("span", { className: "bt-branch-label" }, `${task2.title} · ${t(status)} · ${suffix}${task2.lateReplies.count ? ` · ${t("Late results")}: ${task2.lateReplies.count}` : ""}`),
+        (0, import_react47.createElement)(Elapsed, { at: task2.openedAt })
       )
     );
   }), ...branches.map((branch) => {
@@ -19274,7 +19280,47 @@ ${endpoint ?? t("Creating")}`
     );
   }));
 }
+function TaskHeader({ task, sessionId, roster, work, actions }) {
+  return (0, import_react47.createElement)(
+    "section",
+    { className: "bt-task-header", "aria-label": t("Task details") },
+    (0, import_react47.createElement)(
+      "div",
+      { className: "bt-task-title" },
+      (0, import_react47.createElement)("strong", null, task.title),
+      (0, import_react47.createElement)("span", { className: "bt-chip" }, t(task.state === "open" ? "In progress" : task.state))
+    ),
+    (0, import_react47.createElement)("div", { className: "bt-task-brief" }, task.brief),
+    (0, import_react47.createElement)(
+      "div",
+      { className: "bt-task-participants", "aria-label": t("Participants") },
+      Object.entries(task.participants).map(([botId, participant]) => {
+        const bot = roster.byId[botId];
+        const endpoint = participant.kind === "trunk" ? bot?.sessionId ?? botId : task.sessions[botId];
+        const since = work.turns?.[endpoint];
+        const working = since !== void 0;
+        const label = `${bot?.name ?? botId} · ${t(working ? "Working" : "Idle")}`;
+        return (0, import_react47.createElement)(
+          "div",
+          { key: botId, className: "bt-task-participant" },
+          endpoint && endpoint !== sessionId ? (0, import_react47.createElement)("button", {
+            type: "button",
+            className: "bt-mini",
+            "aria-label": `${t("Open task")}: ${bot?.name ?? botId}`,
+            onClick: () => actions.openBranch(endpoint)
+          }, label) : (0, import_react47.createElement)("span", null, label),
+          (0, import_react47.createElement)(Elapsed, { at: since ?? task.updatedAt ?? task.openedAt })
+        );
+      })
+    )
+  );
+}
 var BRANCH_CSS = `
+.bt-task-header{border:1px solid var(--bt-line);background:var(--bt-card);border-radius:12px;padding:12px 16px;max-height:32vh;overflow:auto;font-size:13px;line-height:18px}
+.bt-task-title,.bt-task-participant{display:flex;align-items:center;gap:8px;overflow-wrap:anywhere}
+.bt-task-title{justify-content:space-between}
+.bt-task-brief{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0}
+.bt-task-participants{display:flex;flex-wrap:wrap;gap:8px 16px;color:var(--bt-ink-2)}
 .bt-branch-dock{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0;max-width:100%}
 .bt-branch-dock .bt-mw-pill{max-width:100%}
 .bt-branch-dock .bt-mw-pill-in{flex:1;min-width:0}
