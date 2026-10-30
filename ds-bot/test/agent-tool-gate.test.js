@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
-import { tmpdir } from 'node:os'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import fsp from 'node:fs/promises'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
+import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
@@ -36,17 +37,21 @@ class GateRuntime extends PtcRuntime {
   }
 }
 
-async function setup(t, { team = TEAM, ptc = false } = {}) {
+async function setup(t, { team = TEAM, ptc = false, beforeStart } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-agent-gate-'))
-  writeFileSync(join(home, 'state.json'), JSON.stringify(team))
+  const statePath = join(home, 'state.json')
+  writeFileSync(statePath, JSON.stringify(team))
+  beforeStart?.(statePath)
   const ctx = new Context()
   ctx.provide('workingDirectory', { ensure: async () => home })
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime, { mode: ptc ? 'ptc' : 'native' })
   if (ptc) await ctx.plugin(GateRuntime)
   const recordings = []
+  const warnings = []
   const install = () => {
     const recorded = fakeContext()
+    recorded.logger.warn = (...args) => warnings.push(args.join(' '))
     const rt = createRuntime(recorded, { home, github: false, diagnosticsFile: false })
     const stops = [
       ...(recorded.listeners.get('tools/pre-execute') ?? []).map(policy => ctx.on('tools/pre-execute', policy)),
@@ -79,7 +84,20 @@ async function setup(t, { team = TEAM, ptc = false } = {}) {
     for (const recorded of recordings) await recorded.dispose()
     rmSync(home, { recursive: true, force: true, maxRetries: 5 })
   })
-  return { ...plugin, ctx, home, agent, execute, ran, register, install }
+  return { ...plugin, ctx, home, statePath, warnings, agent, execute, ran, register, install }
+}
+
+function failRead(t, statePath) {
+  const original = fsp.readFile
+  let failing = true
+  const restore = () => { fsp.readFile = original; syncBuiltinESMExports() }
+  fsp.readFile = async (path, ...args) => {
+    if (failing && path === statePath) throw Object.assign(new Error('synthetic read failure'), { code: 'EACCES' })
+    return original(path, ...args)
+  }
+  syncBuiltinESMExports()
+  t.after(restore)
+  return () => { failing = false }
 }
 
 const denied = (result) => {
@@ -127,24 +145,99 @@ test('cold resume and plugin HMR reload persisted ownership for the surviving Ag
   assert.deepEqual(JSON.parse(readFileSync(join(first.home, 'state.json'), 'utf8')).agents, JSON.parse(saved).agents)
 })
 
-test('indexed ownership still denies a missing Agent record and failed lookups', async (t) => {
+test('indexed ownership still denies a missing Agent record', async (t) => {
   const { rt, execute, ran, agent } = await setup(t)
   await rt.load()
   delete rt.state.agents.dsh
   assert.equal(rt.agentOf(agent.id), undefined)
-  rt.load = async () => { throw new Error('ownership lookup unavailable') }
   denied(await execute())
   assert.equal((await execute('list_bots', { ...agent, id: 'ordinary', session: { id: 'ordinary' } })).isError, false)
   assert.deepEqual(ran, ['list_bots'])
 })
 
-test('unloaded ownership fails closed on lookup failure or a skipped pre-execute policy', async (t) => {
-  const { rt, execute, ran, recorded, agent } = await setup(t)
+test('unloaded ownership fails closed on a skipped pre-execute policy', async (t) => {
+  const { recorded, agent } = await setup(t)
   const guard = recorded.guards[0]
   assert.equal(guard({ name: 'list_bots', agent }), REFUSAL)
-  rt.load = async () => { throw new Error('ownership lookup unavailable') }
+})
+
+for (const failure of ['EACCES', 'EISDIR', 'incompatible version']) {
+  test(`real storage ${failure} denies unknown Sessions and recovers after a successful read`, async (t) => {
+    let recover
+    let original
+    const { rt, execute, ran, agent, warnings, statePath } = await setup(t, {
+      beforeStart(path) {
+        original = readFileSync(path, 'utf8')
+        if (failure === 'EACCES') {
+          recover = failRead(t, path)
+        } else {
+          if (failure === 'EISDIR') {
+            rmSync(path)
+            mkdirSync(path)
+          } else {
+            writeFileSync(path, JSON.stringify({ ...TEAM, version: 2 }))
+          }
+          recover = () => {
+            if (failure === 'EISDIR') rmSync(path, { recursive: true })
+            writeFileSync(path, original)
+          }
+        }
+      },
+    })
+    for (const name of TEAM_TOOLS) denied(await execute(name))
+    denied(await execute('list_bots', { ...agent, id: 'ordinary', session: { id: 'ordinary' } }))
+    assert.ok(rt.readOnly())
+    assert.deepEqual(ran, [])
+    assert.equal(warnings.filter(line => line.includes('unreadable state')).length, 1)
+    if (failure === 'EACCES') assert.equal(readFileSync(statePath, 'utf8'), original)
+    if (failure === 'incompatible version') assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).version, 2)
+    recover()
+    assert.equal((await execute('list_bots', { ...agent, id: 'ordinary', session: { id: 'ordinary' } })).isError, false)
+    denied(await execute())
+    assert.equal(rt.stateReadError(), undefined)
+    assert.equal(rt.agentOf(agent.id).id, 'dsh')
+    assert.deepEqual(ran, ['list_bots'])
+  })
+}
+
+test('a failed refresh preserves known Bot, group and task ownership without trusting unknown Sessions', async (t) => {
+  const team = {
+    ...TEAM,
+    bots: { ...TEAM.bots, peer: { id: 'peer', sessionId: 'peer', name: 'Peer', createdAt: 1 } },
+    rooms: { room: { id: 'room', name: 'Desk', named: true, members: ['chief'], sessions: { chief: 'group-chief' } } },
+    tasks: { task: {
+      id: 'task', mode: 'v2', title: 'Check', brief: 'Check the gate.',
+      requester: 'chief', assignee: 'peer', state: 'open', phase: 'ready',
+      capabilityAtCreation: { requester: true, initialAssignee: true },
+      sessions: { chief: 'task-chief', peer: 'task-peer' },
+      participants: { chief: { role: 'requester', kind: 'fork', inheritedThrough: 0 }, peer: { role: 'assignee', kind: 'fresh' } },
+      openedAt: 1, updatedAt: 1, closedAt: null, conclusion: null,
+      creationIntents: {}, pendingSends: {}, lateReplies: { count: 0, ids: [] },
+    } },
+  }
+  const { rt, execute, ran, agent, statePath, home, warnings } = await setup(t, { team })
+  await rt.load()
+  assert.equal(rt.selfOf('task-chief'), 'chief')
+  const recover = failRead(t, statePath)
+  // Another host takes the lock and changes the file: refresh must reread it.
+  writeFileSync(join(home, 'state.lock'), JSON.stringify({ pid: process.ppid, host: hostname(), token: 'test-other-owner' }))
+  writeFileSync(statePath, JSON.stringify({ ...team, revision: 123456 }))
+  await rt.refresh()
+  assert.equal(rt.agentOf(agent.id).id, 'dsh')
+  assert.equal(rt.selfOf('group-chief'), 'chief')
+  assert.equal(rt.selfOf('task-chief'), 'chief')
+  for (const id of ['chief', 'room', 'group-chief', 'task-chief', 'task-peer']) {
+    assert.equal((await execute('list_bots', { ...agent, id, session: { id } })).isError, false)
+  }
   denied(await execute())
-  assert.deepEqual(ran, [])
+  denied(await execute('list_bots', { ...agent, id: 'ordinary', session: { id: 'ordinary' } }))
+  assert.equal(warnings.filter(line => line.includes('unreadable state')).length, 1)
+  recover()
+  assert.equal((await execute('list_bots', { ...agent, id: 'ordinary', session: { id: 'ordinary' } })).isError, false)
+  assert.match(rt.readOnly(), /another dsh/)
+  assert.equal(rt.stateReadError(), undefined)
+  denied(await execute())
+  assert.equal(ran.length, 6)
 })
 
 test('Bot, group, task, plain Sessions and agentless calls retain team tools', async (t) => {

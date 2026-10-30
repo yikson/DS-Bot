@@ -33,6 +33,7 @@ export function install(rt) {
   let holder
   let lockBroken = false
   let stuck
+  let readError
   let warnedReadOnly = false
   let stopped = false
   // mtime and size of the state.json this host last read or wrote.
@@ -65,6 +66,10 @@ export function install(rt) {
     const where = holder.pid ? `pid ${holder.pid}${holder.host ? ` on ${holder.host}` : ''}` : 'unknown process'
     return `The Bot team in ${home} is open in another dsh (Web or Desktop, ${where}). This window shows the team but cannot change it; close the other one and reload.`
   }
+  const unreadable = (reason, detail = reason) => {
+    if (readError === undefined) warn('ds-bot: unreadable state %s: %s', statePath, detail)
+    readError = reason
+  }
 
   const readFileState = async () => {
     let contents
@@ -74,10 +79,11 @@ export function install(rt) {
       seen = stamp()
       if (error?.code === 'ENOENT') {
         stuck = undefined
+        readError = undefined
         return undefined
       }
       stuck = error?.code ?? error?.message ?? String(error)
-      warn('ds-bot: unreadable state %s: %s', statePath, error)
+      unreadable(stuck, error)
       return undefined
     }
     seen = stamp()
@@ -85,28 +91,34 @@ export function install(rt) {
     try {
       parsed = JSON.parse(contents)
     } catch (error) {
+      const reason = error?.message ?? String(error)
+      if (readError === reason) return undefined
       const backup = `${statePath}.broken-${Date.now()}`
       try {
         await copyFile(statePath, backup)
         stuck = undefined
-        warn('ds-bot: unreadable state %s: %s; backed up as %s', statePath, error, backup)
+        unreadable(reason, `${error}; backed up as ${backup}`)
       } catch (copyError) {
         stuck = copyError?.code ?? copyError?.message ?? error?.message ?? String(error)
-        warn('ds-bot: unreadable state %s: %s; backup failed: %s', statePath, error, copyError)
+        unreadable(reason, `${error}; backup failed: ${copyError}`)
       }
       return undefined
     }
     if (parsed?.version === 1) {
       stuck = undefined
+      readError = undefined
       return parsed
     }
     stuck = 'saved by a newer DS Bot; update DS Bot'
+    unreadable(stuck)
     return undefined
   }
 
   // Fill `state` from the saved file and bring an older team up to date. Returns the
   // groups whose Session titles still need the new name.
   const adopt = (parsed) => {
+    // A failed read carries no ownership evidence; keep the last known indexes.
+    if (readError !== undefined) return { migrated: false, stale: [] }
     const hadCapabilities = parsed !== null && parsed !== undefined && Object.hasOwn(parsed, 'capabilities')
     for (const key of Object.keys(state)) delete state[key]
     Object.assign(state, JSON.parse(EMPTY), parsed ?? {})
@@ -278,7 +290,7 @@ export function install(rt) {
       }
       warn('ds-bot: %s', readOnly())
     }
-    if ((stuck !== undefined || holder !== undefined) && stamp() !== seen) adopt(await readFileState())
+    if (readError !== undefined || (holder !== undefined && stamp() !== seen)) adopt(await readFileState())
   }
 
   const warnReadOnly = () => {
@@ -514,7 +526,7 @@ export function install(rt) {
   const isAdminOf = (room, id) => id !== undefined && room.admin === id
 
   Object.assign(rt, {
-    state, load, save, refresh, readOnly, own,
+    state, load, save, refresh, readOnly, own, stateReadError: () => readError,
     botOf, roomOf, isMain, chatOf, selfOf, isBotSession,
     chatOwners, groupOwners, pastOwners, branchOwners, branchByWork, indexSessions,
     taskById, taskBySession, taskOwners, taskDiagnostics, taskOf, taskForSession, openTasksOf, taskSessionsOf, validateTaskSessions,

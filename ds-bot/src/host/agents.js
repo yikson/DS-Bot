@@ -25,21 +25,31 @@ export function install(rt) {
   const agentOf = sessionId => state.agents[sessionIndex.get(sessionId)]
 
   const teamTools = new Set(TEAM_TOOLS)
+  let warnedLookup = false
   safe.on('tools/pre-execute', async (exec, next) => {
     if (!teamTools.has(exec.name)) return next()
     try {
-      await rt.load()
+      await rt.refresh()
+      if (rt.stateReadError() === undefined) warnedLookup = false
     } catch (error) {
-      rt.warn('ds-bot: DSH Agent ownership lookup failed: %s', error)
+      indexed = false
+      if (!warnedLookup) rt.warn('ds-bot: DSH Agent ownership lookup failed: %s', error)
+      warnedLookup = true
     }
     return next()
   })
   // Restrictions only hide inherited schemas. The index also denies scoped/PTC
   // calls, unresolved owned records and cold/HMR calls before ownership loads.
-  ctx.tools.guard(exec => (teamTools.has(exec.name) && exec.agent !== undefined
-    && (!indexed || sessionIndex.has(exec.agent.id))
-    ? 'DSH Agent Sessions cannot use DS Bot team tools.'
-    : undefined))
+  ctx.tools.guard(exec => {
+    const id = exec.agent?.id
+    if (id === undefined || !teamTools.has(exec.name)) return undefined
+    const unknown = !indexed || rt.stateReadError() !== undefined
+    if (sessionIndex.has(id) || (unknown && rt.selfOf(id) === undefined
+      && rt.botOf(id) === undefined && rt.roomOf(id) === undefined)) {
+      return 'DSH Agent Sessions cannot use DS Bot team tools.'
+    }
+    return undefined
+  })
 
   // A DSH Agent Session must not offer the team tools: its agent sees only the
   // global dsh surface minus this plugin's registrations. A Session whose deny
