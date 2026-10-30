@@ -23,6 +23,7 @@ const { outputFiles } = await build({
 let effects = []
 const sets = []
 const Fragment = Symbol('Fragment')
+const MarkdownText = ({ text }) => text
 const h = (type, props, ...children) => ({ type, props: { ...props, children } })
 const react = {
   createElement: h, Fragment,
@@ -42,7 +43,7 @@ runInNewContext(outputFiles[0].text, {
   require: (name) => {
     if (name === 'react') return react
     if (name === 'react-dom') return { createPortal: node => node }
-    if (name === '@deepseek-ai/dsh-client-ui-primitives') return { MarkdownText: ({ text }) => text }
+    if (name === '@deepseek-ai/dsh-client-ui-primitives') return { MarkdownText }
     throw new Error(`Unexpected platform module ${name}`)
   },
 })
@@ -692,6 +693,26 @@ test('a goal round draws nothing, while another unknown trigger keeps its event 
   }))
   assert.equal(trigger({ kind: 'goal', goalId: 'goal-1', revision: 1, round: 1 }), null)
   assert.match(text(trigger({ kind: 'webhook' })), /<goal_round>Keep going/)
+})
+
+test('task conclusions use the normal Markdown renderer and keep their task link', () => {
+  const conclusion = '- **Checked** [evidence](https://example.com/check)\n- <script>unsafe()</script>'
+  const opened = []
+  const tree = TriggerCell({
+    node: { data: { turn: 1, source: { kind: 'bot', role: 'task-conclusion', taskId: 'task-1' }, content: text$(`[Task closed]\nConclusion: ${conclusion}`) } },
+    sessionId: 'chief', useRoster: select => select(team({
+      tasks: [{ id: 'task-1', title: 'Check the task', state: 'done', requester: 'chief',
+        sessions: { chief: 'task-chief' }, conclusion: { text: conclusion, evidence: 'Tests passed', link: 'https://example.com/check' } }],
+    })),
+    useSessions: select => select({ byId: {} }), useTurnClock: select => select({}),
+    useUi: select => select({}), actions: { openBranch: id => opened.push(id) },
+  })
+  const markdown = find(tree, node => node.type === MarkdownText)
+  assert.equal(markdown.props.text, `${conclusion}\n\nTests passed\n\nhttps://example.com/check`)
+  assert.equal(markdown.props.variant, 'compact')
+  assert.equal(markdown.props.labels.code.copyLabel, 'Copy')
+  find(tree, node => node.type === 'button').props.onClick()
+  assert.deepEqual(opened, ['task-chief'])
 })
 
 // #212: the chat hands a trigger its event (seq, content, source) but no turn, so every post

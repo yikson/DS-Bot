@@ -7865,11 +7865,14 @@ function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnClock, us
       if (source.role === "task-conclusion") {
         const task = roster.tasks?.find((task2) => task2.id === source.taskId);
         const sessionId2 = task?.sessions?.[task.requester];
+        const conclusion = task?.conclusion;
+        const text = conclusion ? [conclusion.text, conclusion.evidence, conclusion.link].filter(Boolean).join("\n\n") : stripHeader(contentText(data.content));
         return (0, import_react13.createElement)(
           "div",
           { className: "bt-branch-summary" },
           (0, import_react13.createElement)("strong", null, t("Task closed")),
-          (0, import_react13.createElement)("div", null, stripHeader(contentText(data.content))),
+          task ? (0, import_react13.createElement)("div", null, `${task.title} · ${t(task.state)}`) : null,
+          (0, import_react13.createElement)(import_dsh_client_ui_primitives.MarkdownText, { text, labels: mdLabels3(), variant: "compact" }),
           sessionId2 ? (0, import_react13.createElement)("button", { type: "button", className: "bt-mini", onClick: () => actions.openBranch(sessionId2) }, t("Open task")) : null
         );
       }
