@@ -2,6 +2,12 @@ import assert from 'node:assert/strict'
 import { format } from 'node:util'
 import { setTimeout as delay } from 'node:timers/promises'
 import test from 'node:test'
+import { Context } from '@deepseek-ai/cordis'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { deepSeekImageRequestPricing, resolveAdapterOptions } from '@deepseek-ai/dsh-llm-deepseek'
+import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { install as installModels } from '../src/host/models.js'
 import { install as installParts } from '../src/host/parts.js'
 import { fakeContext } from './fake-ctx.js'
@@ -11,7 +17,7 @@ const NOTE = ['Goals', 'Constraints and preferences', 'Progress', 'Decisions', '
   .map(name => `## ${name}\n- Saved work`).join('\n\n')
 const say = text => ({ role: 'user', content: [{ type: 'text', text }] })
 
-function bench(t, { summaryModel, tokens = 406_000, summaryWindow = 1_000_000, summaryMax = 32_000 } = {}) {
+function bench(t, { summaryModel, tokens = 406_000, targetTokens = tokens, summaryWindow = 1_000_000, summaryMax = 32_000 } = {}) {
   const requests = []
   const warnings = []
   const selections = []
@@ -36,9 +42,17 @@ function bench(t, { summaryModel, tokens = 406_000, summaryWindow = 1_000_000, s
     compactRegion() {},
     summarize() { throw new Error('The Bot must use its checkpoint hook') },
   }
+  const measurements = []
+  const meter = {
+    measure(session, header) {
+      measurements.push({ session, header })
+      return { totalTokens: header?.config.provider === 'deepseek' ? targetTokens : tokens }
+    },
+    estimateMessage: message => Math.ceil(JSON.stringify(message).length / 4),
+  }
   const ctx = fakeContext({ services: {
     compaction: engine,
-    tokenMeter: { measure: () => ({ totalTokens: tokens }) },
+    tokenMeter: meter,
   } })
   ctx.llm = {
     listProviders: () => [{ id: 'opus' }, { id: 'deepseek' }],
@@ -86,7 +100,7 @@ function bench(t, { summaryModel, tokens = 406_000, summaryWindow = 1_000_000, s
   t.after(() => ctx.dispose())
   ctx.emit('agent/created', { agent })
   const summaries = () => requests.filter(request => request.system === undefined)
-  const checkpoint = () => engine.summarize({ messages, tools: header.tools }, agent)
+  const checkpoint = (input = {}) => engine.summarize({ messages, tools: header.tools, ...input }, agent)
   const step = () => ctx.listeners.get('agent/pre-step')[0]({
     agent, step: 1, messages: [], signal: new AbortController().signal,
   }, () => 'normal step')
@@ -96,7 +110,7 @@ function bench(t, { summaryModel, tokens = 406_000, summaryWindow = 1_000_000, s
     assert.equal(bot.sessionId, 'fresh', warnings.join('\n'))
     assert.equal([...rt.switchJobs()].length, 0)
   }
-  return { rt, ctx, agent, bot, header, messages, history, requests, warnings, selections, carried, archived, summaries, checkpoint, step, switched }
+  return { rt, ctx, agent, bot, header, messages, history, meter, measurements, requests, warnings, selections, carried, archived, summaries, checkpoint, step, switched }
 }
 
 test('summaryModel routes both checkpoints and handoff notes with its own limits and effort', async t => {
@@ -198,6 +212,79 @@ test('summary requests reserve output within their own window, including the app
   await small.switched()
   assert.equal(small.summaries().length, 0)
   assert.equal(small.bot.segments.at(-1).note, 'Earlier saved note')
+})
+
+test('20 images priced at 406095 source tokens and 4815 summary tokens can generate both summaries', async t => {
+  const b = bench(t, { summaryModel: 'deepseek/long', tokens: 406_095, targetTokens: 4_815, summaryWindow: 300_000 })
+  b.messages[0].content.push(...Array.from({ length: 20 }, (_, i) => ({
+    type: 'image',
+    attachment: { attachmentId: `sha256:${String(i).padStart(64, '0')}`, mediaType: 'image/png', bytes: 2048, width: 800, height: 800 },
+  })))
+  await b.switched()
+  assert.deepEqual(b.summaries().map(request => request.maxTokens), [32_000, 8_192])
+  const measured = b.measurements.filter(({ header }) => header?.config.provider === 'deepseek')
+  assert.equal(measured.length, 2)
+  for (const { header } of measured) assert.deepEqual(header.tools, b.header.tools)
+  assert.equal(b.summaries()[0].messages[0].content.filter(block => block.type === 'image').length, 20)
+  assert.equal(b.bot.segments.at(-1).note, NOTE)
+  assert.equal(b.warnings.length, 0)
+})
+
+test('a more expensive target route limits output and skips only when its own input cannot fit', async t => {
+  const b = bench(t, { summaryModel: 'deepseek/long', tokens: 100_000, targetTokens: 296_000, summaryWindow: 300_000 })
+  await b.checkpoint()
+  const request = b.summaries()[0]
+  assert.equal(request.maxTokens, 300_000 - 296_000 - b.meter.estimateMessage(request.messages.at(-1)))
+  const full = bench(t, { summaryModel: 'deepseek/long', tokens: 100_000, targetTokens: 300_001, summaryWindow: 300_000 })
+  await assert.rejects(full.checkpoint(), { code: 'bot/summary-overflow' })
+  assert.equal(full.requests.length, 0)
+})
+
+test('checkpoint measurement prices its actual tools instead of the source header tools', async t => {
+  const b = bench(t, { summaryModel: 'deepseek/long' })
+  const tools = [{ name: 'summary-read', description: 'Summary tool', parameters: { type: 'object' } }]
+  await b.checkpoint({ tools })
+  assert.deepEqual(b.measurements[0].header.tools, tools)
+  assert.deepEqual(b.summaries()[0].tools, tools)
+  assert.deepEqual(b.header.tools.map(tool => tool.name), ['read'])
+})
+
+test('real DSH token metering reprices 20 images using the built-in DeepSeek flash catalog', async t => {
+  const options = resolveAdapterOptions({})
+  assert.ok(options.models.some(model => model.id === 'deepseek-flash' && model.inputModalities.includes('image')))
+  const pricing = deepSeekImageRequestPricing(options, 'deepseek-flash')
+  const ctx = new Context()
+  new SessionProjectionRegistry(ctx)
+  ctx.provide('llm', { imageRequestPricing: provider => provider === 'deepseek' ? pricing : {
+    priceImages: images => images.map(() => ({ visualTokens: 20_300, text: '' })),
+  } })
+  const meter = new TokenMeter(ctx)
+  const b = bench(t, { summaryModel: 'deepseek/long', summaryWindow: 300_000 })
+  const session = Session.create(SessionId('current'))
+  session.append('user/message', createUserMessage({
+    content: [
+      { type: 'text', text: 'Keep the image findings' },
+      ...Array.from({ length: 20 }, () => ({
+        type: 'image',
+        attachment: { attachmentId: `sha256:${'ab'.repeat(32)}`, mediaType: 'image/png', bytes: 2048, width: 128, height: 128, name: 'test.png' },
+      })),
+    ],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
+  session.append('request/header', { header: b.header, reason: 'initial' })
+  b.agent.session = session
+  b.messages.splice(0, b.messages.length, ...session.deriveMessages())
+  b.meter.measure = (session, header) => meter.measure(session, header)
+  b.meter.estimateMessage = message => meter.estimateMessage(message)
+  const before = session.snapshotEvents()
+  const source = meter.measure(session).totalTokens
+  const target = meter.measure(session, { config: { provider: 'deepseek', model: 'long' }, tools: b.header.tools }).totalTokens
+  assert.ok(source > 406_000, String(source))
+  assert.ok(target < 10_000, String(target))
+  await b.switched()
+  assert.deepEqual(b.summaries().map(request => request.maxTokens), [32_000, 8_192])
+  assert.deepEqual(session.snapshotEvents(), before)
+  assert.equal(b.warnings.length, 0)
 })
 
 test('summaryModel leaves normal steps, normal requests and Bot model selection alone', async t => {

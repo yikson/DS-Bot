@@ -250,9 +250,9 @@ export function install(rt) {
   // A broken provider adapter must not crash every turn; estimate from the
   // derived messages instead, with one warning.
   let measureWarned = false
-  const tokensOf = (session) => {
+  const tokensOf = (session, header) => {
     try {
-      return ctx.get('tokenMeter')?.measure(session).totalTokens
+      return ctx.get('tokenMeter')?.measure(session, header).totalTokens
     } catch (error) {
       if (!measureWarned) {
         measureWarned = true
@@ -278,14 +278,31 @@ export function install(rt) {
 
   const skippedSummaries = new WeakSet()
   const SUMMARY_OVERFLOW = 'bot/summary-overflow'
-  async function summaryRoute(session, prompt) {
+  async function summaryRequest(session, { messages, tools }, cap) {
+    const header = session.requestHeader()
     const selected = await rt.summaryRoute?.()
-    const route = selected ?? session.requestHeader()?.config
+    const route = selected ?? header?.config
     if (!route?.provider || !route?.model) throw new Error('the Session has not called a model yet')
     const info = selected ?? await ctx.llm.resolveModelInfo(route.provider, route.model)
     const window = linesFor({ window: selected?.contextWindow ?? info.context?.contextWindow }).window
-    const tokens = tokensOf(session)
-    const room = tokens === undefined ? undefined : Math.floor(window - tokens - estimateTokens(prompt))
+    const limit = route.maxTokens ?? info.defaultMaxTokens
+    const maxTokens = cap === undefined ? limit : Math.min(cap, limit ?? cap)
+    const config = {
+      provider: route.provider,
+      model: route.model,
+      ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
+      ...(maxTokens === undefined ? {} : { maxTokens }),
+    }
+    const meter = ctx.get('tokenMeter')
+    const sameRoute = header?.config?.provider === route.provider && header?.config?.model === route.model
+    // Source usage is valid only on that route; images can cost much less or more
+    // on the summary route. The override also prices the actual summary's tools.
+    const tokens = sameRoute
+      ? tokensOf(session, { ...header, tools })
+      : meter?.measure(session, { config, ...(tools ? { tools } : {}) }).totalTokens
+    const prompt = messages.at(-1)
+    const promptTokens = meter?.estimateMessage(prompt) ?? estimateTokens(textOf(prompt.content))
+    const room = tokens === undefined ? undefined : Math.floor(window - tokens - promptTokens)
     if (room !== undefined && room <= 0) {
       const error = Object.assign(new Error('summary input exceeds the model context window'), { code: SUMMARY_OVERFLOW })
       if (!skippedSummaries.has(session)) {
@@ -294,8 +311,16 @@ export function install(rt) {
       }
       throw error
     }
-    const limit = route.maxTokens ?? info.defaultMaxTokens
-    return { ...route, maxTokens: room === undefined ? limit : Math.min(limit ?? room, room) }
+    const budget = room === undefined ? maxTokens : Math.min(maxTokens ?? room, room)
+    return {
+      ...config,
+      messages,
+      toolHistory: session.toolHistory(),
+      ...(tools ? { tools: [...tools] } : {}),
+      ...(budget === undefined ? {} : { maxTokens: budget }),
+      sessionId: session.id,
+      purpose: 'compaction',
+    }
   }
 
   // The backend's own entry points leave Bot Sessions alone, earlier parts and group
@@ -486,20 +511,12 @@ export function install(rt) {
     let problem
     for (let attempt = 1; attempt <= NOTE_ATTEMPTS; attempt += 1) {
       const prompt = retry === undefined ? base : `${base}\n\n${retry}`
-      const route = await summaryRoute(session, prompt)
-      const assembler = new BlockAssembler()
-      for await (const chunk of ctx.llm.stream({
-        provider: route.provider,
-        model: route.model,
-        ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
+      const request = await summaryRequest(session, {
         messages: [...messages, { role: 'user', content: [{ type: 'text', text: prompt }] }],
-        toolHistory: session.toolHistory(),
-        ...(header?.tools ? { tools: [...header.tools] } : {}),
-        maxTokens: Math.min(NOTE_MAX_TOKENS, route.maxTokens ?? NOTE_MAX_TOKENS),
-        sessionId: session.id,
-        purpose: 'compaction',
-        signal,
-      })) assembler.push(chunk)
+        tools: header?.tools,
+      }, NOTE_MAX_TOKENS)
+      const assembler = new BlockAssembler()
+      for await (const chunk of ctx.llm.stream({ ...request, signal })) assembler.push(chunk)
       const finish = assembler.finish
       if (finish.kind === 'error' || finish.kind === 'aborted') throw new Error(finish.failure?.message ?? finish.kind)
       const text = assembler.blocks().filter(block => block.type === 'text').map(block => block.text).join('\n').trim()
@@ -550,21 +567,13 @@ export function install(rt) {
     const head = input.messages
     const tail = checkpointTail(head, session.deriveMessages())
     const prompt = tail.length === 0 ? CHECKPOINT_PROMPT : `${CHECKPOINT_PROMPT}\n\n${checkpointTailNote(tail)}`
-    const route = await summaryRoute(session, prompt)
-    const maxTokens = route.maxTokens
-    const assembler = new BlockAssembler()
-    for await (const chunk of ctx.llm.stream({
-      provider: route.provider,
-      model: route.model,
-      ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
+    const request = await summaryRequest(session, {
       messages: [...head, ...tail, { role: 'user', content: [{ type: 'text', text: prompt }] }],
-      toolHistory: session.toolHistory(),
-      ...(input.tools ? { tools: [...input.tools] } : {}),
-      ...(maxTokens !== undefined ? { maxTokens } : {}),
-      sessionId: session.id,
-      purpose: 'compaction',
-      signal,
-    })) assembler.push(chunk)
+      tools: input.tools,
+    })
+    const { provider, model, maxTokens } = request
+    const assembler = new BlockAssembler()
+    for await (const chunk of ctx.llm.stream({ ...request, signal })) assembler.push(chunk)
     const finish = assembler.finish
     if (finish.kind === 'error' || finish.kind === 'aborted') throw new Error(finish.failure?.message ?? finish.kind)
     if (finish.kind === 'max-tokens') throw new Error('the checkpoint was cut off at the output limit')
@@ -583,8 +592,8 @@ export function install(rt) {
       summary: [{ type: 'text', text }],
       rawOutput,
       llmStreamCall: true,
-      provider: route.provider,
-      model: route.model,
+      provider,
+      model,
       ...(maxTokens !== undefined ? { maxTokens } : {}),
       ...(assembler.usage === undefined ? {} : { usage: assembler.usage }),
     }

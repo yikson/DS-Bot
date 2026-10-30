@@ -72,7 +72,7 @@ Bot 是长期的：用户和一个 Bot 聊几周、几个月，上下文一定�
 
 - `bot.config.summaryModel` 可选，接受 Bot 模型选择现有的 `provider/model`、唯一模型 id / 名称字符串，或 `{ provider, model, effort? }`。启动时通过 `models.js` 查询 DSH 已注册模型；模型或推理档位不可用时 diagnostics 警告并回退本段路由。
 - 仅检查点 `writeCheckpoint` 与交接笔记 `writeNote` 使用此路由；Bot 的正常回合、管家、记忆整理与 task 结论均保持原路由。请求沿用本段消息、工具及工具历史；跨模型时不保证前缀缓存命中。
-- 摘要按所选模型自身的 `contextWindow` 与输出上限预算，并扣除当前输入和追加摘要指令；交接笔记仍最多 8,192 tokens。未配置时使用本段模型。
+- 摘要按所选模型自身的 `contextWindow` 与输出上限预算；使用公开 `tokenMeter.measure(session, requestHeader)` 按目标 provider/model 及实际工具重新计量当前输入（含图片），再扣除追加摘要指令。仅摘要仍走源路由时复用源 Session 的 usage；交接笔记仍最多 8,192 tokens。未配置时使用本段模型。
 - 当前输入加摘要指令已超过摘要路由窗口时不发送注定溢出的请求，同一 Session 只记录一次跳过警告。沿用原有压缩失败 / 换段回退流程，保留最近已有笔记及消息原文；配置了可容纳长输入的模型时可照常生成新摘要。
 
 ### `read_own_chat`
