@@ -18,6 +18,7 @@ import { FAILURE_RESUME_DELAY_MS, HISTORY_TIMEOUT_MS, MESSAGE_INLINE_MAX, SOURCE
 import { answerSender, failureLine, turnFailure } from './turns.js'
 import { textOf } from './text.js'
 import { replyTarget, sourcesIn } from './branches.js'
+import { deliveryId } from './delivery-id.js'
 
 // Long enough for DSH to finish opening its workspaces after a start.
 export const RESUME_DELAY_MS = 3000
@@ -88,6 +89,7 @@ const triggerOf = info => ({
   ...(info.askedBy ? { askedBy: info.askedBy } : {}),
   ...(info.senderRoomId ? { senderRoomId: info.senderRoomId } : {}),
   ...(info.failureResumes !== undefined ? { failureResumes: info.failureResumes } : {}),
+  ...(info.continuationId ? { continuationId: info.continuationId } : {}),
 })
 
 const readNotes = (file) => {
@@ -126,7 +128,7 @@ export function install(rt) {
     const deliveries = {}
     for (const id of new Set([...Object.keys(interrupted.queued), ...Object.keys(queued)])) {
       deliveries[id] = [...new Map([...(interrupted.queued[id] ?? []), ...(queued[id] ?? [])]
-        .map(item => [item.args.exchangeId, item])).values()]
+        .map(item => [deliveryId(item.args), item])).values()]
     }
     latest = JSON.stringify({ turns: { ...interrupted.turns, ...turns }, queued: deliveries, pendingResumes })
     // One write waits at a time and takes the latest notes, so a busy round does not
@@ -150,11 +152,12 @@ export function install(rt) {
     else turns[id] = next
     persist()
   }
-  const forgetQueued = (exchangeId) => {
+  const forgetQueued = (exchangeId, source) => {
     let changed = false
     for (const table of [queued, interrupted.queued]) {
       for (const [sessionId, list] of Object.entries(table)) {
-        const rest = list.filter(item => item.args.exchangeId !== exchangeId)
+        const rest = list.filter(item => item.args.exchangeId !== exchangeId
+          || (source && deliveryId(item.args) !== deliveryId(source)))
         if (rest.length === list.length) continue
         if (rest.length === 0) delete table[sessionId]
         else table[sessionId] = rest
@@ -172,6 +175,8 @@ export function install(rt) {
   const openResume = record => (!record.args.taskId || rt.taskOf(record.args.taskId)?.state === 'open')
     && (record.work === undefined || rt.ownsWork(record.args.toId, record.work))
   const workOfDelivery = args => args.work ?? (args.role === 'request' && args.audience !== 'user' ? args.exchangeId : undefined)
+  const exchangeOf = args => args.exchangeId ?? (args.taskId && args.continuationId
+    ? JSON.stringify([args.taskId, 'continuation', args.continuationId]) : randomUUID())
   const queuedFailures = () => [...Object.values(interrupted.queued), ...Object.values(queued)].flat().filter(item => item.args.failureResumes !== undefined)
   const hasFailureResume = work => Object.values(pendingResumes).some(record => record.work === work)
     || queuedFailures().some(item => workOfDelivery(item.args) === work)
@@ -201,7 +206,7 @@ export function install(rt) {
   rt.scheduleFailureResume = ({ work, args }) => {
     if (stopped || rt.readOnly() !== undefined) return
     if (args.taskId && rt.taskOf(args.taskId)?.state !== 'open') return
-    const exchangeId = args.exchangeId ?? randomUUID()
+    const exchangeId = exchangeOf(args)
     const record = { due: Date.now() + FAILURE_RESUME_DELAY_MS, ...(work ? { work } : {}), args: { ...args, exchangeId } }
     pendingResumes[exchangeId] = record
     persist()
@@ -224,7 +229,7 @@ export function install(rt) {
       if (receipt) receipt.skipped = true
       return args.exchangeId
     }
-    const noted = args.exchangeId === undefined ? { ...args, exchangeId: randomUUID() } : args
+    const noted = args.exchangeId === undefined ? { ...args, exchangeId: exchangeOf(args) } : args
     const sessionId = rt.deliverySession?.(noted) ?? noted.sessionId ?? rt.chatOf(noted.toId)
     const pending = pendingResumes[noted.exchangeId]
     // One snapshot moves a due resume into queued; a reload sees one or the other.
@@ -237,7 +242,7 @@ export function install(rt) {
     } catch (error) {
       // A stopped host leaves the durable queue for the next install.
       if (stopped || safe.stopped) throw error
-      forgetQueued(noted.exchangeId)
+      forgetQueued(noted.exchangeId, noted)
       if (pending !== undefined && openResume(pending) && !stopped) {
         pendingResumes[noted.exchangeId] = { ...pending, due: Date.now() + FAILURE_RESUME_DELAY_MS }
         persist()
@@ -263,7 +268,7 @@ export function install(rt) {
   safe.on('agent/inbox/discarded', ({ agent, message } = {}) => {
     // Fork isolation discards inherited copies, not the trunk's delivery.
     if (rt.taskForSession?.(agent?.id)?.phase === 'creating') return
-    if (message?.source?.kind === SOURCE_KIND && message.source.exchangeId) forgetQueued(message.source.exchangeId)
+    if (message?.source?.kind === SOURCE_KIND && message.source.exchangeId) forgetQueued(message.source.exchangeId, message.source)
   })
   // Exchanges a turn took up since this start, until the resends are done, so a resend
   // never repeats one.
@@ -279,8 +284,8 @@ export function install(rt) {
       firstTurn.set(id, { type: event.type, turn: event.data?.turn, reason: event.data?.reason })
     }
     if (event.type === 'user/message' && event.data?.source?.kind === SOURCE_KIND && event.data.source.exchangeId) {
-      taken?.add(event.data.source.exchangeId)
-      forgetQueued(event.data.source.exchangeId)
+      taken?.add(deliveryId(event.data.source))
+      forgetQueued(event.data.source.exchangeId, event.data.source)
     }
     if (!rt.isBotSession(id)) return
     switch (event.type) {
@@ -335,17 +340,18 @@ export function install(rt) {
     if (record.resumed) return
     const trigger = record.trigger
     const taskId = trigger?.taskId ?? rt.taskForSession?.(sessionId)?.id
+    const continuation = taskId ? { continuationId: `restart:${sessionId}:${record.since}:${trigger?.continuationId ?? ''}` } : {}
     if (taskId && rt.taskOf(taskId)?.state !== 'open') return
     const work = rt.workOf(trigger)
     if (work !== undefined && (hasFailureResume(work)
       || [...rt.live.values()].some(entry => entry.turn !== undefined && rt.workOf(entry.info) === work))) return
     if ((trigger?.role === 'request' || trigger?.role === 'stopped') && trigger.senderSessionId && trigger.audience !== 'user' && rt.botOf(trigger.senderSessionId)) {
       // The sender still waits for this turn's answer, so it goes on under the same exchange.
-      await rt.deliver({ fromId: trigger.senderSessionId, toId: bot.id, ...(rt.branchOwners?.has(sessionId) || taskId ? { sessionId } : {}), ...(taskId ? { taskId } : {}), role: trigger.role, ...(trigger.replySessionId ? { replySessionId: trigger.replySessionId } : {}), ...(trigger.exchangeId ? { exchangeId: trigger.exchangeId } : {}), ...(trigger.senderRoomId ? { fromRoomId: trigger.senderRoomId } : {}), ...(trigger.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}), resumed: true, text })
+      await rt.deliver({ fromId: trigger.senderSessionId, toId: bot.id, ...(rt.branchOwners?.has(sessionId) || taskId ? { sessionId } : {}), ...(taskId ? { taskId } : {}), ...continuation, role: trigger.role, ...(trigger.replySessionId ? { replySessionId: trigger.replySessionId } : {}), ...(trigger.exchangeId ? { exchangeId: trigger.exchangeId } : {}), ...(trigger.senderRoomId ? { fromRoomId: trigger.senderRoomId } : {}), ...(trigger.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}), resumed: true, text })
       return
     }
     // A turn that went on with work another Bot asked for still owes that Bot its answer.
-    await rt.deliver({ toId: bot.id, ...(rt.branchOwners?.has(sessionId) || taskId ? { sessionId } : {}), ...(taskId ? { taskId } : {}), role: 'resume', resumed: true, text, ...(trigger?.work ? { work: trigger.work } : {}), ...(trigger?.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}) })
+    await rt.deliver({ toId: bot.id, ...(rt.branchOwners?.has(sessionId) || taskId ? { sessionId } : {}), ...(taskId ? { taskId } : {}), ...continuation, role: 'resume', resumed: true, text, ...(trigger?.work ? { work: trigger.work } : {}), ...(trigger?.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}) })
   }
 
   // A hard stop keeps the inbox, which the Session runs once it wakes; only what DSH
@@ -361,14 +367,14 @@ export function install(rt) {
       return !branch || branch.state === 'open'
     }
     const fresh = list.filter(item => routable(item.args) && Date.now() - item.at < QUEUED_KEPT_MS && rt.botOf(item.args?.toId) !== undefined
-      && current(item.args) !== undefined && taken?.has(item.args.exchangeId) !== true)
+      && current(item.args) !== undefined && taken?.has(deliveryId(item.args)) !== true)
     if (fresh.length === 0) return
     const target = current(fresh[0].args)
     const agent = await rt.resolveAgent(target)
-    const waiting = new Set([...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])].map(message => message.source?.exchangeId))
+    const waiting = new Set([...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])].map(message => deliveryId(message.source ?? {})))
     for (const { args } of fresh) {
-      if (waiting.has(args.exchangeId) || taken?.has(args.exchangeId) === true) continue
-      if ((args.taskId || rt.branchOf?.(current(args)) || rt.branchOf?.(args.replySessionId))
+      if (waiting.has(deliveryId(args)) || taken?.has(deliveryId(args)) === true) continue
+      if (!args.taskId && (rt.branchOf?.(current(args)) || rt.branchOf?.(args.replySessionId))
         && await rt.branchDelivered(current(args), args.exchangeId, undefined, args.failureResumes)) continue
       await rt.deliver({ ...args, sessionId: current(args), steer: false, resent: true })
     }

@@ -1,6 +1,7 @@
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { asyncScope } from './async.js'
 import { HISTORY_TIMEOUT_MS, SOURCE_KIND } from './constants.js'
+import { deliveryId } from './delivery-id.js'
 
 export const TASK_CONCLUSION_HEADER = '[Task closed]'
 const MAX_CONCLUSION_ATTEMPTS = 5
@@ -72,7 +73,13 @@ export function install(rt) {
   }
   const ofTurn = (sessionId, entry = rt.live.get(sessionId)) => entry?.info?.role === 'task-conclusion'
     ? undefined : entry?.info?.taskId ?? rt.state.works?.[rt.workOf(entry?.info)]?.taskId
-  const ledgerOf = (task, args) => args.role === 'task-conclusion' ? task.delivery : task.sends?.[args.exchangeId]?.delivery
+  const sendOf = (task, args) => {
+    const saved = task.sends?.[deliveryId(args)]
+    if (saved) return saved
+    const legacy = task.sends?.[args.exchangeId]
+    return legacy && deliveryId(legacy.args) === deliveryId(args) ? legacy : undefined
+  }
+  const ledgerOf = (task, args) => args.role === 'task-conclusion' ? task.delivery : sendOf(task, args)?.delivery
   const destination = (task, args) => args.role === 'task-conclusion'
     ? rt.chatOf(task.requester) : task.participants[args.toId]?.kind === 'trunk'
       ? rt.chatOf(args.toId) : task.sessions[args.toId]
@@ -97,12 +104,12 @@ export function install(rt) {
     const attempt = args[CONCLUSION_ATTEMPT]
     if (attempt?.target && attempt.target !== current) throw new Error('Task conclusion endpoint changed; delivery remains pending')
     if (attempt) attempt.target = current
-    if (args.role !== 'task-conclusion' && !task.sends?.[args.exchangeId]) {
+    if (args.role !== 'task-conclusion' && !sendOf(task, args)) {
       if (task.state !== 'open') throw new Error('Terminal tasks cannot admit new deliveries')
       await commit(task.id, task => {
         task.sends ??= {}
-        task.sends[args.exchangeId] = { args: { ...args, sessionId: current },
-          delivery: { summaryId: args.exchangeId, targets: [], state: 'pending' } }
+        task.sends[deliveryId(args)] = { args: { ...args, sessionId: current },
+          delivery: { summaryId: deliveryId(args), targets: [], state: 'pending' } }
         return task
       }, args)
     }
@@ -140,7 +147,7 @@ export function install(rt) {
     return task
   }
   const matches = (source, args) => source?.kind === SOURCE_KIND
-    && source.taskId === args.taskId && source.exchangeId === args.exchangeId
+    && source.taskId === args.taskId && deliveryId(source) === deliveryId(args)
   async function observe(sessionId, args) {
     check(args)
     const agent = await rt.resolveAgent(sessionId)
@@ -241,7 +248,7 @@ export function install(rt) {
       return attemptConclusion(args, scoped => runDelivery(scoped, receipt, enqueue), () => rt.deliver({ ...args }, {}))
     }
     check(args)
-    const operationId = args.exchangeId
+    const operation = { ...args }
     await prepare(args)
     if (await alreadyPresent(args)) { receipt.present = true; return args.exchangeId }
     check(args)
@@ -249,7 +256,7 @@ export function install(rt) {
     check(args)
     if (!receipt.skipped) {
       if (ledgerOf(taskOf(args.taskId), args)) await acknowledge(args, args.sessionId)
-      if (operationId !== args.exchangeId) await acknowledge({ ...args, exchangeId: operationId }, args.sessionId)
+      if (deliveryId(operation) !== deliveryId(args)) await acknowledge(operation, args.sessionId)
     }
     return result
   }
@@ -407,7 +414,7 @@ export function install(rt) {
       const task = taskOf(source.taskId)
       const args = source.role === 'task-conclusion'
         ? { taskId: task.id, toId: task.requester, exchangeId: source.exchangeId, role: source.role }
-        : task.sends?.[source.exchangeId]?.args
+        : sendOf(task, source)?.args
       if (!args) throw new Error('Forwarded task message has no durable send record')
       if (args.toId !== owner.botId) throw new Error('Forwarded task message belongs to another Bot')
       const forwarded = { ...args, resent: true }

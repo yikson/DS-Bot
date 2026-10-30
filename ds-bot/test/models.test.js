@@ -98,7 +98,7 @@ function bench({ providers = { deepseek: ['v4-flash'], stepfun: ['step-5'] }, fa
       },
     },
   }
-  const rt = { ctx, state: { bots: {} }, chatOf: id => id, groupSessionsOf: () => [], save: async () => {}, warn: () => {} }
+  const rt = { ctx, state: { bots: {} }, chatOf: id => id, groupSessionsOf: () => [], taskSessionsOf: () => [], save: async () => {}, warn: () => {} }
   install(rt)
   return { rt, selected, saved, providers, listeners, current: () => current }
 }

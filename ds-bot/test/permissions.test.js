@@ -17,6 +17,7 @@ function runtime({ presets = true, auto = false, fail = false } = {}) {
     ctx,
     chatOf: id => `${id}-chat`,
     groupSessionsOf: id => [`${id}-group`],
+    taskSessionsOf: () => [],
     groupOwners: new Map(),
     roomOf: () => undefined,
     resolveAgent: async sessionId => ({ session: sessionId }),

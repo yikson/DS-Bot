@@ -9,7 +9,7 @@ import { zstdDecompressSync } from 'node:zlib'
 const [name, port, phase = 'open'] = process.argv.slice(2)
 assert.match(name ?? '', /^[a-z0-9-]+$/)
 assert.match(port ?? '', /^\d+$/)
-assert.ok(['open', 'close', 'verify'].includes(phase))
+assert.ok(['open', 'hmr', 'close', 'verify'].includes(phase))
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 const home = join(root, `.dsh-test-${name}`)
 const base = `http://127.0.0.1:${port}`
@@ -84,6 +84,43 @@ if (phase === 'open') {
   writeFileSync(resultPath, JSON.stringify({ taskId: task.id, requesterSession: task.sessions[chief.id],
     requester: chief.id, assigneeSession: task.sessions[coder.id], requests: 2, replies: 2, phase }, null, 2))
   console.log('open/follow-up: one task, two requests, two replies; user input stays in requester task Session')
+} else if (phase === 'hmr') {
+  const result = read(resultPath)
+  const before = structuredClone(state().tasks[result.taskId].sessions)
+  const pid = readFileSync(join(home, 'web.pid'), 'utf8').trim()
+  const checkTools = () => {
+    const call = log().findLast(call => call.session === result.requesterSession && call.toolNames?.includes('message_bot'))
+    assert.ok(call?.toolNames?.includes('close_task'), 'run the mock with MOCK_LOG_TOOLS=1')
+    assert.ok(call.toolNames.includes('list_tasks'))
+  }
+  await send(result.requesterSession, 'Gate HMR before')
+  await settle()
+  checkTools()
+  async function remote(method, args) {
+    const response = await fetch(`${base}/api/${method}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ type: 'client-request', rpcId: `gate-${Date.now()}`, method, payload: { args } }),
+    })
+    const value = await response.json()
+    assert.ok(value.result?.ok, JSON.stringify(value.result?.error ?? value))
+    return value.result.value
+  }
+  const plugins = await remote('pluginManager/listPlugins', {})
+  const bot = plugins.find(plugin => plugin.moduleName === 'ds-bot')
+  assert.ok(bot?.entryId)
+  for (const enabled of [false, true]) {
+    const change = await remote('pluginManager/setPluginEnabled', { id: bot.entryId, enabled })
+    assert.equal(change.application, 'applied', JSON.stringify(change.error))
+  }
+  await send(result.requesterSession, 'Gate HMR after')
+  await settle()
+  checkTools()
+  assert.equal(readFileSync(join(home, 'web.pid'), 'utf8').trim(), pid, 'this is plugin HMR, not host restart')
+  assert.deepEqual(state().tasks[result.taskId].sessions, before)
+  assert.equal(state().tasks[result.taskId].state, 'open')
+  result.hmr = 'same host and endpoints; close_task/list_tasks restored'
+  writeFileSync(resultPath, JSON.stringify(result, null, 2))
+  console.log('hmr: disabled/enabled the bot entry in the live host; same requester retains close_task/list_tasks')
 } else {
   const result = read(resultPath)
   if (phase === 'close') {

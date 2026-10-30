@@ -118,6 +118,7 @@ export function install(rt) {
     const bot = rt.botOf(botId)
     if (!bot) throw new Error('Task participant no longer exists')
     const initialWorkdir = await rt.cleanWorkDir(task.workdir ?? rt.workDirOf({ botId }) ?? '')
+      ?? (task.workdir === undefined ? undefined : await rt.real(task.workdir))
     checkGeneration()
     const requestId = randomUUID()
     const marker = `task:${id}:${botId}:${requestId}`
@@ -246,6 +247,9 @@ export function install(rt) {
       if (choice.kind === 'new') {
         creating.add(id)
         try {
+          const workdir = args.workdir === undefined ? undefined
+            : await rt.cleanWorkDir(args.workdir) ?? await rt.real(rt.teamFolder())
+          checkGeneration()
           const observed = await rt.ctx.sessionController.inspect(sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS))
           checkGeneration()
           if (!Array.isArray(observed?.events)) throw new Error('Cannot inspect the requester fork boundary')
@@ -255,6 +259,7 @@ export function install(rt) {
             if (selectTaskRoute(sender, target, sessionId, args).kind !== 'new') throw new Error('Task admission changed')
             return {
               id, mode: 'v2', title: Array.from(text.trim().split('\n')[0]).slice(0, 80).join(''), brief: text,
+              ...(workdir === undefined ? {} : { workdir }),
               requester: sender.id, assignee: target.id, state: 'open', phase: 'creating',
               capabilityAtCreation: rt.taskCapabilitySnapshot(sender.id, target.id),
               participants: {

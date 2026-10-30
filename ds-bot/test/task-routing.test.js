@@ -62,13 +62,6 @@ for (const fallback of [false, true]) {
     const workdir = realpathSync.native(mkdtempSync(join(tmpdir(), 'ds-bot-task-folder-')))
     t.after(() => rmSync(workdir, { recursive: true, force: true, maxRetries: 5 }))
     f.rt.dshHome = join(f.home, 'dsh')
-    // Seed the optional persisted workdir without adding a routing/tool argument.
-    const commit = f.rt.commitTask
-    f.rt.commitTask = (id, update) => commit(id, previous => {
-      const next = update(previous)
-      if (previous === undefined) next.workdir = workdir
-      return next
-    })
     if (fallback) f.ctx.sessionController.fork = async () => {
       throw Object.assign(new Error('session "a" has no completed turn to fork from'), { code: 'session/fork-unavailable' })
     }
@@ -97,8 +90,9 @@ for (const fallback of [false, true]) {
       assert.equal(f.ctx.workingDirectory.get(f.agentOf(id).session), workdir)
       return capabilities(id, options)
     }
-    await f.send()
+    await f.send('a', 'B', { workdir })
     const task = f.tasks()[0]
+    assert.equal(f.saved().tasks[task.id].workdir, workdir)
     const endpoints = [task.sessions.a, task.sessions.b]
     assert.deepEqual(applied, endpoints)
     assert.deepEqual(approvals, endpoints)

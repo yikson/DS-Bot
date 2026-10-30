@@ -48,6 +48,7 @@ export function install(rt) {
   async function setPermission(bot, name) {
     const wanted = checkPreset(name, 'a Bot\'s')
     await applyPermission({ ...bot, permission: wanted }, rt.chatOf(bot.id))
+    for (const sessionId of rt.taskSessionsOf(bot.id)) await applyPermission({ ...bot, permission: wanted }, sessionId)
     bot.permission = wanted
     for (const sessionId of [...rt.groupSessionsOf(bot.id), ...Object.values(bot.workBranches ?? {}).map(branch => branch.sessionId).filter(Boolean)]) {
       if (roomOfSession(sessionId)?.permission) continue

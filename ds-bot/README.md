@@ -75,10 +75,12 @@ Options go in the profile's `cordis.patch.yml`, under the `bot` entry. All of th
     updateCheck: true               # look for a newer DS Bot when a window opens; default true
     updateRegistry: https://registry.example/   # ask only this npm registry for updates
     github: false                   # hide the GitHub connector; default shown in Connectors
-    workBranches: [[Chief, Coder]]  # private task branches for this pair of Bots; default none
+    taskSessionsEnabled: false      # rollout gate; stays off until task-session acceptance
+    taskSessions: [Chief, Coder]    # Bots eligible to open isolated tasks when the gate is on
+    workBranches: []               # deprecated capability alias and explicit legacy-pair configuration
 ```
 
-**Work branches**: with `workBranches` naming two Bots (the first owns the branches), a new task between them runs in a fork of the owner's Session instead of its main chat, and the main chat receives one short conclusion when the branch closes. Needs a DSH that provides `sessionController.fork`. Removing the option stops new branches; open ones keep working until they close. See [the design note](../docs/plans/2026-10-29-work-branch-sessions.md) and [`dev/work-branches.md`](dev/work-branches.md).
+**Task sessions and legacy branches**: `taskSessions` gives the named Bots task capability; only the literal gate `taskSessionsEnabled: true` enables new v2 tasks between eligible Bots. `workBranches: [[Chief, Coder]]` is a deprecated capability alias and does not open that gate. With the gate off, an ordinary delegation uses trunks. Existing open tasks and legacy branches still route and close; closed legacy records remain readable and never replay their work or conclusions. Explicit `work: "new"` on a configured legacy pair still uses the legacy path. New task creation accepts an optional full `workdir` through `message_bot`, validates it and checks approval separately for each task-owned Session; it does not synchronize later directory changes. See [the approved task-session design](../docs/plans/2026-10-30-task-sessions.md).
 
 **Updates**: this personal fork only checks for newer releases. The sidebar cloud and Settings → About DS Bot show the version and release notes; **Check for updates** asks again at once. There is no in-plugin install action, and Bot / managed DSH Agent Sessions cannot change `ds-bot` through `plugin_manager`. Unverified Git, tarball and local installation sources are refused in those Sessions too. Stop the target profile and follow the [out-of-band release and rollback procedure](../README.md#install) from a separate terminal. Linked checkouts are updated and built there while stopped. Release links do not authorize replacing this fork with upstream; the desktop app retains its separate app updater.
 
