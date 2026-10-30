@@ -9,7 +9,7 @@ const ROUTE_WAIT_MS = 30_000
 
 export function install(rt) {
   const safe = asyncScope(rt)
-  const { ctx, state } = rt
+  const { ctx, state, config = {} } = rt
 
   let modelsSynced = null
   let catalogCache = { at: 0, value: [] }
@@ -125,6 +125,34 @@ export function install(rt) {
     throw new Error(`Thinking level ${wanted} is not available for ${ref}. Available: ${efforts.map(effort => effort.name).join(', ')}`)
   }
 
+  let summaryWarned = false
+  async function summaryRoute() {
+    const selected = config.summaryModel
+    if (selected === undefined) return undefined
+    try {
+      const ref = await resolveModel(typeof selected === 'string' ? selected : `${selected?.provider}/${selected?.model}`)
+      const route = splitRef(ref)
+      const effort = typeof selected === 'object' && selected?.effort !== undefined
+        ? await resolveEffort(ref, selected.effort) : undefined
+      const info = await ctx.llm.resolveModelInfo(route.provider, route.model)
+      return {
+        ...route,
+        ...(effort === undefined ? {} : { reasoningEffort: effort }),
+        maxTokens: info.defaultMaxTokens,
+        contextWindow: info.context?.contextWindow,
+      }
+    } catch (error) {
+      if (!summaryWarned) {
+        summaryWarned = true
+        rt.warn('ds-bot: summaryModel is unavailable; using the Session route: %s', error)
+      }
+      return undefined
+    }
+  }
+  if (config.summaryModel !== undefined) {
+    safe.effect(async () => { await summaryRoute() }, 'ds-bot: validate summaryModel')
+  }
+
   // The profile default model's thinking level, when the model a Bot starts on
   // serves it. A level the model does not know is ignored, like an inherited
   // `bot.effort` — the model's own default applies instead.
@@ -220,7 +248,7 @@ export function install(rt) {
   Object.assign(rt, {
     catalog, cachedCatalog: () => catalogCache.value, cachedDefault: () => pickDefault(catalogCache.value),
     defaultRef, defaultModel, defaultEffort, resolveModel, desiredModel, reasoningOf, resolveEffort, desiredEffort,
-    selectSessionModel, applyModel, waitForModel, syncModels,
+    selectSessionModel, applyModel, waitForModel, syncModels, summaryRoute,
     dropCatalog: () => { catalogCache = { at: 0, value: [] } },
   })
 }
