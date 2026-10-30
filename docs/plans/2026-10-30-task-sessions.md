@@ -363,6 +363,12 @@ Every fresh participant Session is configured before any prompt or followup:
 The fresh Session has the Bot's identity, permissions and capabilities but
 not the other side's trunk history. Its task provenance is explicit.
 
+An installed generation reattaches scoped task tools to existing live Agents,
+including before a resolved or resumed Agent's first step. Bot permission,
+model and reasoning-effort changes propagate to all that Bot's task-owned
+Sessions even after capability/gate removal; shared trunks keep their own
+Bot's settings.
+
 ### Initial workdir and native cd
 
 The task may record `workdir` when it is opened.
@@ -451,6 +457,14 @@ task Session/cursor. HMR interruption is recovered by the next review using
 the persisted cursor, not by replaying a completed task twice.
 
 ### Unified task commit protocol
+
+An exchange identifies the work and reply relationship. Each retry or
+continuation has a separate durable admission identity, carried in its
+message source and outbox key (including its stable continuation id and
+retry/failure/restart attributes). Replaying one continuation is idempotent;
+the original request's consumption does not prove that continuation ran.
+Unread updates cannot replace a queued continuation as if it were the
+original request. Existing exchange-only send records remain readable.
 
 Every task mutation goes through one per-task serialized commit path:
 

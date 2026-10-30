@@ -102,7 +102,7 @@ export function install(rt) {
 
   // The retry goes where the turn's trigger came from: a group round's waiter or a
   // Bot's request keeps its exchange; anything else is a nudge in the Bot's own chat.
-  const retryWrittenCall = (id, info) => {
+  const retryWrittenCall = (id, info, turn) => {
     const keeps = info !== undefined && (info.role === 'room' || expectsReply(info))
     const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
     return rt.deliver({
@@ -113,7 +113,9 @@ export function install(rt) {
       ...(keeps && info.roomId ? { roomId: info.roomId } : {}),
       ...(keeps && info.exchangeId ? { exchangeId: info.exchangeId } : {}),
       ...(info?.work ? { work: info.work } : {}),
-      ...(taskId ? { taskId } : {}),
+      ...(taskId ? { taskId, continuationId: `written:${id}:${turn}` } : {}),
+      ...(info?.failureResumes === undefined ? {} : { failureResumes: info.failureResumes }),
+      ...(info?.resumed ? { resumed: true } : {}),
       ...(keeps && info.audience ? { audience: info.audience } : {}),
       ...(keeps && info.askedBy ? { askedBy: info.askedBy } : {}),
       ...(keeps && info.senderRoomId ? { fromRoomId: info.senderRoomId } : {}),
@@ -126,7 +128,7 @@ export function install(rt) {
 
   // The turn runs again on the trigger it failed on: a Bot that waits keeps its
   // exchange, and a turn of the Bot's own chat starts a plain one there.
-  const resumeFailedTurn = (id, info, failure) => {
+  const resumeFailedTurn = (id, info, failure, turn) => {
     const keeps = info !== undefined && expectsReply(info)
     const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
     const args = {
@@ -136,7 +138,7 @@ export function install(rt) {
       role: keeps ? info.role : 'retry',
       ...(keeps && info.exchangeId ? { exchangeId: info.exchangeId } : {}),
       ...(info?.work ? { work: info.work } : {}),
-      ...(taskId ? { taskId } : {}),
+      ...(taskId ? { taskId, continuationId: `failure:${id}:${turn}` } : {}),
       ...(keeps && info.audience ? { audience: info.audience } : {}),
       ...(keeps && info.askedBy ? { askedBy: info.askedBy } : {}),
       ...(keeps && info.senderRoomId ? { fromRoomId: info.senderRoomId } : {}),
@@ -662,14 +664,14 @@ export function install(rt) {
         const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
         const terminalTask = taskId && rt.taskOf(taskId)?.state !== 'open'
         const retry = !terminalTask && wroteCall && info?.retried !== true && !(info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))
-        if (retry) safe.run('turns background job', () => retryWrittenCall(id, info).catch(error => rt.warn('ds-bot: asking %s to run its written tool call failed: %s', id, error)))
+        if (retry) safe.run('turns background job', () => retryWrittenCall(id, info, event.data.turn).catch(error => rt.warn('ds-bot: asking %s to run its written tool call failed: %s', id, error)))
         // A model call that failed on a transient fault is run again on the same trigger,
         // so whoever waits keeps waiting instead of hearing that the Bot gave up. A group
         // member's turn is left as it is: its round has a failure path of its own.
         const resumes = info?.failureResumes ?? 0
         const resumeFailure = !terminalTask && failure !== undefined && !rt.groupOwners.has(id) && info?.role !== 'room'
           && TRANSIENT_FAILURE_CODES.has(failure.code) && resumes < FAILURE_RESUME_MAX
-        if (resumeFailure) resumeFailedTurn(id, info, failure)
+        if (resumeFailure) resumeFailedTurn(id, info, failure, event.data.turn)
         // What is still said about the failure, to whoever waits for the reply.
         const failed = failure !== undefined && !resumeFailure
         const replyText = () => {

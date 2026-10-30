@@ -1,15 +1,16 @@
 // Run ordinary smoke first, restart the isolated bench with taskSessionsEnabled: true
-// and taskSessions: [Chief, Coder], then use open, close, and verify (after restart).
+// and taskSessions: [Chief, Coder], then use open, hmr [iterations=50], close,
+// and verify (after restart). HMR requires MOCK_LOG_TOOLS=1.
 import assert from 'node:assert/strict'
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { zstdDecompressSync } from 'node:zlib'
 
-const [name, port, phase = 'open'] = process.argv.slice(2)
+const [name, port, phase = 'open', iterations = '50'] = process.argv.slice(2)
 assert.match(name ?? '', /^[a-z0-9-]+$/)
 assert.match(port ?? '', /^\d+$/)
-assert.ok(['open', 'close', 'verify'].includes(phase))
+assert.ok(['open', 'hmr', 'close', 'verify'].includes(phase))
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 const home = join(root, `.dsh-test-${name}`)
 const base = `http://127.0.0.1:${port}`
@@ -84,6 +85,57 @@ if (phase === 'open') {
   writeFileSync(resultPath, JSON.stringify({ taskId: task.id, requesterSession: task.sessions[chief.id],
     requester: chief.id, assigneeSession: task.sessions[coder.id], requests: 2, replies: 2, phase }, null, 2))
   console.log('open/follow-up: one task, two requests, two replies; user input stays in requester task Session')
+} else if (phase === 'hmr') {
+  const result = read(resultPath)
+  const task = state().tasks[result.taskId]
+  const before = structuredClone(task.sessions)
+  for (const botId of [task.requester, task.assignee]) {
+    assert.equal(state().bots[botId].capabilities?.length ?? 0, 0, 'probe the native prompt path without capability resolution')
+  }
+  const pid = readFileSync(join(home, 'web.pid'), 'utf8').trim()
+  assert.match(iterations, /^[1-9]\d*$/)
+  const count = Number(iterations)
+  async function remote(method, args) {
+    const response = await fetch(`${base}/api/${method}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ type: 'client-request', rpcId: `gate-${Date.now()}`, method, payload: { args } }),
+    })
+    const value = await response.json()
+    assert.ok(value.result?.ok, JSON.stringify(value.result?.error ?? value))
+    return value.result.value
+  }
+  const plugins = await remote('pluginManager/listPlugins', {})
+  const bot = plugins.find(plugin => plugin.moduleName === 'ds-bot')
+  assert.ok(bot?.entryId)
+  for (let iteration = 1; iteration <= count; iteration += 1) {
+    const offset = log().length
+    for (const enabled of [false, true]) {
+      const change = await remote('pluginManager/setPluginEnabled', { id: bot.entryId, enabled })
+      assert.equal(change.application, 'applied', JSON.stringify(change.error))
+    }
+    const probes = [[result.requesterSession, 'requester', true], [result.assigneeSession, 'assignee', false]]
+      .map(([session, role, closer]) => ({ session, closer, text: `Gate HMR first ${role} ${iteration}` }))
+    // No resolve, readiness await, warmup or pre-step before either first prompt.
+    await Promise.all(probes.map(probe => send(probe.session, probe.text)))
+    await settle()
+    const calls = log().slice(offset)
+    for (const probe of probes) {
+      // DSH may append runtime context after the user's first line.
+      const matching = calls.filter(call => call.session === probe.session
+        && call.last.trim().split(/\r?\n/, 1)[0] === probe.text)
+      assert.equal(matching.length, 1, `${probe.text}: exactly one normal request`)
+      const names = matching[0].toolNames
+      assert.ok(names?.includes('list_tasks'), `${probe.text}: list_tasks (MOCK_LOG_TOOLS=1 required)`)
+      assert.equal(names.includes('close_task'), probe.closer, `${probe.text}: close_task scope`)
+    }
+    assert.equal(readFileSync(join(home, 'web.pid'), 'utf8').trim(), pid, 'plugin HMR, not host restart')
+    assert.deepEqual(state().tasks[result.taskId].sessions, before)
+    assert.equal(state().tasks[result.taskId].state, 'open')
+    console.log(`hmr ${iteration}/${count}: requester close_task/list_tasks; assignee list_tasks only; 0 misses`)
+  }
+  result.hmr = { iterations: count, requesterChecks: count, assigneeChecks: count, misses: 0 }
+  writeFileSync(resultPath, JSON.stringify(result, null, 2))
+  console.log(`hmr: ${count} reloads, ${count * 2} first requests, 0 misses; same host and endpoints`)
 } else {
   const result = read(resultPath)
   if (phase === 'close') {

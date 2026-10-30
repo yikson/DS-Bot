@@ -10,6 +10,7 @@ import { absoluteLinks } from './links.js'
 import { NAME_MAX } from './requests.js'
 import { unquote } from './text.js'
 import { taskBrief } from './task-routing.js'
+import { deliveryId } from './delivery-id.js'
 import { SELF_UPDATE_REFUSAL } from './update.js'
 import { mentionSpans } from '../shared/mentions.js'
 import { checkShownView } from '../shared/views.js'
@@ -164,7 +165,7 @@ export function install(rt) {
         || [...rt.taskById.values()].some(task => Object.hasOwn(task.participants, self)))
     const dispose = taskToolAgents.get(agent)
     const task = rt.taskForSession(agent.session?.id)
-    const closer = task?.requester === self && task !== undefined || rt.branchOf(agent.session?.id)
+    const closer = rt.botOf(self) !== undefined && (task?.requester === self && task !== undefined || rt.branchOf(agent.session?.id))
     const mode = `${eligible ? 1 : 0}:${closer ? 1 : 0}`
     if (dispose?.mode === mode) return
     dispose?.()
@@ -199,7 +200,8 @@ export function install(rt) {
     for (const message of [...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])]) {
       const source = message.source
       if (source?.kind === SOURCE_KIND && source.role === 'request' && source.senderSessionId === senderId
-        && (source.audience === 'user') === toUser && !source.deferred && !source.resumed) return { message }
+        && (source.audience === 'user') === toUser && !source.deferred && !source.resumed
+        && deliveryId(source) === source.exchangeId) return { message }
     }
     return undefined
   }
@@ -284,6 +286,11 @@ export function install(rt) {
       const room = rt.roomOf(rt.groupOwners.get(exec.agent?.id)?.roomId)
       const branchContext = rt.branchOf?.(exec.agent?.id) ?? rt.relatedBranch?.(exec.agent?.id, target.id)
       const choice = rt.selectTaskRoute(sender, target, exec.agent?.id, args, room)
+      if (args.workdir !== undefined && (choice.kind !== 'new' || typeof args.workdir !== 'string' || !args.workdir.trim())) {
+        refuse('workdir is a full folder path used only when opening a new task')
+      }
+      const workdir = args.workdir === undefined ? undefined
+        : await rt.cleanWorkDir(args.workdir) ?? await rt.real(rt.teamFolder())
       const workChoice = choice.kind === 'legacy' ? choice.work : undefined
       // The request the caller named: it is admitted once, and a repeat of it is not sent again.
       const request = name === '' ? undefined : rt.requestIdentity({
@@ -297,6 +304,7 @@ export function install(rt) {
           when: args.when === 'queue' ? 'queue' : 'now',
           ...(workChoice === undefined ? {} : { work: workChoice }),
           ...(choice.id || choice.kind === 'new' ? { task: choice.id ?? 'new' } : {}),
+          ...(workdir === undefined ? {} : { workdir }),
         },
       })
       // What the caller gets for a request that was admitted before.
@@ -334,7 +342,7 @@ export function install(rt) {
         const work = toUser ? undefined : works[0]
         const route = choice.kind === 'legacy'
           ? await rt.routeBranch(sender, target, exec.agent?.id, text, toUser, choice.inherited ? undefined : workChoice)
-          : await rt.routeTask(choice, sender, target, exec.agent?.id, text, args)
+          : await rt.routeTask(choice, sender, target, exec.agent?.id, text, { ...args, ...(workdir === undefined ? {} : { workdir }) })
         const taskId = route.task?.id
         if (request && taskId) rt.bindRequestTask(request, taskId)
         const chat = route.sessionId ?? rt.chatOf(target.id)
@@ -417,6 +425,7 @@ export function install(rt) {
         type: 'string',
         description: 'An open task id from list_tasks, or "new" from an eligible root trunk. Inside a task, omit this or use its current id; new or different tasks are refused. Takes precedence over work.',
       },
+      workdir: { ...WORK_DIR_PARAM, description: 'Initial full folder path for every new task-owned participant Session. Only when opening a new task; later Session cd does not synchronize it.' },
     },
   })
   const closeTaskTool = defineTool({
@@ -913,25 +922,48 @@ export function install(rt) {
     ? `Bots cannot use ${BLOCKING_QUESTION_TOOL}. Ask with ask_user in your own chat, or ask in your reply.`
     : undefined))
   // Creation waits for this listener, so the Agent's first step already lacks the tool.
+  const registerTaskTools = agent => {
+    if (safe.stopped) return
+    hideBotUnusedTools(agent)
+    if (typeof agent?.ctx?.tools?.register !== 'function') return
+    if (!taskToolAgents.has(agent)) {
+      taskToolAgents.set(agent, undefined)
+      safe.effect(() => () => {
+        taskToolAgents.get(agent)?.()
+        taskToolAgents.delete(agent)
+      }, 'ds-bot: task tool scope', agent.ctx)
+    }
+    syncTaskTool(agent)
+  }
   safe.on('agent/created', async ({ agent }) => {
     try {
       await rt.load()
       if (safe.stopped) return
-      hideBotUnusedTools(agent)
-      if (typeof agent?.ctx?.tools?.register === 'function') {
-        if (!taskToolAgents.has(agent)) {
-          taskToolAgents.set(agent, undefined)
-          safe.effect(() => () => {
-            taskToolAgents.get(agent)?.()
-            taskToolAgents.delete(agent)
-          }, 'ds-bot: task tool scope', agent.ctx)
-        }
-        syncTaskTool(agent)
-      }
+      registerTaskTools(agent)
     } catch (error) {
       rt.warn('ds-bot: hiding %s on agent/created failed: %s', HIDDEN_TOOLS.join(', '), error)
     }
   })
+
+  const restoredTaskTools = Symbol('restored task tools')
+  const taskToolNames = new Set(['message_bot', 'list_tasks', 'close_task'])
+  const taskSchemas = schemas => JSON.stringify(schemas.filter(tool => taskToolNames.has(tool.name))
+    .sort((a, b) => a.name.localeCompare(b.name)))
+  safe.on('system-prompt/assemble', async (assembly, context, next) => {
+    const agent = context.agent
+    if (agent === undefined || context[restoredTaskTools]) return next()
+    await rt.load()
+    safe.signal.throwIfAborted()
+    context.signal?.throwIfAborted()
+    if (!rt.isBotSession(agent.id)) return next()
+    registerTaskTools(agent)
+    if (assembly.tools.some(tool => tool.name === 'run_code')) {
+      if (!taskToolAgents.get(agent)) return next()
+    } else if (taskSchemas(assembly.tools) === taskSchemas(ctx.tools.schemas(agent))) return next()
+    // DSH collects schemas (and the PTC SDK) before this awaited hook. Reassemble
+    // once after restoring this Agent, including when another assembly restored it.
+    return ctx.systemPrompt.assemble({ ...context, [restoredTaskTools]: true })
+  }, { prepend: true })
 
   // The /goal command stays open in every Session, so a goal started in a Bot chat or a
   // group is blocked at once; DSH's round driver then starts no round for it.
@@ -1076,5 +1108,18 @@ export function install(rt) {
     },
   }))
 
-  Object.assign(rt, { pickRoom, hideBotUnusedTools })
+  Object.assign(rt, { pickRoom, hideBotUnusedTools, registerTaskTools })
+  safe.effect(() => {
+    rt.taskToolsReady = rt.load().then(async () => {
+      const enabled = rt.config.taskSessionsEnabled === true ? rt.taskCapabilities() : new Set()
+      const ids = new Set([...rt.chatOwners.keys(), ...rt.groupOwners.keys(), ...rt.branchOwners.keys(), ...rt.taskOwners.keys()])
+      for (const id of ids) {
+        if (safe.stopped) return
+        const botId = rt.selfOf(id)
+        if (!enabled.has(botId) && ![...rt.taskById.values()].some(task => Object.hasOwn(task.participants, botId)) && rt.branchOf(id)?.state !== 'open') continue
+        await rt.resolveAgent(id).catch(error => { if (!safe.stopped) rt.warn('ds-bot: restoring tools for %s failed: %s', id, error) })
+      }
+    })
+    rt.taskToolsReady.catch(error => { if (!safe.stopped) rt.warn('ds-bot: restoring task tools failed: %s', error) })
+  }, 'ds-bot: restore task tools')
 }

@@ -1,5 +1,6 @@
 import { asyncScope } from './async.js'
 import { isDeepStrictEqual } from 'node:util'
+import { deliveryId as taskDeliveryId } from './delivery-id.js'
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const text = value => typeof value === 'string' && value.trim().length > 0
@@ -73,7 +74,8 @@ export function validateTask(task, id) {
   require(record(task.creationIntents) && record(task.pendingSends), 'creationIntents and pendingSends must be maps')
   require(task.sends === undefined || record(task.sends), 'send history must be a map')
   for (const [deliveryId, send] of Object.entries(task.sends ?? {})) {
-    require(record(send) && record(send.args) && send.args.taskId === id && send.args.exchangeId === deliveryId
+    require(record(send) && record(send.args) && send.args.taskId === id
+      && (send.args.exchangeId === deliveryId || taskDeliveryId(send.args) === deliveryId)
       && Object.hasOwn(task.participants, send.args.toId), 'invalid saved send identity')
     require(send.delivery?.summaryId === deliveryId, 'invalid saved delivery id')
     validateDeliveryUpdate(undefined, send.delivery)

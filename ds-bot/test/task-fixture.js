@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { createRuntime } from '../index.js'
 import { fakeContext } from './fake-ctx.js'
 
-export async function setup(t, config = {}, seed, notes) {
+export async function setup(t, config = {}, seed, notes, existingAgentOf) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-task-routing-'))
   const statePath = join(home, 'state.json')
   writeFileSync(statePath, JSON.stringify(seed ?? {
@@ -20,9 +20,10 @@ export async function setup(t, config = {}, seed, notes) {
   const ctx = fakeContext({ services: {
     agentPresets: { list: async () => [{ id: 'standard' }], serviceFor: () => undefined },
     agentDefaultModel: { currentSelection: () => profile, saveSelection: async value => restores.push(value) },
-    permissionPresets: { set: (session, preset) => permissions.push([session.id, preset]) },
+    permissionPresets: { resolve: value => value, set: (session, preset) => permissions.push([session.id, preset]) },
   } })
   const agentOf = id => {
+    if (existingAgentOf) return existingAgentOf(id)
     if (agents.has(id)) return agents.get(id)
     const events = logs.get(id) ?? (/^[a-d]$/.test(id) ? [{ type: 'turn/end', seq: 13, data: { reason: { kind: 'completed' } } }] : [])
     logs.set(id, events)
@@ -64,6 +65,7 @@ export async function setup(t, config = {}, seed, notes) {
   })
   const rt = createRuntime(ctx, { home, memory: false, taskSessionsEnabled: true, taskSessions: ['A', 'B'], ...config })
   await rt.load()
+  await rt.taskToolsReady
   rt.ensureCapabilities = async sessionId => {
     assert.ok(rt.isBotSession(sessionId))
     capabilities.push(sessionId)

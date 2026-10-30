@@ -1074,6 +1074,7 @@ export function install(rt) {
   safe.on('agent/pre-step', async function preparePart(payload, next) {
     await rt.load()
     const { agent } = payload
+    rt.registerTaskTools?.(agent)
     if (rt.taskForSession?.(agent.id)) return next()
     const past = rt.pastOwners.get(agent.id)
     if (past !== undefined && !rt.isBotSession(agent.id)) {

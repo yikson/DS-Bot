@@ -5,6 +5,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { BRANCH_SUMMARY_HEADER, HISTORY_TIMEOUT_MS, LONG_HEAD, MESSAGE_INLINE_MAX, READ_LINE_MAX, SOURCE_KIND, TEXT_KEPT, TEXT_SHOW_MAX } from './constants.js'
 import { headOf, textOf } from './text.js'
 import { taskBrief } from './task-routing.js'
+import { deliveryId } from './delivery-id.js'
 
 export function install(rt) {
   const safe = asyncScope(rt)
@@ -14,6 +15,7 @@ export function install(rt) {
     const resolved = await ctx.sessionController.resolveAgent(sessionId)
     if ('error' in resolved) throw Object.assign(new Error(resolved.error?.message ?? 'Session unavailable'), { code: resolved.error?.code })
     rt.hideBotUnusedTools(resolved.agent)
+    rt.registerTaskTools?.(resolved.agent)
     return resolved.agent
   }
 
@@ -95,6 +97,7 @@ export function install(rt) {
       senderName: fromName,
       ...(work ? { work } : {}),
       ...(taskId ? { taskId } : {}),
+      ...(args.continuationId ? { continuationId: args.continuationId } : {}),
       ...(fromId ? { senderSessionId: fromId } : {}),
       ...(replyTo ? { replyTo } : {}),
       ...(replySessionId ? { replySessionId } : {}),
@@ -142,6 +145,7 @@ export function install(rt) {
     if (candidate && JSON.stringify(candidate.source) === merge.source && JSON.stringify(candidate.content) === merge.content
       && candidate.source.senderSessionId === fromId && candidate.source.replySessionId === replySessionId
       && !candidate.source.deferred && !candidate.source.resumed
+      && deliveryId(candidate.source) === candidate.source.exchangeId
       && (audience === 'user' ? candidate.source.audience === 'user' : samePrivateWork(source, candidate.source))
       && agent.inbox.remove(candidate.id)) {
       const replaced = exchangeId

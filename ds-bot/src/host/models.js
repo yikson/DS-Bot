@@ -169,6 +169,10 @@ export function install(rt) {
     if (!force && bot.appliedModel === ref && (bot.appliedEffort ?? undefined) === effort) return ref
     const route = { ...splitRef(ref), ...(effort === undefined ? {} : { reasoningEffort: effort }) }
     await selectSessionModel(rt.chatOf(bot.id), route)
+    for (const sessionId of rt.taskSessionsOf(bot.id)) {
+      const result = await selectSessionModel(sessionId, route)
+      if (result?.error) throw new Error(result.error.message ?? 'Cannot apply task Session model')
+    }
     for (const sessionId of rt.groupSessionsOf(bot.id)) {
       await selectSessionModel(sessionId, route)
         .catch(error => rt.warn('ds-bot: model for %s in a group not applied: %s', bot.name, error))
