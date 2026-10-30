@@ -224,8 +224,10 @@ export function install(rt) {
   // What a Bot is doing, in one line for the Bots that work with it.
   function statusOf(botId) {
     const chat = rt.chatOf(botId)
-    const sessions = [...new Set([chat, ...(rt.groupSessionsOf?.(botId) ?? [])])]
+    const sessions = [...new Set([chat, ...(rt.groupSessionsOf?.(botId) ?? []), ...(rt.taskSessionsOf?.(botId) ?? [])])]
     const place = sessionId => {
+      const task = rt.taskForSession?.(sessionId)
+      if (task) return `in task "${task.title}"`
       const room = rt.roomOf(rt.groupOwners.get(sessionId)?.roomId)
       return room ? `in group "${room.name}"` : 'in its own chat'
     }

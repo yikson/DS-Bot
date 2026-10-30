@@ -322,6 +322,10 @@ export function install(rt) {
       const owner = rt.groupOwners.get(id)
       if (owner !== undefined) merged[owner.botId] ??= value
     }
+    for (const [id, value] of Object.entries(activity)) {
+      const owner = rt.taskOwners.get(id)
+      if (owner !== undefined) merged[owner.botId] ??= value
+    }
     // A Bot writing its handoff note is thinking.
     for (const job of rt.switchJobs()) {
       if (job.roomId === undefined) merged[job.botId] = 'thinking'
@@ -361,6 +365,12 @@ export function install(rt) {
       const botId = owner?.botId ?? rt.chatOwners.get(id)
       if (botId === undefined || (owner !== undefined && bots[botId] !== undefined)) continue
       bots[botId] = { since: entry.since, ...doingOf(entry), ...(owner ? { roomId: owner.roomId } : {}) }
+    }
+    for (const [id, owner] of rt.taskOwners) {
+      const entry = live.get(id)
+      if (entry?.turn === undefined) continue
+      bots[owner.botId] ??= { since: entry.since, ...doingOf(entry), taskId: owner.taskId,
+        taskTitle: rt.taskById.get(owner.taskId)?.title }
     }
     for (const job of rt.switchJobs()) {
       // `folder` marks the switch the chat must name: the working folder changed.
