@@ -179,7 +179,7 @@ test('the navigation guard resets across a full collapse and expansion cycle', (
 
 // A Bot working in its own chat previews what it is doing, the way a group row does
 // for members at work; an idle Bot keeps the last message preview.
-test('a running Bot\'s sidebar row shows what it is doing', () => {
+for (const task of [false, true]) test(`a Bot running in ${task ? 'a task' : 'its own chat'} shows its sidebar activity`, () => {
   viewport.innerWidth = 1280
   const bot = { id: 'writer', name: 'Writer', createdAt: 1 }
   const roster = { bots: [bot], rooms: [], agents: [], byId: { writer: bot }, ready: true, exchangeTurns: {} }
@@ -195,10 +195,11 @@ test('a running Bot\'s sidebar row shows what it is doing', () => {
     actions: Object.fromEntries(['openSession', 'openAgent', 'openAgentSession', 'newAgentSession', 'openMenu', 'openPalette', 'openNewChat', 'toggleSidebar', 'clearUnread'].map(name => [name, () => {}])),
     useRoster: pick => pick(roster), useUi: pick => pick({ unread: {} }), useRegistry: pick => pick({}),
     useSessions: pick => pick({ ids: [], byId: {} }), useUpdate: () => ({}),
-    useSessionStatus: pick => pick(new Map([['writer', { running: true }]])),
+    useSessionStatus: pick => pick(new Map([['writer', { running: !task }]])),
     useSessionRetainInfo: () => null,
     useActivity: pick => pick({ writer: 'working' }),
-    useWork: pick => pick({ waiting: {}, rooms: {}, approvals: [] }),
+    useWork: pick => pick({ waiting: {}, rooms: {}, approvals: [],
+      bots: task ? { writer: { taskId: 't1', taskTitle: 'Inspect task UX', since: 1 } } : {} }),
   })
   walk(tree)
   assert.equal(rows.length, 1)
@@ -223,11 +224,15 @@ test('a running Bot\'s sidebar row shows what it is doing', () => {
     if (Array.isArray(node)) return node.map(textOf).join('')
     return textOf(node.props?.children)
   }
-  collect(expand(rows[0].type(rows[0].props)))
+  const row = rows[0].type(rows[0].props)
+  assert.match(row.props['aria-label'], /Working/)
+  if (task) assert.match(row.props['aria-label'], /Inspect task UX/)
+  collect(expand(row))
   assert.equal(previews.length, 1)
   // The row already says Writer, so the preview is the doing phrase alone.
   assert.match(textOf(previews[0]), /^.+…$/)
   assert.doesNotMatch(textOf(previews[0]), /^Writer ·/)
+  if (task) assert.match(textOf(previews[0]), /^Inspect task UX ·/)
 })
 
 test('an idle Bot\'s sidebar row keeps the message preview', () => {

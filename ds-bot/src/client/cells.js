@@ -588,9 +588,13 @@ export function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnCl
       if (source.role === 'task-conclusion') {
         const task = roster.tasks?.find(task => task.id === source.taskId)
         const sessionId = task?.sessions?.[task.requester]
+        const conclusion = task?.conclusion
+        const text = conclusion ? [conclusion.text, conclusion.evidence, conclusion.link].filter(Boolean).join('\n\n')
+          : stripHeader(contentText(data.content))
         return h('div', { className: 'bt-branch-summary' },
           h('strong', null, t('Task closed')),
-          h('div', null, stripHeader(contentText(data.content))),
+          task ? h('div', null, `${task.title} · ${t(task.state)}`) : null,
+          h(MarkdownText, { text, labels: mdLabels(), variant: 'compact' }),
           sessionId ? h('button', { type: 'button', className: 'bt-mini', onClick: () => actions.openBranch(sessionId) }, t('Open task')) : null)
       }
       if (source.role === 'branch-summary') {

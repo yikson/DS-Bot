@@ -9,6 +9,25 @@ import { SOURCE_KIND } from '../src/host/constants.js'
 import { buildForkSeed } from '@deepseek-ai/dsh-session/fork'
 import { setup } from './task-fixture.js'
 
+test('task-owned turns make the Bot busy and name the task without hiding trunk or group work', async t => {
+  const f = await setup(t)
+  await f.send('a', 'B', { message: 'Inspect task UX' })
+  const task = f.tasks()[0]
+  const session = task.sessions.b
+  f.handling(session, f.incoming(session))
+  f.rt.live.get(session).since = Date.now()
+  assert.match(await f.tool('list_bots', {}, 'a'), /now: working in task "Inspect task UX" for less than a minute/)
+  assert.equal(f.rt.workView().b.taskId, task.id)
+  assert.equal(f.rt.workView().b.taskTitle, task.title)
+  f.rt.live.set('b', { turn: 8, since: Date.now() })
+  assert.match(f.rt.statusOf('b'), /working in its own chat.*working in task/)
+  assert.equal(f.rt.workView().b.taskId, undefined, 'own chat retains priority')
+  f.rt.live.delete('b')
+  f.rt.live.delete(session)
+  assert.equal(f.rt.workView().b, undefined)
+  assert.equal(f.rt.statusOf('b'), 'idle')
+})
+
 for (const gate of [false, true]) {
   for (const a of [false, true]) for (const b of [false, true]) {
     test(`root routing matrix gate=${gate} pair=${Number(a)}${Number(b)}`, async t => {
