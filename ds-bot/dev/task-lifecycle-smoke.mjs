@@ -120,7 +120,9 @@ if (phase === 'open') {
     await settle()
     const calls = log().slice(offset)
     for (const probe of probes) {
-      const matching = calls.filter(call => call.session === probe.session && call.last.trim() === probe.text)
+      // DSH may append runtime context after the user's first line.
+      const matching = calls.filter(call => call.session === probe.session
+        && call.last.trim().split(/\r?\n/, 1)[0] === probe.text)
       assert.equal(matching.length, 1, `${probe.text}: exactly one normal request`)
       const names = matching[0].toolNames
       assert.ok(names?.includes('list_tasks'), `${probe.text}: list_tasks (MOCK_LOG_TOOLS=1 required)`)
