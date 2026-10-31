@@ -36,7 +36,7 @@ export function install(rt) {
   }
   async function deferConclusion(args, budget) {
     if (!budget.warned) {
-      await commit(args.taskId, task => { task.delivery.state = 'pending'; return task })
+      if (args.role === 'task-conclusion') await commit(args.taskId, task => { task.delivery.state = 'pending'; return task })
       budget.warned = true
       rt.warn('ds-bot: conclusion %s remains pending until next startup: retry limit reached (%d attempts)', args.exchangeId, MAX_CONCLUSION_ATTEMPTS)
     }
@@ -56,6 +56,7 @@ export function install(rt) {
       const result = await safe.race(action({ ...args, [CONCLUSION_ATTEMPT]: attempt }), HISTORY_TIMEOUT_MS, TIMED_OUT)
       check()
       if (result === TIMED_OUT) throw new Error('Task conclusion attempt timed out; delivery remains pending')
+      if (args.role === 'worker-result') budget.attempts = 0
       return result
     } catch (error) {
       // A timed-out resolve/inspect may still finish; it must never save or enqueue.
@@ -80,7 +81,7 @@ export function install(rt) {
     return legacy && deliveryId(legacy.args) === deliveryId(args) ? legacy : undefined
   }
   const ledgerOf = (task, args) => args.role === 'task-conclusion' ? task.delivery : sendOf(task, args)?.delivery
-  const destination = (task, args) => args.role === 'task-conclusion'
+  const destination = (task, args) => args.role === 'worker-result' ? args.requesterSessionId : args.role === 'task-conclusion'
     ? rt.chatOf(task.requester) : task.participants[args.toId]?.kind === 'trunk'
       ? rt.chatOf(args.toId) : task.sessions[args.toId]
   const updateLedger = (args, update) => commit(args.taskId, task => {
@@ -92,6 +93,7 @@ export function install(rt) {
   async function prepare(args) {
     check(args)
     const task = taskOf(args.taskId)
+    if (args.role === 'worker-result') workerIdentity(task, args)
     if (args.role === 'task-conclusion' && (task.state === 'open'
       || task.delivery?.summaryId !== args.exchangeId || args.toId !== task.requester)) throw new Error('Invalid task conclusion')
     if (args.role !== 'task-conclusion' && task.state !== 'open'
@@ -131,6 +133,7 @@ export function install(rt) {
   function atBoundary(args, { forwarding = false } = {}) {
     check(args)
     const task = taskOf(args.taskId)
+    if (args.role === 'worker-result') workerIdentity(task, args)
     if (args.role === 'task-conclusion') {
       if (task.state === 'open' || task.delivery?.summaryId !== args.exchangeId || args.toId !== task.requester) throw new Error('Invalid task conclusion')
     } else {
@@ -146,7 +149,7 @@ export function install(rt) {
     }
     return task
   }
-  const matches = (source, args) => source?.kind === SOURCE_KIND
+  const matches = (source, args) => source?.kind === (args.role === 'worker-result' ? 'worker-result' : SOURCE_KIND)
     && source.taskId === args.taskId && deliveryId(source) === deliveryId(args)
   async function observe(sessionId, args) {
     check(args)
@@ -260,6 +263,39 @@ export function install(rt) {
     }
     return result
   }
+  function workerIdentity(task, args) {
+    const worker = task.workers?.[args.workerId]
+    const run = worker?.runs[args.runId]
+    if (task.state !== 'open' || task.phase !== 'ready' || !worker || !run?.result
+      || run.result.id !== args.resultId || run.result.text !== args.text
+      || worker.requesterSessionId !== args.requesterSessionId || worker.requestedBy !== args.toId
+      || task.sessions[args.toId] !== args.requesterSessionId || task.participants[args.toId]?.kind === 'trunk'
+      || rt.ctx.workspaceRegistry?.archivedSessionIds?.includes(args.requesterSessionId)) {
+      throw new Error('Worker result endpoint or identity is unavailable; delivery remains pending')
+    }
+  }
+  async function deliverWorkerResult(args, attempt) {
+    const scoped = { ...args, ...(attempt?.[CONCLUSION_ATTEMPT] ? { [CONCLUSION_ATTEMPT]: attempt[CONCLUSION_ATTEMPT] } : {}) }
+    check(scoped)
+    if (taskOf(args.taskId).state !== 'open') return
+    return rt.withTask(args.taskId, () => runDelivery(scoped, {}, async deliveryArgs => {
+      const agent = await rt.resolveAgent(deliveryArgs.requesterSessionId)
+      check(deliveryArgs)
+      const inspected = await rt.ctx.sessionController.inspect(agent.id, AbortSignal.timeout(HISTORY_TIMEOUT_MS))
+      check(deliveryArgs)
+      if (!Array.isArray(inspected?.events)
+        || rt.ctx.workspaceRegistry?.archivedSessionIds?.includes(agent.id)) throw new Error('Worker result endpoint is unavailable')
+      atBoundary(deliveryArgs)
+      agent.followup(createUserMessage({
+        content: [{ type: 'text', text: deliveryArgs.text }],
+        source: { kind: 'worker-result', taskId: args.taskId, workerId: args.workerId,
+          runId: args.runId, resultId: args.resultId, requesterSessionId: args.requesterSessionId },
+      }))
+      await rt.ctx.sessions.flush(agent.session)
+      check(deliveryArgs)
+      return args.resultId
+    }))
+  }
   async function recordLate(id, sessionId, exchangeId, text = '') {
     const resultId = `${exchangeId}:reply`
     const task = taskOf(id)
@@ -281,7 +317,8 @@ export function install(rt) {
   }
   function dependencies(id, caller) {
     const currentWork = rt.workOf(rt.live.get(caller)?.info)
-    return Object.values(taskOf(id).pendingSends).some(send => send.state !== 'terminal')
+    return rt.workerDependencies?.(taskOf(id))
+      || Object.values(taskOf(id).pendingSends).some(send => send.state !== 'terminal')
       || Object.entries(rt.state.works ?? {}).some(([workId, work]) => work.taskId === id && workId !== currentWork)
       || [...rt.live.entries()].some(([sessionId, entry]) => entry.turn !== undefined && sessionId !== caller
         && (ofTurn(sessionId, entry) === id || rt.taskForSession(sessionId)?.id === id))
@@ -368,6 +405,7 @@ export function install(rt) {
           }
           for (const saved of Object.values(task.sends ?? {})) {
             if (saved.delivery.state === 'delivered' || saved.args.merge) continue
+            if (saved.args.role === 'worker-result') continue
             try {
               await enqueue({ ...saved.args, resent: true }, {})
               check()
@@ -403,6 +441,7 @@ export function install(rt) {
     }
   }
   Object.assign(rt, { taskOfTurn: ofTurn, taskDependencies: dependencies, recordTaskLateReply: recordLate,
+    deliverWorkerResult, attemptTaskResult: attemptConclusion,
     prepareTaskDelivery: prepare, checkTaskDelivery: atBoundary, runTaskDelivery: runDelivery,
     closeTask, recoverTaskLifecycle: recover, taskLifecycleCheck: check, removeTaskBot: removeBot,
     confirmTaskDeliveryTarget: async args => {

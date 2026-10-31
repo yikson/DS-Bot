@@ -47,6 +47,7 @@ fixed target runtime in W1; source inspection is not runtime acceptance.
 | Admission | `sessionController.prompt(request, signal)` | Signal is mandatory. `{ accepted: true }` is inbox admission, not completion or flush. The controller may await inside admission after its entry signal check |
 | Correlation | `agent/inbox/inserted`, `agent/inbox/claimed { message, turn }`; `packages/core/agent-loop/src/inbox.ts` | Persist/replay `agent/inbox/spliced`; bind the identified message to its claimed turn before any `user/message` exists |
 | Lifecycle | Awaited serial `agent/created`; `Agent.cancel`, `whenIdle` | Creation holds queued work until listeners finish. Cancellation acknowledgement is only a request; quiescence needs evidence |
+| Worker marker | `session.append('session/title', ...)`, then `ctx.sessions.flush`; controller `inspect()` | The initial log-only `worker:<taskId>:<workerId>` title event identifies the Session from immutable history, independent of its current title |
 
 The root-factory creation path supplies provider, model and reasoningEffort
 only through `agentOptions`. Prompt that newly created Agent immediately after
@@ -340,6 +341,29 @@ prompt-capable worker; unknown/malformed claims stay denied. Creation uses the
 default Agent preset, including any extra scoped tools. The execution deny
 makes forbidden preset tools unusable; there is no worker-specific preset.
 
+Before native creation, flush an append-only `workers.created.jsonl` record
+containing only the reserved Session/task/worker ids and marker. During
+unpublished setup append the marker as a documented log-only `session/title`
+event with `messageSeqs: []` and `source: { kind: "user" }` (the supported
+explicit-title shape, also used by `sessionTitle.rename`);
+flush the Session before the first prompt. Later title renames and surface
+compaction do not remove that event. Read it through controller `inspect()`
+and cache identity per Session, never derive identity from the latest title.
+The reserved `worker:<taskId>:<workerId>` value is an immutable historical
+record even after a later rename; it is not the mutable title projection.
+This creation record is a security tombstone, not another worker state table.
+
+When the ownership index cannot be read, a marked worker refuses every tool,
+including permitted native shell/file names, and cold native activation.
+If both ownership and marker reads fail, a creation-record hit still refuses
+all tools and activation. A live worker's pre-step barrier also blocks model
+work during that window. The controller has no public live-prompt admission
+hook: a live prompt RPC can acknowledge enqueue, but the turn is blocked before
+model execution. Cold activation rejects the RPC at the awaited creation gate.
+User-created plain DSH Sessions absent from the creation record and worker
+marker remain unaffected. Restoring readable ownership permits normal policy
+reconciliation, except permanently closed admissions remain closed.
+
 The minimal worker setup helper installs policy, permissions and listeners
 during unpublished `ctx.agents.create` setup; initial route/effort are supplied
 only by `agentOptions`. Its final publication check revalidates the task,
@@ -350,8 +374,7 @@ starts detached work or waits for `whenIdle()` inside creation. Failure is
 propagated as a controlled creation/resume error with diagnostics, not an
 unhandled listener rejection or app-boot fatal.
 
-For HMR-surviving live Agents, reattach before permitting another tool or
-coordinator prompt. Keep a deny-all transition barrier in the Agent scope
+Keep a deny-all transition barrier in any surviving Agent scope
 until the new generation has loaded and verified ownership/policy; a stopped
 generation cannot leave an unguarded execution window. Worker-scoped effects
 are owned by the Agent scope, with explicit takeover/cleanup on generation
@@ -503,17 +526,20 @@ completed/failed/unknown finish rather than rewriting history as cancelled.
 
 ### Plugin-only HMR
 
-First inspect whether the exact native Agent is still live and whether the
-matching turn has ended. If it is running, reinstall the policy barrier and
-listeners and continue observing that same run. Do not mark it unknown,
-clear its accepted input or issue another prompt. If it already ended while
-the plugin was absent, flush/read the log and settle once. A cancelling live
-Agent stays cancelling until quiescence.
+On the pinned DSH, `ctx.agents.create` binds the Agent to the calling plugin.
+Reload disposes those Agents; W1 accepts that lifecycle. An unsettled run
+whose native turn ends `aborted / disposed` becomes `unknown` with reason
+`plugin-reload`, preserving the native reason as evidence and the warning
+`may have partially run; not re-run`. If no terminal event exists, same-host
+creation-generation evidence plus an absent Agent yields the same unknown
+outcome. Close that worker's admissions permanently. Deliver one result through
+the task ledger; never recreate or re-prompt that Session.
 
-If DSH tears an Agent down during recomposition, use its actual abort/terminal
-evidence. Missing evidence during plugin replacement remains reconciliation
-pending; it is not proof of host restart. Preserve HMR generation checks after
-every await, with only the exact admission-compensation exception above.
+Earlier completed/failed/interrupted evidence keeps its existing classification;
+HMR cannot rewrite a settled run. If a host-owned Agent survives a future
+creation path, reattach its barrier before dispatch and observe its exact turn.
+That path is a W2 investigation, not a W1 continuity promise. Preserve generation
+checks after every await and the exact admission-compensation exception above.
 
 ### Host restart
 
@@ -699,7 +725,9 @@ Example of one settled run (optional lifecycle timestamps omitted):
 
 The existing task send ledger, not a duplicate field on the run, stores result
 delivery state, fixed target, retry observations and acknowledgement. Runtime
-Promise/generation/Agent handles are not serialized. Full accepted prompts
+Promise/Agent handles are not serialized. Immutable `createdHost` and
+`createdGeneration` identifiers distinguish a same-host plugin replacement
+from a process restart; they are evidence, not runtime handles. Full accepted prompts
 and transcripts stay in native logs; the admission key/digest identifies an
 attempt without pretending a missing accepted prompt can safely be rerun.
 `initialModel` is the creation request for audit only. Actual route/effort come
@@ -777,8 +805,9 @@ credentials. Minimal diagnostics suffice in W1; richer UI can wait.
 8. Each admission has durable identity before prompt; each run has at most one
    in-flight prompt. A stale accepted prompt is cancelled/drained, not rerun.
 9. Inbox identity/claim binds the exact turn, including pre-user-message errors.
-10. Only completed is success. Cancellation ack is not cancelled; a live HMR
-    turn is not unknown. Every matched interrupted end is unknown with its
+10. Only completed is success. Cancellation ack is not cancelled; plugin-owned
+    HMR disposal is unknown/plugin-reload, with one result and closed admissions.
+    Every matched interrupted end is unknown with its
     exact reason and partial-execution warning, never an automatic rerun.
 11. Worker log flush precedes result settlement; task delivery uses raw-log
     dedupe, fixed target, flush-before-ack and bounded recovery.
@@ -837,6 +866,12 @@ the mock model on a fixed real DSH in an isolated profile, plus applicable
 unit regressions. A unit fake that repeats the design's assumptions is not
 evidence for those API boundaries.
 
+The maintainer accepted the external W1 report at PR #46 comment 6543796856,
+with the fail-closed marker fix and HMR disposition specified above. Its
+BLOCKED exhaustive A2 pause-point matrix, A7 crash-point matrix and A5
+re-registration variants are deferred to the explicit W2/W4 exits below;
+partial W1 evidence must not be described as exhaustive certification.
+
 When disabled with no worker data, compare tools/schemas, task creation/
 closure, DSH Agent create/adopt/resolve and Bot model/permission behavior
 against the base. There must be no behavior or data-shape change. Existing
@@ -855,6 +890,16 @@ Exit requires A1-A10 rerun for follow-up and every control/close race, with
 completed/failed/unknown plus actual idle checked; cancelled remains closed.
 Both lowered limits and flag/capability removal preserve readable history.
 
+Investigate a documented host-owned creation path that survives plugin reload
+while retaining `agentOptions` plus DSH header replay as the single model
+authority. Do not patch DSH or add another model-selection helper.
+
+Exit also requires injectable pause points on the real isolated host: finish
+A2's create/setup/admission/save/flush/control races, A7's full intent/enqueue/
+flush/ack crash matrix, and A5's HMR/re-registration/ordinary/PTC variants.
+Record each pause/crash location and exact evidence, including variants that
+were BLOCKED in the external W1 report.
+
 ### W3: task-header UI and provenance
 
 Implement worker rows/state/elapsed/Session links and worker-result messages.
@@ -872,6 +917,10 @@ W1 APIs. Use the
 DS Bot/DSH versions, commit and compatible rollback target, and stop every
 bench/process started for acceptance. No live Desktop or private user data.
 
+W4 must rerun the exhaustive A2/A7/A5 variants from W2 with injectable pause
+points on the exact release runtime. They are release exit criteria, not
+optional follow-up tests or claims already satisfied by W1.
+
 ### Required matrix
 
 These are required outcomes to prove, not a report of tests already passed.
@@ -880,12 +929,12 @@ All safety rows use the pinned real DSH plus mock and isolated data.
 | ID / review | Scenario and exit evidence | Slice exit |
 |---|---|---|
 | A1 / R6 | Pre-step rejects; assemble/prepare fails before rpcId user-message; prompt remains in inbox; claim precedes user-message; completed with no text. Exact splice/message/claim/turn yields one correct result, never permanent running | W1; W2 follow-up variants |
-| A2 / R7 | Pause every create/setup/prompt-admission/save/flush await; race run, follow-up, cancel, close, Bot deletion and HMR. Durable intents fence and drain late admission; no unaccounted enqueue, ghost worker, duplicate run or lane deadlock. There is no approval await | W1 internal controls; W2 tool controls |
-| A3 / R7 | Plugin-only HMR with still-running native Agent, ended-but-missed event, and cancel not yet idle: reattach, never infer unknown from live work. Host crash without terminal evidence yields unknown once. Also native UI resumes the Session before worker recovery scans: matched synthetic interrupted closer, with/without original user/message, always yields unknown, exact interrupted reason and `may have partially run; not re-run`; never auto-rerun | W1; W2 |
+| A2 / R7 | Pause every create/setup/prompt-admission/save/flush await; race run, follow-up, cancel, close, Bot deletion and HMR. Durable intents fence and drain late admission; no unaccounted enqueue, ghost worker, duplicate run or lane deadlock. There is no approval await | W1 observed internal controls; exhaustive pause-point matrix BLOCKED at W1, required W2/W4 with injectable pause points |
+| A3 / R7 | Plugin HMR disposes plugin-owned running Agents: unknown/plugin-reload, native disposed evidence, partial-execution warning, closed admissions, one result, no re-prompt. Preserve earlier completed/interrupted evidence. Host crash without terminal evidence yields unknown once. Native UI resume before recovery with synthetic interrupted closer, with/without original user/message, always yields unknown and exact interrupted reason/warning; never auto-rerun | W1; W2 host-owned survival investigation |
 | A4 / R3 | Native UI/API cold resume has policy before tool dispatch; default/overridden preset includes scoped forbidden tools. Gate errors reject/deny with bounded diagnostic and no app-boot fatal; HMR takeover has no unguarded window | W1; W2 |
-| A5 / R2-R3 | Denied team/worker/subagent/goal/schedule/plugin-manager names and aliases stay denied through scoped registration, HMR/re-registration and mid-await definition replacement, in ordinary and PTC calls; no replacement body executes under a denied name. Unknown names fail closed. Allowed-name replacement inside the tools/execute await by an installed host plugin, and shell-launched CLIs, are outside the guarantee; do not claim definition binding | W1; W2 |
+| A5 / R2-R3 | Denied team/worker/subagent/goal/schedule/plugin-manager names and aliases stay denied through scoped registration, HMR/re-registration and mid-await definition replacement, in ordinary and PTC calls; no replacement body executes under a denied name. Unknown names fail closed. Allowed-name replacement inside the tools/execute await by an installed host plugin, and shell-launched CLIs, are outside the guarantee; do not claim definition binding | W1 observed denies; BLOCKED re-registration variants required W2/W4 with injectable pause points |
 | A6 / R1,R4,R5,R13 | Requester ask/never and read-only/workspace-write/full-access combinations; no named read-only preset; forced never with no answerers/UI or with UI disconnected; explicit full access rejected; implicit execute capped at workspace-write; verify uses direct read-only API or refuses. Tighten running Bot/task permission. Different cd/header.cwd, cross-root/symlink/guarded roots and worker cd are checked; follow-up retains current cd | W1; W2 |
-| A7 / R9 | Crash after accepted/turn-end before worker flush, and before/after each result intent/enqueue/receiver-flush/ack. Raw-log compaction/dedupe; transient inspect/save/flush failure retries; deleted/archived/unexpected endpoint stays pending. One resultId, no duplicate delivery or trunk fallback | W1; W2 |
+| A7 / R9 | Crash after accepted/turn-end before worker flush, and before/after each result intent/enqueue/receiver-flush/ack. Raw-log compaction/dedupe; transient inspect/save/flush failure retries; deleted/archived/unexpected endpoint stays pending. One resultId, no duplicate delivery or trunk fallback | W1 observed dedupe; exhaustive crash points BLOCKED at W1, required W2/W4 with injectable pause points |
 | A8 / R7-R8 | Terminal commit followed by half-completed cancellation failure/crash; every terminal entry point; already-queued unconsumed result; late success/error. Resume narrow cleanup, settle cancelled results, never revive; conclusion and summaryId unchanged with no second admission | W1; W2 |
 | A9 / R10 | Two workers with explicit/configured/Bot/default efforts and interleaved UI default changes: initial route enters only through creation agentOptions, with no second helper. Cold resume with header present: assert actual subsequent request/header provider/model/effort follows DSH's durable record. Restart after creation before first header: unknown, no model request, native UI/API/follow-up refused permanently; PM must use new run_worker. Assert zero worker-caused profile-default writes and no other Bot/task route changes. Existing S2 restore behavior is not claimed fixed | W1; W2 |
 | A10 / R11-R13 | Empty flag-off schemas/tasks/DSH Agent paths match base; on-to-off recovery; lower both limits; delete requester Bot; old/absent/empty/non-empty workers round-trip. Historical validation remains valid, no unnecessary empty map, non-empty data blocks unaware rollback. Bidirectional worker/Bot/Agent/task/fork adoption fails | W1; W2; W4 rollback |
@@ -922,6 +971,9 @@ Known limits:
 
 - Same-host Sessions do not survive host exit. Unknown outcome is not proof
   of no external side effect, and delivery dedupe is not exactly-once execution.
+- W1 plugin-owned workers are disposed on plugin reload. The unsettled run is
+  unknown/plugin-reload, warns of partial execution, delivers once and cannot
+  be re-prompted. Surviving host-owned creation is a W2 investigation.
 - DSH tool policy cannot stop an allowed shell from launching another CLI,
   background process or service call. It is not a process/container sandbox.
 - A preset is trusted host code, not a security boundary. Arbitrary malicious

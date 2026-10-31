@@ -488,6 +488,8 @@ export function install(rt) {
   async function resumeAll() {
     await rt.load()
     if (stopped || rt.readOnly() !== undefined) return
+    await rt.recoverWorkers?.()
+    if (stopped) return
     await rt.recoverTasks()
     if (stopped) return
     for (const bot of Object.values(rt.state?.bots ?? {})) {

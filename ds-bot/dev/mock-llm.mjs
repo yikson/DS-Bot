@@ -30,6 +30,7 @@
 //   视图选项 (options card, waits) · 视图表单 (form card, waits) · 视图展示 (display-only
 //   stack) · 大视图 (display-only, just under the byte limit)
 //   查能力 [词] (names the mcp__ tools and catalog skills that contain 词; also in a group)
+//   MOCK_TOOL {"name":"tool_name","arguments":{...}} (one scripted native tool call)
 //   A message with a file (a long Bot message as a file, a file the user sent): the Bot
 //   reads the saved path, then says how many lines it read and how the file ends.
 // Memory panel: a summary restating the entries; asks 记住|remember X, 团队记住 X,
@@ -285,6 +286,14 @@ function decide(body) {
   }
 
   const userText = textOf(last?.content).trim()
+  if (userText.startsWith('MOCK_TOOL ')) {
+    try {
+      const call = JSON.parse(userText.split('\n')[0].slice('MOCK_TOOL '.length))
+      return [tool(call.name, call.arguments ?? {})]
+    } catch {
+      return [text('Invalid MOCK_TOOL JSON command.')]
+    }
+  }
   // "撑爆": the provider rejects the request as past its window.
   if (userText.startsWith('撑爆')) return 'overflow'
   // A file in the message (a long Bot message, a file the user sent): DSH gives its saved

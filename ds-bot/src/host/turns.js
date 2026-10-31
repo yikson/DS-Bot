@@ -21,6 +21,7 @@ const PRIVATE_INPUT_ROLES = new Set(['request', 'stopped', 'reply'])
 
 // DSH context snapshots use user/message too, but do not change turn visibility.
 const turnInput = (source) => {
+  if (source?.kind === 'worker-result') return 'private'
   if (CONTEXT_ONLY_KINDS.has(source?.kind)) return 'context'
   if (VISIBLE_INPUT_KINDS.has(source?.kind)) return 'visible'
   if (source?.kind === SOURCE_KIND) {
@@ -494,6 +495,14 @@ export function install(rt) {
         break
       case 'user/message': {
         const source = event.data?.source
+        if (source?.kind === 'worker-result') {
+          if (entry.turn === undefined) entry.pending = { ...source, role: 'worker-result' }
+          else if (!entry.opened) claimTrigger(id, entry, { ...source, role: 'worker-result' })
+          entry.opened = true
+          entry.answers = true
+          entry.steerable = false
+          break
+        }
         const input = turnInput(source)
         if (entry.turn !== undefined && input !== 'context' && input !== 'private') {
           entry.steerable = false
@@ -673,7 +682,7 @@ export function install(rt) {
         const wroteCall = failure === undefined && reason?.kind === 'completed' && lastCalled !== true && writesToolCall(lastText)
         const taskId = info?.taskId ?? rt.taskForSession?.(id)?.id
         const terminalTask = taskId && rt.taskOf(taskId)?.state !== 'open'
-        const retry = !terminalTask && wroteCall && info?.retried !== true && !(info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))
+        const retry = !terminalTask && info?.kind !== 'worker-result' && wroteCall && info?.retried !== true && !(info?.role === 'room' && stoppedRoomTurns.has(info.exchangeId))
         if (retry) safe.run('turns background job', () => retryWrittenCall(id, info, event.data.turn).catch(error => rt.warn('ds-bot: asking %s to run its written tool call failed: %s', id, error)))
         // A model call that failed on a transient fault is run again on the same trigger,
         // so whoever waits keeps waiting instead of hearing that the Bot gave up. A group

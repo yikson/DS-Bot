@@ -197,6 +197,10 @@ export function historyEntry(event, group) {
     return text === '' ? undefined : { answer: true, text }
   }
   const source = event.data?.source
+  if (event.type === 'user/message' && source?.kind === 'worker-result') {
+    return { answer: false, who: 'worker', text: textOf(event.data.content), keepAnswers: true,
+      provenance: { ...source, sessionId: source.requesterSessionId, seq: event.seq } }
+  }
   if (event.type === 'user/message' && source?.kind === REPLY_KIND) {
     return { answer: false, who: 'user', text: replyText(textOf(event.data.content)), keepAnswers: true }
   }
@@ -416,7 +420,8 @@ export function install(rt) {
       const kept = entry.keepAnswers ? answers : []
       answers = []
       yield* kept
-      if (entry.text !== '') yield { text: entry.who === 'user' ? `User: ${entry.text}` : entry.text, time: event.time, seq: event.seq, who: entry.who }
+      if (entry.text !== '') yield { text: entry.who === 'user' ? `User: ${entry.text}` : entry.text, time: event.time, seq: event.seq, who: entry.who,
+        ...(entry.provenance ? { provenance: entry.provenance } : {}) }
     }
   }
 

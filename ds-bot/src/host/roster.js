@@ -89,6 +89,7 @@ export function install(rt) {
     const preset = await botPreset()
     if (onCreated && safe.stopped) throw new Error('Task Session creation stopped')
     const { sessionId } = await ctx.sessionController.create({ ...place, ...preset })
+    await rt.assertNonWorkerSession?.(sessionId)
     if (onCreated) await onCreated(sessionId)
     const agent = await rt.resolveAgent(sessionId)
     if (onCreated && safe.stopped) throw new Error('Task Session setup stopped')

@@ -3,6 +3,7 @@
 // or group chat it belongs to.
 import { asyncScope } from './async.js'
 import { validateTask } from './tasks.js'
+import { workerClaims } from './worker-data.js'
 import { mkdirSync, statSync } from 'node:fs'
 import { copyFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -33,6 +34,7 @@ export function install(rt) {
   let holder
   let lockBroken = false
   let stuck
+  let readError
   let warnedReadOnly = false
   let stopped = false
   // mtime and size of the state.json this host last read or wrote.
@@ -65,6 +67,11 @@ export function install(rt) {
     const where = holder.pid ? `pid ${holder.pid}${holder.host ? ` on ${holder.host}` : ''}` : 'unknown process'
     return `The Bot team in ${home} is open in another dsh (Web or Desktop, ${where}). This window shows the team but cannot change it; close the other one and reload.`
   }
+  const unreadable = (reason, detail = reason) => {
+    if (readError === undefined) warn('ds-bot: unreadable state %s: %s', statePath, detail)
+    readError = reason
+    rt.indexWorkers?.()
+  }
 
   const readFileState = async () => {
     let contents
@@ -74,10 +81,11 @@ export function install(rt) {
       seen = stamp()
       if (error?.code === 'ENOENT') {
         stuck = undefined
+        readError = undefined
         return undefined
       }
       stuck = error?.code ?? error?.message ?? String(error)
-      warn('ds-bot: unreadable state %s: %s', statePath, error)
+      unreadable(stuck, error)
       return undefined
     }
     seen = stamp()
@@ -85,28 +93,34 @@ export function install(rt) {
     try {
       parsed = JSON.parse(contents)
     } catch (error) {
+      const reason = error?.message ?? String(error)
+      if (readError === reason) return undefined
       const backup = `${statePath}.broken-${Date.now()}`
       try {
         await copyFile(statePath, backup)
         stuck = undefined
-        warn('ds-bot: unreadable state %s: %s; backed up as %s', statePath, error, backup)
+        unreadable(reason, `${error}; backed up as ${backup}`)
       } catch (copyError) {
         stuck = copyError?.code ?? copyError?.message ?? error?.message ?? String(error)
-        warn('ds-bot: unreadable state %s: %s; backup failed: %s', statePath, error, copyError)
+        unreadable(reason, `${error}; backup failed: ${copyError}`)
       }
       return undefined
     }
     if (parsed?.version === 1) {
       stuck = undefined
+      readError = undefined
       return parsed
     }
     stuck = 'saved by a newer DS Bot; update DS Bot'
+    unreadable(stuck)
     return undefined
   }
 
   // Fill `state` from the saved file and bring an older team up to date. Returns the
   // groups whose Session titles still need the new name.
   const adopt = (parsed) => {
+    // A failed read is not evidence that persisted Session ownership disappeared.
+    if (readError !== undefined) return { migrated: false, stale: [] }
     const hadCapabilities = parsed !== null && parsed !== undefined && Object.hasOwn(parsed, 'capabilities')
     for (const key of Object.keys(state)) delete state[key]
     Object.assign(state, JSON.parse(EMPTY), parsed ?? {})
@@ -278,7 +292,7 @@ export function install(rt) {
       }
       warn('ds-bot: %s', readOnly())
     }
-    if ((stuck !== undefined || holder !== undefined) && stamp() !== seen) adopt(await readFileState())
+    if (readError !== undefined || (holder !== undefined && stamp() !== seen)) adopt(await readFileState())
   }
 
   const warnReadOnly = () => {
@@ -388,7 +402,9 @@ export function install(rt) {
   const validateTaskSessions = (task, claims = taskSessionClaims()) => {
     // Read persisted Agent claims directly: their live index rebuilds after task validation.
     const agentSessions = new Set(Object.values(state.agents).flatMap(agent => agent.sessions ?? []))
+    const workers = workerClaims(state)
     for (const [botId, sessionId] of Object.entries(task.sessions)) {
+      if (workers.has(sessionId)) throw new Error(`Task ${task.id}: endpoint is worker-owned`)
       const trunk = task.participants[botId].kind === 'trunk'
       if (agentSessions.has(sessionId) || (!trunk && (own(state.bots, sessionId) || own(state.rooms, sessionId)
         || chatOwners.has(sessionId) || groupOwners.has(sessionId) || pastOwners.has(sessionId) || branchOwners.has(sessionId)))) {
@@ -403,6 +419,14 @@ export function install(rt) {
       // Include every valid saved record, so conflicts fail closed in either load order.
       const others = trunk ? claims.get(sessionId)?.owned : claims.get(sessionId)?.all
       if (others && others.size > Number(others.has(task.id))) throw new Error(`Task ${task.id}: Session is already owned`)
+    }
+    for (const worker of Object.values(task.workers ?? {})) {
+      const id = worker.sessionId
+      if (own(state.bots, id) || own(state.rooms, id) || agentSessions.has(id)
+        || chatOwners.has(id) || groupOwners.has(id) || pastOwners.has(id) || branchOwners.has(id)
+        || claims.has(id) || workers.get(id)?.some(claim => claim.taskId !== task.id || claim.workerId !== worker.id)) {
+        throw new Error(`Task ${task.id}: worker Session is already owned`)
+      }
     }
   }
   const taskOf = id => taskById.get(id)
@@ -464,6 +488,7 @@ export function install(rt) {
     }
     // The agents module owns the DSH Agent session index; it installs after this.
     rt.indexAgents?.()
+    rt.indexWorkers?.()
     rt.syncTaskTools?.()
   }
   // The Bot a Session speaks for: its own chat, one of its group Sessions, or an
@@ -514,7 +539,7 @@ export function install(rt) {
   const isAdminOf = (room, id) => id !== undefined && room.admin === id
 
   Object.assign(rt, {
-    state, load, save, refresh, readOnly, own,
+    state, load, save, refresh, readOnly, own, stateReadError: () => readError,
     botOf, roomOf, isMain, chatOf, selfOf, isBotSession,
     chatOwners, groupOwners, pastOwners, branchOwners, branchByWork, indexSessions,
     taskById, taskBySession, taskOwners, taskDiagnostics, taskOf, taskForSession, openTasksOf, taskSessionsOf, validateTaskSessions,

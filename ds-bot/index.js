@@ -16,6 +16,7 @@ import * as delivery from './src/host/delivery.js'
 import * as branches from './src/host/branches.js'
 import * as taskRouting from './src/host/task-routing.js'
 import * as taskLifecycle from './src/host/task-lifecycle.js'
+import * as workers from './src/host/workers.js'
 import * as roster from './src/host/roster.js'
 import * as folders from './src/host/folders.js'
 import * as agents from './src/host/agents.js'
@@ -46,13 +47,13 @@ import * as feed from './src/host/feed.js'
 export { COLORS } from './src/host/constants.js'
 
 export const name = 'ds-bot'
-export const inject = ['llm', 'tools', 'systemPrompt', 'sessionController', 'sessions', 'sessionTitle', 'workspaceRegistry', 'connection']
+export const inject = ['llm', 'tools', 'systemPrompt', 'sessionController', 'sessionQuery', 'sessions', 'sessionTitle', 'workspaceRegistry', 'connection']
 
 // Each module's install(rt) registers its listeners, tools, and effects, and puts on `rt`
 // the functions other modules call; they call them through `rt` at run time, never during
 // install. Listeners run and tools are listed in registration order, so this order holds:
 // usage meters model requests after every listener that rewrites them.
-const MODULES = [diagnostics, store, tasks, models, providers, permissions, turns, handoffs, requests, delivery, roster, branches, taskRouting, taskLifecycle, folders, agents, prompt, timeContext, tools, chatIndex, groups, approvals, resume, memory, parts, images, avatarLibrary, secrets, connectors, capabilities, schedules, browser, browserPlugins, usage, update, dshUpdate, thinking, feed, channel]
+const MODULES = [diagnostics, store, tasks, models, providers, permissions, turns, handoffs, requests, delivery, roster, branches, taskRouting, taskLifecycle, folders, workers, agents, prompt, timeContext, tools, chatIndex, groups, approvals, resume, memory, parts, images, avatarLibrary, secrets, connectors, capabilities, schedules, browser, browserPlugins, usage, update, dshUpdate, thinking, feed, channel]
 
 export function apply(ctx, config = {}) {
   createRuntime(ctx, config)

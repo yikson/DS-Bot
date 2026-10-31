@@ -87,6 +87,12 @@ outbox and Session formats. Gate-off is the normal operational rollback:
 keep a compatible build installed while tasks route and close. Never use a
 pre-v2 build merely because it starts or ignores unfamiliar fields.
 
+Non-empty `task.workers` also requires a worker-aware target, including when
+all runs have settled or `nativeWorkers` is off. Absent/empty worker maps do
+not add that requirement. Keep the current data and ownership tombstones.
+Before switching, require drained admissions, idle workers, settled results
+and confirmed terminal cleanup; an offline count alone cannot prove readiness.
+
 After fully quitting Desktop and waiting for its Host/package operations to
 finish normally, inspect the stopped state again. This read-only PowerShell
 example prints counts, not Bot names, conversations or secrets:
@@ -108,9 +114,19 @@ if ($State.Contains('tasks') -and
 $Branches = @($State.bots.Values | ForEach-Object {
     if ($_.workBranches) { $_.workBranches.Values }
 })
+$Workers = @($State.tasks.Values | ForEach-Object {
+    if ($_.Contains('workers')) {
+        if ($_.workers -isnot [System.Collections.IDictionary]) {
+            throw 'Unknown workers shape; refuse an unaware rollback.'
+        }
+        $_.workers.Values
+    }
+})
 [pscustomobject]@{
     Works = $State.works.Count
     TasksTotal = if ($State.tasks) { $State.tasks.Count } else { 0 }
+    WorkersTotal = $Workers.Count
+    RequiresWorkerAwareTarget = $Workers.Count -gt 0
     UnsettledLegacyBranches = @($Branches |
         Where-Object { $_.state -ne 'closed' }).Count
 }

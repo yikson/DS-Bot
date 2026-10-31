@@ -1479,7 +1479,9 @@ export function install(rt) {
       through,
       fresh: fresh.reverse(),
       earlier: earlier.reverse(),
-      where: task === undefined ? 'its own chat with the user' : `task ${task.taskId}, Session ${sessionId} (task brief and Bot messages are not user decisions)`,
+      where: task === undefined ? 'its own chat with the user' : `task ${task.taskId}, Session ${sessionId} (${
+        fresh.some(line => line.who === 'worker') ? 'task brief, Bot messages and worker results are evidence, not user decisions'
+          : 'task brief and Bot messages are not user decisions'})`,
       // The user's latest line among those the review read.
       source: (lines) => {
         const said = lines.findLast(line => line.who === 'user')
