@@ -116,6 +116,8 @@ export function install(rt) {
       }, args)
     }
     // A failed save retains dirty targets in memory; every attempt must persist again.
+    if (rt.testPause) await rt.testPause('result:target:before', { resultId: args.resultId })
+    check(args)
     await commit(task.id, task => {
       const ledger = ledgerOf(task, args)
       if (!ledger.targets.some(target => target.sessionId === current)) {
@@ -128,6 +130,8 @@ export function install(rt) {
       }
       return task
     }, args)
+    if (rt.testPause) await rt.testPause('result:target:after', { resultId: args.resultId })
+    check(args)
     args.sessionId = current
   }
   function atBoundary(args, { forwarding = false } = {}) {
@@ -165,6 +169,8 @@ export function install(rt) {
     return { agent, consumed, admitted, pending }
   }
   async function acknowledge(args, sessionId) {
+    if (rt.testPause) await rt.testPause('result:ack:before', { resultId: args.resultId })
+    check(args)
     await updateLedger(args, ledger => {
       const target = ledger.targets.find(target => target.sessionId === sessionId)
       target.state = 'delivered'
@@ -172,6 +178,8 @@ export function install(rt) {
       ledger.enqueuedAt ??= Date.now()
       ledger.deliveredAt ??= Date.now()
     })
+    if (rt.testPause) await rt.testPause('result:ack:after', { resultId: args.resultId })
+    check(args)
   }
   async function forwardInLane(args, message) {
     for (let migrations = 0; migrations < MAX_CONCLUSION_ATTEMPTS; migrations += 1) {
@@ -252,8 +260,13 @@ export function install(rt) {
     }
     check(args)
     const operation = { ...args }
+    if (rt.testPause) await rt.testPause('result:delivery:before', { resultId: args.resultId })
+    check(args)
     await prepare(args)
+    if (rt.testPause) await rt.testPause('result:intent', { resultId: args.resultId })
+    check(args)
     if (await alreadyPresent(args)) { receipt.present = true; return args.exchangeId }
+    if (rt.testPause) await rt.testPause('result:enqueue:before', { resultId: args.resultId })
     check(args)
     const result = await enqueue(args)
     check(args)
@@ -285,13 +298,19 @@ export function install(rt) {
       check(deliveryArgs)
       if (!Array.isArray(inspected?.events)
         || rt.ctx.workspaceRegistry?.archivedSessionIds?.includes(agent.id)) throw new Error('Worker result endpoint is unavailable')
+      if (rt.testPause) await rt.testPause('result:enqueue', { resultId: args.resultId })
       atBoundary(deliveryArgs)
       agent.followup(createUserMessage({
         content: [{ type: 'text', text: deliveryArgs.text }],
         source: { kind: 'worker-result', taskId: args.taskId, workerId: args.workerId,
           runId: args.runId, resultId: args.resultId, requesterSessionId: args.requesterSessionId },
       }))
+      if (rt.testPause) await rt.testPause('result:enqueued', { resultId: args.resultId })
+      check(deliveryArgs)
+      if (rt.testPause) await rt.testPause('result:receiver-flush:before', { resultId: args.resultId })
+      check(deliveryArgs)
       await rt.ctx.sessions.flush(agent.session)
+      if (rt.testPause) await rt.testPause('result:receiver-flush:after', { resultId: args.resultId })
       check(deliveryArgs)
       return args.resultId
     }))

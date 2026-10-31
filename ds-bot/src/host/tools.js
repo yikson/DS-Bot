@@ -153,6 +153,15 @@ export function install(rt) {
         `- ${task.id} — ${task.title} (${task.state}; ${task.phase})`,
         ...Object.entries(task.participants).map(([botId, participant]) =>
           `  ${rt.botOf(botId)?.name ?? botId}: ${participant.role}, ${participant.kind}, ${task.sessions[botId] ?? 'not created'}`),
+        ...Object.values(task.workers ?? {}).filter(worker => worker.requesterSessionId === exec.agent?.id).map(worker => {
+          const run = worker.runs[worker.currentRunId]
+          const started = run.openedAt ?? worker.openedAt
+          const elapsed = Number.isFinite(started)
+            ? `${Math.max(0, Math.floor(((run.finishedAt ?? Date.now()) - started) / 1000))}s` : 'elapsed unknown'
+          const delivery = run.result ? task.sends?.[run.result.id]?.delivery.state ?? 'pending' : 'awaiting result'
+          const native = ctx.get('agents')?.get(worker.sessionId)?.status ?? 'inactive'
+          return `  worker ${worker.id}: ${worker.title}; ${worker.mode}/${worker.sandbox}; ${run.state}; native ${native}; ${elapsed}; ${delivery}; follow-ups ${worker.followupCount}; session:${worker.sessionId}`
+        }),
       ].join('\n')).join('\n')
     },
   })

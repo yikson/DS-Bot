@@ -204,7 +204,10 @@ export function install(rt) {
       rt.indexSessions()
       // Like the rest of the store, failed writes retain dirty state for a later save.
       // Rolling back here could erase a task already captured by another queued save.
+      if (rt.testPause) await rt.testPause('task:save:before', { taskId: id, state: next.state })
+      if (safe.stopped) throw new Error('Cannot save a task after this host stopped')
       await rt.save({ required: true })
+      if (rt.testPause) await rt.testPause('task:save:after', { taskId: id, state: next.state })
       if (safe.stopped) throw new Error('Cannot finish a task commit after this host stopped')
       if (next.state !== 'open') rt.scheduleWorkerSettlement?.(id)
       return structuredClone(next)

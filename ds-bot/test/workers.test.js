@@ -187,7 +187,7 @@ class WorkerMock extends LlmAdapter {
 
 // Native factory, scoped tools, inbox/claim, loop, sandbox and approval are real DSH.
 // The controller/persistence facade below is a unit fixture, not Web/cold-controller acceptance.
-async function nativeHarness(t, config = {}, { beforeLoad, beforeRuntime, mountPreset } = {}) {
+async function nativeHarness(t, config = {}, { beforeLoad, beforeRuntime, mountPreset, pause } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'worker-native-'))
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = join(root, 'dsh')
@@ -254,6 +254,7 @@ async function nativeHarness(t, config = {}, { beforeLoad, beforeRuntime, mountP
   await beforeRuntime?.({ ctx, cwd, home })
   const mount = () => ctx.plugin({ inject, apply(scope) {
     rt = createRuntime(scope, { home, memory: false, nativeWorkers: true, taskSessions: ['PM', 'Dev'], ...config })
+    if (pause) rt.testPause = pause
   } })
   let fiber = await mount()
   await rt.load()
@@ -281,6 +282,7 @@ async function nativeHarness(t, config = {}, { beforeLoad, beforeRuntime, mountP
     await rm(root, { recursive: true, force: true, maxRetries: 5 })
   })
   return { ctx, get rt() { return rt }, adapter, exec, cwd, home, dirs, get, wait, flushes,
+    remember: (id, raw) => histories.set(id, raw),
     get fiber() { return fiber },
     reload: async () => {
       const previous = ctx.agents.list()
@@ -326,6 +328,289 @@ test('native worker is asynchronous, uses the immutable root/current cd, forced 
   assert.equal(h.ctx.agents.get('tb').session.snapshotEvents().some(e => e.data?.source?.kind === 'worker-result'), false)
   assert.equal((await h.rt.runWorker({ prompt: 'Report evidence.', effort: 'high' }, h.exec)), result)
   assert.equal(Object.keys(h.rt.taskOf('task').workers).length, 1)
+})
+
+test('worker follow-up continues the same idle Session only after a delivered terminal result and stays inside lifetime limits', async t => {
+  const h = await nativeHarness(t, { maxWorkerFollowups: 2 })
+  await h.rt.runWorker({ prompt: 'Initial work.' }, h.exec)
+  await h.wait(() => h.get()?.runs[h.get().id].result)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${h.get().id}:result`]?.delivery.state === 'delivered')
+  const w = h.get()
+  const before = h.ctx.agents.get(w.sessionId)
+  await assert.rejects(h.rt.followupWorker({ worker: w.id, message: 'No call identity.' }, { ...h.exec, callId: undefined }), /invocation identity/)
+  await assert.rejects(h.rt.followupWorker({ worker: w.id, message: 'Wrong Session.' }, { ...h.exec, agent: h.ctx.agents.get('tb') }), /does not belong/)
+  const first = await h.rt.followupWorker({ worker: w.id, message: 'Continue work.' }, { ...h.exec, callId: 'follow-1' })
+  assert.match(first, /followup:1/)
+  await h.wait(() => h.get().runs[`${w.id}:followup:1`]?.result)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${w.id}:followup:1:result`]?.delivery.state === 'delivered')
+  assert.equal(h.ctx.agents.get(w.sessionId), before)
+  assert.equal(h.get().followupCount, 1)
+  assert.equal(h.get().runs[`${w.id}:followup:1`].state, 'completed')
+  assert.equal(h.get().runs[`${w.id}:followup:1`].promptRequestId, `${w.id}:followup:1`)
+  await h.rt.followupWorker({ worker: w.id, message: 'Continue again.' }, { ...h.exec, callId: 'follow-2' })
+  await h.wait(() => h.get().runs[`${w.id}:followup:2`]?.result)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${w.id}:followup:2:result`]?.delivery.state === 'delivered')
+  await assert.rejects(h.rt.followupWorker({ worker: w.id, message: 'Too far.' }, { ...h.exec, callId: 'follow-3' }), /lifetime limit/)
+  h.rt.config.maxWorkerFollowups = 0
+  assert.equal(h.get().followupCount, 2)
+  await assert.rejects(h.rt.followupWorker({ worker: w.id, message: 'Lowered.' }, { ...h.exec, callId: 'follow-4' }), /lifetime limit/)
+  assert.equal(h.get().cleanup.state, 'none')
+})
+
+test('follow-up refuses running work and an unacknowledged result', async t => {
+  const release = Promise.withResolvers()
+  t.after(() => release.resolve())
+  let blockAck = false
+  const h = await nativeHarness(t, {}, { pause: async (point, value) => {
+    if (blockAck && point === 'result:ack:before' && value.resultId) await release.promise
+  } })
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Still running.' }, h.exec)
+  await h.wait(() => h.get().runs[h.get().id].state === 'running')
+  const w = h.get()
+  await assert.rejects(h.rt.followupWorker({ worker: w.id, message: 'Too soon.' }, { ...h.exec, callId: 'too-soon' }), /settled/)
+  blockAck = true
+  h.adapter.fault = undefined
+  h.adapter.release()
+  await h.ctx.agents.get(w.sessionId).whenIdle()
+  await h.wait(() => h.get().runs[w.id].state === 'completed')
+  await assert.rejects(h.rt.followupWorker({ worker: w.id, message: 'Not delivered.' }, { ...h.exec, callId: 'unsettled' }), /settled/)
+  release.resolve()
+})
+
+test('cancel_worker fences admissions, waits for quiescence, records cancelled and stays idempotent', async t => {
+  const h = await nativeHarness(t)
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Cancel running work.' }, h.exec)
+  await h.wait(() => h.get().runs[h.get().id].state === 'running')
+  const w = h.get()
+  const cancelling = h.rt.cancelWorker({ worker: w.id }, { ...h.exec, callId: 'cancel-1' })
+  const stopped = await cancelling
+  assert.match(stopped, /cancelled/)
+  const run = h.get().runs[w.id]
+  assert.equal(run.state, 'cancelled')
+  assert.equal(run.finish.reason.kind, 'aborted')
+  assert.equal(h.get().admissionsClosed, true)
+  assert.equal(h.get().cleanup.state, 'settled')
+  assert.ok(h.get().cleanup.confirmedIdleAt >= h.get().cleanup.cancelRequestedAt)
+  await assert.rejects(h.rt.followupWorker({ worker: w.id, message: 'Continue cancelled.' }, { ...h.exec, callId: 'after-cancel' }), /closed/)
+  assert.match(await h.rt.cancelWorker({ worker: w.id }, { ...h.exec, callId: 'cancel-2' }), /cancelled/)
+})
+
+test('cancel timeout remains cancelling and a bounded background retry confirms idle without another prompt', async t => {
+  const release = Promise.withResolvers()
+  t.after(() => release.resolve())
+  let paused = false
+  const h = await nativeHarness(t, {}, { pause: async point => {
+    if (point === 'worker:cancel-intent' && !paused) { paused = true; await release.promise }
+  } })
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Wait for bounded cancellation.' }, h.exec)
+  await h.wait(() => h.get().runs[h.get().id].state === 'running')
+  const result = await h.rt.cancelWorker({ worker: h.get().id }, { ...h.exec, callId: 'timeout-cancel' })
+  assert.match(result, /^cancelling worker/)
+  assert.equal(h.get().runs[h.get().id].state, 'cancelling')
+  assert.equal(h.get().admissionsClosed, true)
+  await h.wait(() => h.get().cleanup.state === 'settled')
+  release.resolve()
+  assert.equal(h.get().runs[h.get().id].state, 'cancelled')
+  assert.equal(h.get().followupCount, 0)
+})
+
+test('follow-up retains live cd and a stricter worker sandbox without a model-selection helper', async t => {
+  const h = await nativeHarness(t)
+  await h.rt.runWorker({ prompt: 'Keep route and directory.', effort: 'high' }, h.exec)
+  await h.wait(() => h.get()?.runs[h.get().id].result)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${h.get().id}:result`]?.delivery.state === 'delivered')
+  const agent = h.ctx.agents.get(h.get().sessionId)
+  h.dirs.set(agent.id, join(h.cwd, 'child'))
+  agent.inject(createUserMessage({ content: [{ type: 'text', text: 'Directory changed.' }],
+    source: { kind: 'working-directory' } }))
+  setSandboxMode(agent.session, 'read-only')
+  await h.wait(() => h.get().sandbox === 'read-only')
+  await h.rt.followupWorker({ worker: h.get().id, message: 'Same route, lower permission.' },
+    { ...h.exec, callId: 'same-route' })
+  await h.wait(() => h.get().runs[`${h.get().id}:followup:1`]?.result)
+  assert.equal(h.dirs.get(agent.id), join(h.cwd, 'child'))
+  assert.equal(agent.session.header.cwd, h.cwd)
+  assert.equal(agent.session.requestHeader().config.reasoningEffort, 'high')
+  assert.equal(h.ctx.sandboxPolicy.resolve({ session: agent.session }).mode, 'read-only')
+  assert.equal(agent.session.snapshotEvents().filter(event => event.type === 'model/selection').length, 0)
+})
+
+test('cold follow-up drops an old admitted RPC before loop release and preserves a renamed Session marker', async t => {
+  const h = await nativeHarness(t)
+  await h.rt.runWorker({ prompt: 'Original completed work.' }, h.exec)
+  await h.wait(() => h.get()?.runs[h.get().id].result)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${h.get().id}:result`]?.delivery.state === 'delivered')
+  const w = h.get()
+  const agent = h.ctx.agents.get(w.sessionId)
+  await h.ctx.sessionTitle.rename(agent.session, 'Chosen native title')
+  const oldId = `${w.id}:followup:1`
+  await h.rt.commitTask('task', task => {
+    const saved = task.workers[w.id]
+    const run = { id: oldId, ordinal: 1, state: 'unknown', admissionKey: 'old-host-follow-up',
+      promptRequestId: oldId, promptDigest: 'old-digest', admission: { state: 'settled' },
+      finish: { kind: 'unknown', reason: 'host-restart' } }
+    run.result = { id: `${oldId}:result`, text: workerResult(saved, run, run.finish) }
+    saved.runs[oldId] = run
+    saved.followupCount = 1
+    saved.currentRunId = oldId
+    const old = task.sends[`${w.id}:result`]
+    task.sends[run.result.id] = {
+      args: { ...old.args, runId: oldId, resultId: run.result.id, exchangeId: run.result.id, text: run.result.text },
+      delivery: { ...old.delivery, summaryId: run.result.id },
+    }
+    return task
+  })
+  const events = [...agent.session.snapshotEvents(), {
+    seq: agent.session.seq, time: Date.now(), type: 'agent/inbox/spliced', data: {
+      target: 'next-turn', start: 0, inserted: [createUserMessage({
+        content: [{ type: 'text', text: 'Queued old work must never replay.' }],
+        source: { kind: 'user', rpcId: oldId },
+      })],
+    },
+  }]
+  const meta = agent.session.header
+  await h.reload()
+  h.remember(w.sessionId, { meta, events })
+  await h.rt.followupWorker({ worker: w.id, message: 'Explicit new work after inspection.' },
+    { ...h.exec, callId: 'new-after-unknown' })
+  await h.wait(() => h.get().runs[`${w.id}:followup:2`]?.result)
+  assert.equal(h.get().runs[`${w.id}:followup:2`].state, 'completed')
+  assert.equal(h.adapter.requests.some(request => request.messages.some(message =>
+    message.content?.some(block => block.text === 'Queued old work must never replay.'))), false)
+  const fresh = h.ctx.agents.get(w.sessionId)
+  const titles = fresh.session.snapshotEvents().filter(event => event.type === 'session/title')
+  assert.equal(titles.at(-1).data.title, 'Chosen native title')
+  assert.equal(titles.filter(event => event.data.title === w.marker).length, 1)
+})
+
+test('a surviving cold Agent retains an in-flight admission across plugin reload and cancel waits for its receipt', async t => {
+  const h = await nativeHarness(t)
+  await h.rt.runWorker({ prompt: 'Before a cold admission.' }, h.exec)
+  await h.wait(() => h.get()?.runs[h.get().id].result)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${h.get().id}:result`]?.delivery.state === 'delivered')
+  await h.reload()
+  const release = Promise.withResolvers()
+  t.after(() => release.resolve())
+  let waiting = false
+  h.pauseAdmission(async () => { waiting = true; await release.promise })
+  const pending = h.rt.followupWorker({ worker: h.get().id, message: 'Late admission after reload.' },
+    { ...h.exec, callId: 'late-cold-followup' }).catch(error => error)
+  await h.wait(() => waiting)
+  const agent = h.ctx.agents.get(h.get().sessionId)
+  await h.reload()
+  assert.equal(h.ctx.agents.get(h.get().sessionId), agent)
+  const cancel = h.rt.cancelWorker({ worker: h.get().id }, { ...h.exec, callId: 'cancel-late-cold' })
+  await h.wait(() => h.get().cleanup.state === 'cancelling')
+  await new Promise(resolve => setTimeout(resolve, 80))
+  assert.equal(h.get().runs[h.get().currentRunId].result, undefined)
+  release.resolve()
+  await pending
+  assert.match(await cancel, /cancelled/)
+  const run = h.get().runs[h.get().currentRunId]
+  assert.equal(run.state, 'cancelled')
+  assert.ok(run.admission.messageId)
+  assert.equal(h.get().cleanup.state, 'settled')
+})
+
+test('terminal cleanup retries an unconfirmed archive save, then stops rewriting settled history', async t => {
+  const h = await nativeHarness(t)
+  await h.rt.runWorker({ prompt: 'Archive save retry.' }, h.exec)
+  await h.wait(() => h.get()?.runs[h.get().id].result)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${h.get().id}:result`]?.delivery.state === 'delivered')
+  const save = h.rt.save
+  let refused = false
+  let confirmed = false
+  let saves = 0
+  h.rt.save = async options => {
+    saves++
+    if (h.get().archivedAt && !refused) {
+      refused = true
+      throw new Error('temporary archive confirmation write failure')
+    }
+    const result = await save(options)
+    if (h.get().archivedAt) confirmed = true
+    return result
+  }
+  await h.rt.closeTask('ta', { task: 'task', status: 'blocked', conclusion: 'Archive this worker.' })
+  await h.wait(() => confirmed)
+  assert.equal(refused, true)
+  const before = saves
+  await h.rt.settleTaskWorkers('task')
+  await h.rt.recoverWorkers()
+  assert.equal(saves, before)
+  assert.equal(h.rt.taskOf('task').lateReplies.count, 1)
+})
+
+test('late outside input after idle proof keeps cancellation unsettled until a fresh quiescence check', async t => {
+  const releaseCancel = Promise.withResolvers()
+  const releaseMaintenance = Promise.withResolvers()
+  t.after(() => { releaseCancel.resolve(); releaseMaintenance.resolve() })
+  let held = false
+  const h = await nativeHarness(t, {}, { pause: async point => {
+    if (point === 'worker:drained' && !held) { held = true; await releaseCancel.promise }
+  } })
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Initial cancellable model call.' }, h.exec)
+  await h.wait(() => h.get().runs[h.get().id].state === 'running')
+  const cancel = h.rt.cancelWorker({ worker: h.get().id }, { ...h.exec, callId: 'late-input-cancel' })
+  await h.wait(() => held)
+  const agent = h.ctx.agents.get(h.get().sessionId)
+  const maintenanceStarted = Promise.withResolvers()
+  const maintenance = agent.runMaintenance(async () => {
+    maintenanceStarted.resolve()
+    await releaseMaintenance.promise
+  })
+  await maintenanceStarted.promise
+  await h.ctx.sessionController.prompt({ sessionId: agent.id, requestId: 'outside-cancel-input', mode: 'queue',
+    content: [{ type: 'text', text: 'Late outside input.' }] }, AbortSignal.timeout(2000))
+  releaseCancel.resolve()
+  assert.match(await cancel, /^cancelling worker/)
+  assert.equal(h.get().runs[h.get().id].state, 'cancelling')
+  releaseMaintenance.resolve()
+  await maintenance
+  await h.wait(() => h.get().cleanup.state === 'settled')
+  assert.equal(h.get().runs[h.get().id].state, 'cancelled')
+  assert.equal(h.get().followupCount, 0)
+})
+
+test('control tools are scoped to the exact requesting task Session and flag-off keeps cancel available only for its history', async t => {
+  const h = await nativeHarness(t)
+  await h.rt.runWorker({ prompt: 'Control scope.' }, h.exec)
+  await h.wait(() => h.get().runs[h.get().id].result)
+  const run = h.get().runs[h.get().id]
+  await h.wait(() => h.rt.taskOf('task').sends?.[run.result.id]?.delivery.state === 'delivered')
+  assert.ok(h.ctx.tools.schemas(h.exec.agent).some(tool => tool.name === 'worker_followup'))
+  assert.ok(h.ctx.tools.schemas(h.exec.agent).some(tool => tool.name === 'cancel_worker'))
+  await assert.rejects(h.rt.cancelWorker({ worker: h.get().id }, { ...h.exec, agent: h.ctx.agents.get('tb') }), /does not belong/)
+  assert.equal(h.ctx.tools.schemas(h.ctx.agents.get('a')).some(tool => tool.name === 'cancel_worker'), false)
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Cancel after flag off.' }, { ...h.exec, callId: 'second-worker' })
+  await h.wait(() => Object.values(h.rt.taskOf('task').workers).some(worker => worker.title === 'Cancel after flag off.' && worker.runs[worker.id].state === 'running'))
+  h.rt.config.nativeWorkers = false
+  h.rt.indexSessions()
+  const second = Object.values(h.rt.taskOf('task').workers).find(worker => worker.title === 'Cancel after flag off.')
+  assert.equal(h.ctx.tools.schemas(h.exec.agent).some(tool => tool.name === 'run_worker'), false)
+  assert.ok(h.ctx.tools.schemas(h.exec.agent).some(tool => tool.name === 'cancel_worker'))
+  assert.match(await h.rt.cancelWorker({ worker: second.id }, { ...h.exec, callId: 'cancel-off' }), /cancelled/)
+  await assert.rejects(h.rt.runWorker({ prompt: 'Disabled.' }, { ...h.exec, callId: 'third-worker' }), /disabled/)
+})
+
+test('fixture-only pause hook runs through follow-up admission, result intent and cancellation without shipping in production', async t => {
+  const reached = []
+  const h = await nativeHarness(t, {}, { pause: async (point, value) => { reached.push({ point, value }) } })
+  assert.equal(h.rt.testPause !== undefined, true)
+  await h.rt.runWorker({ prompt: 'Paused setup.' }, h.exec)
+  await h.wait(() => h.get()?.runs[h.get().id].result)
+  await h.wait(() => h.rt.taskOf('task').sends?.[`${h.get().id}:result`]?.delivery.state === 'delivered')
+  await h.rt.followupWorker({ worker: h.get().id, message: 'Paused follow-up.' }, { ...h.exec, callId: 'paused-follow-up' })
+  await h.wait(() => h.get().runs[`${h.get().id}:followup:1`]?.result)
+  assert.ok(reached.some(row => row.point === 'worker:setup'))
+  assert.ok(reached.some(row => row.point === 'worker:admitting' && row.value.runId.endsWith(':followup:1')))
+  assert.ok(reached.some(row => row.point === 'result:intent'))
+  assert.ok(reached.some(row => row.point === 'result:ack:after'))
 })
 
 for (const failure of ['blocked', 'assembly']) {
@@ -387,6 +672,81 @@ test('all forbidden/unknown scoped names are denied even after replacement and H
 })
 
 function randomId() { return `call-${Math.random()}` }
+
+for (const point of ['worker:reserved', 'worker:create', 'worker:creation-record', 'worker:setup',
+  'worker:setup-directory', 'worker:permission-flushed', 'worker:published', 'worker:configured',
+  'worker:flushed', 'worker:intent', 'worker:admitting', 'worker:accepted']) {
+  for (const action of ['cancel', 'close']) test(`A2 ${action} fences creation paused at ${point}`, async t => {
+    const reached = Promise.withResolvers()
+    const release = Promise.withResolvers()
+    t.after(() => release.resolve())
+    let held = false
+    const h = await nativeHarness(t, {}, { pause: async name => {
+      if (name === point && !held) { held = true; reached.resolve(); await release.promise }
+    } })
+    h.adapter.fault = 'hang'
+    const pending = h.rt.runWorker({ prompt: 'Pause before dispatch.' }, h.exec).catch(error => error)
+    await h.wait(() => held)
+    const w = h.get()
+    const control = action === 'cancel'
+      ? h.rt.cancelWorker({ worker: w.id }, { ...h.exec, callId: 'race-cancel' })
+      : h.rt.closeTask('ta', { task: 'task', status: 'blocked', conclusion: 'Stop during admission.' })
+    const caught = control.catch(error => error)
+    await h.wait(() => h.get().admissionsClosed || h.rt.taskOf('task').state !== 'open')
+    release.resolve()
+    await pending
+    const result = await caught
+    assert.equal(result instanceof Error, false, String(result))
+    await h.wait(() => h.get().cleanup.state === 'settled')
+    await h.wait(() => h.get().runs[w.id].result)
+    assert.ok(['cancelled', 'completed'].includes(h.get().runs[w.id].state), JSON.stringify(h.get().runs[w.id].finish))
+    assert.equal(h.get().admissionsClosed, true)
+    assert.equal(Object.keys(h.rt.taskOf('task').workers).length, 1)
+    assert.equal(h.get().followupCount, 0)
+    if (action === 'close') {
+      await h.wait(() => h.rt.taskOf('task').lateReplies.count === 1)
+      assert.equal(h.rt.taskOf('task').delivery.summaryId, 'task:closed')
+    }
+  })
+}
+
+for (const point of ['worker:resolved', 'worker:configured', 'worker:flushed', 'worker:reserved',
+  'worker:intent', 'worker:admitting', 'worker:accepted']) {
+  for (const action of ['cancel', 'close']) test(`A2 ${action} fences follow-up paused at ${point}`, async t => {
+    const reached = Promise.withResolvers()
+    const release = Promise.withResolvers()
+    t.after(() => release.resolve())
+    let armed = false
+    let held = false
+    const h = await nativeHarness(t, {}, { pause: async name => {
+      if (armed && name === point && !held) { held = true; reached.resolve(); await release.promise }
+    } })
+    await h.rt.runWorker({ prompt: 'Before follow-up race.' }, h.exec)
+    await h.wait(() => h.get()?.runs[h.get().id].result)
+    await h.wait(() => h.rt.taskOf('task').sends?.[`${h.get().id}:result`]?.delivery.state === 'delivered')
+    const original = structuredClone(h.get().runs[h.get().id])
+    armed = true
+    h.adapter.fault = 'hang'
+    const pending = h.rt.followupWorker({ worker: h.get().id, message: 'Racing follow-up.' },
+      { ...h.exec, callId: 'race-follow-up' }).catch(error => error)
+    await h.wait(() => held)
+    const control = action === 'cancel'
+      ? h.rt.cancelWorker({ worker: h.get().id }, { ...h.exec, callId: 'race-cancel' })
+      : h.rt.closeTask('ta', { task: 'task', status: 'blocked', conclusion: 'Stop follow-up.' })
+    const caught = control.catch(error => error)
+    await h.wait(() => h.get().admissionsClosed || h.rt.taskOf('task').state !== 'open')
+    release.resolve()
+    await pending
+    const result = await caught
+    assert.equal(result instanceof Error, false, String(result))
+    await h.wait(() => h.get().cleanup.state === 'settled')
+    assert.deepEqual(h.get().runs[h.get().id], original)
+    assert.equal(h.get().admissionsClosed, true)
+    const latest = h.get().runs[h.get().currentRunId]
+    assert.ok(['cancelled', 'completed'].includes(latest.state), JSON.stringify(latest.finish))
+    assert.ok(h.get().followupCount <= 1)
+  })
+}
 
 test('admission limits/capability and exact task endpoints are checked at call time without rewriting history', async t => {
   const h = await nativeHarness(t, { maxWorkersPerTask: 0 })
@@ -527,6 +887,63 @@ test('headerless restart settles unknown without a model and native publication 
   assert.equal(h.adapter.requests.slice(before).some(request => request.messages.some(message =>
     message.content?.some(block => block.type === 'text' && block.text === 'Run isolated work.'))), false)
   assert.equal(h.ctx.agents.get('ws'), undefined)
+})
+
+test('restart before native publication uses definitive absence, settles unknown once and completes terminal cleanup', async t => {
+  const h = await nativeHarness(t)
+  const w = worker()
+  Object.assign(w, { sandboxRoot: h.cwd, canonicalRoot: h.cwd, initialWorkdir: h.cwd, createdHost: 'previous-host' })
+  await h.rt.commitTask('task', task => { task.workers = { w }; return task })
+  h.ctx.sessionQuery.observeSession = async id => {
+    assert.equal(id, w.sessionId)
+    throw Object.assign(new Error('native Session is absent'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
+  }
+  await h.rt.recoverWorkers()
+  assert.equal(h.get().runs.w.state, 'unknown')
+  assert.equal(h.get().admissionBlockReason, 'restart-before-first-header')
+  assert.equal(h.get().admissionsClosed, true)
+  await h.wait(() => h.rt.taskOf('task').sends?.['w:result']?.delivery.state === 'delivered')
+  await h.rt.closeTask('ta', { task: 'task', status: 'blocked', conclusion: 'Close an unpublished worker.' })
+  await h.wait(() => h.get().cleanup.state === 'settled' && h.get().archivedAt)
+  assert.ok(h.get().cleanup.sessionAbsentAt)
+  assert.equal(h.get().runs.w.state, 'unknown')
+  assert.equal(h.rt.taskOf('task').lateReplies.count, 1)
+})
+
+test('terminal evidence appended after the first source flush is flushed before result commit', async t => {
+  const h = await nativeHarness(t)
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Finish inside inspection.' }, h.exec)
+  await h.wait(() => typeof h.adapter.release === 'function')
+  const id = h.get().sessionId
+  const agent = h.ctx.agents.get(id)
+  const inspect = h.ctx.sessionController.inspect
+  const flush = h.ctx.sessions.flush.bind(h.ctx.sessions)
+  let flushedThrough = 0
+  h.ctx.sessions.flush = async session => {
+    const boundary = session.seq
+    await flush(session)
+    if (session.id === id) flushedThrough = Math.max(flushedThrough, boundary)
+  }
+  let forced = false
+  h.ctx.sessionController.inspect = async session => {
+    if (session === id && !forced) {
+      forced = true
+      h.adapter.fault = undefined
+      h.adapter.release()
+      await agent.whenIdle()
+    }
+    return inspect(session)
+  }
+  const save = h.rt.save
+  h.rt.save = async options => {
+    const run = h.get().runs[h.get().id]
+    if (run.result) assert.ok(flushedThrough > run.endSeq, 'terminal evidence was not checkpointed')
+    return save(options)
+  }
+  await h.rt.recoverWorkers()
+  await h.wait(() => h.get().runs[h.get().id].result)
+  assert.equal(h.get().runs[h.get().id].state, 'completed')
 })
 
 for (const withUser of [false, true]) {
@@ -693,6 +1110,9 @@ test('plugin HMR disposal settles unknown/plugin-reload once with warning, close
   assert.equal(requests(), 1)
   h.adapter.fault = undefined
   await h.reload()
+  await assert.rejects(h.ctx.sessionController.prompt({ sessionId: w.sessionId, requestId: randomId(), mode: 'queue',
+    content: [{ type: 'text', text: 'Cold activation before worker recovery must be refused.' }] }, AbortSignal.timeout(2000)),
+  /plugin-reload.*permanently closed/)
   await h.rt.recoverWorkers()
   await h.wait(() => h.get().runs[w.id].result)
   const run = h.get().runs[w.id]

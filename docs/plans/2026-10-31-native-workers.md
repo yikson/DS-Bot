@@ -900,6 +900,50 @@ flush/ack crash matrix, and A5's HMR/re-registration/ordinary/PTC variants.
 Record each pause/crash location and exact evidence, including variants that
 were BLOCKED in the external W1 report.
 
+#### W2 ownership investigation (2026-11-01)
+
+The pinned DSH still binds `ctx.agents.create({ agentOptions, ... })` to
+the calling Context's lifecycle. Its public creation options have no supported
+host-owner selector or ownership-transfer operation. Controller `create`
+has no initial route/effort arguments; using controller `selectModel` would
+introduce the forbidden profile-default write path.
+
+The generic Cordis `Context.root` candidate is explicitly marked
+`@experimental` in `vendor/cordis`'s public Context declarations. An isolated
+host observation confirmed that this view can see the same Agents and preset
+services, including the exact live requester Agent. This is a candidate,
+not a documented DSH contract for creating a profile-owned worker that
+outlives its plugin. W2 does not move ownership to that experimental global
+Context, fabricate a header or issue a synthetic warm-up model request.
+Fresh workers retain W1's supported factory path and plugin-reload outcome.
+
+For an existing Session with a durable header, controller `resolveAgent`
+provides the supported continuation path: DSH restores its own route without
+a worker model helper. This cold Agent may outlive a plugin replacement.
+W2 keeps its transition barrier and in-flight admission receipt on the Agent
+scope so that a replacement can fence and drain the same request. A cold
+resume removes old kernel-owned inbox RPCs before the loop is released;
+an explicit follow-up receives a new run/request id. Pending human input
+refuses coordinator follow-up rather than being driven as a side effect.
+Headerless cold activation remains permanently closed.
+
+The remaining fresh host-owned path needs an explicit supported host/profile
+ownership API with initial `agentOptions`, followed by the same admission,
+guard and profile-recomposition matrix. It is not a second routing helper
+or an undocumented caller-context escape.
+
+#### W2 pause fixture
+
+The unit/host fixture may assign `rt.testPause(point, ids)` after constructing
+the runtime. This callback is absent from normal plugin configuration and
+production runtimes. Conditional call sites add no asynchronous boundary
+when it is absent, and neither prompts nor transcripts are passed to it.
+The points cover preflight, creation/publication/setup, permissions, source
+flush, admission intent/receipt, cancellation/drain, task save, result commit,
+target intent, enqueue, receiver flush and acknowledgement. Existing
+generation, ownership, attempt and terminal checks repeat after injected
+waits; a paused fixture cannot authorize an expired operation.
+
 ### W3: task-header UI and provenance
 
 Implement worker rows/state/elapsed/Session links and worker-result messages.

@@ -19,11 +19,12 @@ const STOP_REASONS = new Set(['ds-bot/worker-stop', 'ds-bot/stale-worker-admissi
 const ALLOWED = new Set(['read', 'read_image', 'write', 'edit', 'bash', 'pwsh',
   'grep', 'glob', 'working_directory', 'run_code'])
 const CONTEXT = new Set(['runtime-context', 'agent-instructions', 'skill-catalog',
-  'time-context', 'compact-checkpoint'])
+  'time-context', 'compact-checkpoint', 'working-directory'])
 const rank = mode => ['read-only', 'workspace-write', 'danger-full-access'].indexOf(mode)
 const minMode = (a, b) => rank(a) < rank(b) ? a : b
 const points = (text, limit) => Array.from(text).slice(0, limit).join('')
 const pendingInput = agent => [...agent.inbox.nextTurn, ...agent.inbox.nextStep]
+const pendingWork = agent => pendingInput(agent).filter(message => !CONTEXT.has(message.source?.kind))
 
 // Raw splices are the authority, including failures before a user/message is appended.
 export function workerEvidence(events, run) {
@@ -68,6 +69,7 @@ export function workerEvidence(events, run) {
     if (event.type === 'turn/end') {
       if (matching && event.data.turn === found.turn) {
         found.endSeq = event.seq
+        found.endedAt = event.time
         found.finish = event.data.reason
         found.text = lastText || '(no final text)'
         matching = false
@@ -75,7 +77,7 @@ export function workerEvidence(events, run) {
       turn = undefined
     }
   }
-  return { ...found, outsideInput }
+  return { ...found, outsideInput, pending: [...queues['next-turn'], ...queues['next-step']] }
 }
 
 export function workerResult(worker, run, finish, text = '(no final text)', outsideInput = false) {
@@ -85,7 +87,7 @@ export function workerResult(worker, run, finish, text = '(no final text)', outs
     `Finish: ${points(JSON.stringify(finish), 1000)}`,
     `Session: session:${worker.sessionId}`,
     ...(outsideInput ? ['worker received outside input'] : []),
-    ...(finish.kind === 'interrupted' || finish.reason === 'plugin-reload' ? ['may have partially run; not re-run'] : []),
+    ...(finish.kind === 'interrupted' || finish.kind === 'unknown' ? ['may have partially run; not re-run'] : []),
     ...(finish.kind === 'unknown' ? ['unknown outcome; not rerun'] : []),
   ].join('\n') + '\n'
   return header + points(text, Math.max(0, 4000 - Array.from(header).length))
@@ -98,6 +100,7 @@ export function install(rt) {
   const host = `${process.pid}:${performance.timeOrigin}`
   const generation = randomUUID()
   const identities = new Map()
+  const markedSessions = new Set()
   const createdSessions = new Set()
   const creationPath = join(rt.home, 'workers.created.jsonl')
   let creationRead
@@ -109,7 +112,22 @@ export function install(rt) {
   const policies = new Set()
   const settling = new Set()
   const cleanupAttempts = new Map()
+  const stopFlights = new Map()
+  const stopRetries = new Map()
+  const cleaned = new Set()
+  let cleanupIndexed = false
   const checked = new WeakMap()
+  const cleanHistory = (worker, task) => task && task.state !== 'open' && worker.archivedAt
+    && worker.admissionsClosed && worker.cleanup.state === 'settled'
+    && Object.values(worker.runs).every(run => run.result && !unsettled(run)
+      && worker.cleanup.resultWithdrawals?.[run.result.id] && task.lateReplies.ids.includes(run.result.id))
+  const sharedAdmission = worker => agents.get(worker.sessionId)?.[POLICY]?.pending?.get(worker.currentRunId)
+  function trackAdmission(agent, runId, promise) {
+    const pending = agent[POLICY].pending ??= new Map()
+    pending.set(runId, promise)
+    const clear = () => { if (pending.get(runId) === promise) pending.delete(runId) }
+    promise.then(clear, clear)
+  }
   let activated = false
   let api
   const check = args => {
@@ -162,6 +180,7 @@ export function install(rt) {
       safe.signal.throwIfAborted()
       if (!Array.isArray(raw?.events)) throw new Error('Worker identity history is unavailable')
       const marked = raw.events.some(isWorkerMarker)
+      if (marked) markedSessions.add(agent.id)
       const owned = marked || createdSessions.has(agent.id)
       identities.set(agent.id, owned)
       return owned
@@ -178,6 +197,7 @@ export function install(rt) {
     agent.session.append('session/title', { title: worker.marker, messageSeqs: [],
       source: { kind: 'user' } })
     identities.set(agent.id, true)
+    markedSessions.add(agent.id)
   }
   const current = id => {
     check()
@@ -251,14 +271,15 @@ export function install(rt) {
     check()
     const { policy } = await requester(worker)
     check()
-    const selected = minMode(worker.sandbox, policy.mode)
+    const ownPolicy = ctx.get('sandboxPolicy').resolve({ session: agent.session })
+    if (rank(ownPolicy.mode) < 0) throw new Error('Worker sandbox mode is unresolved')
+    const selected = minMode(minMode(worker.sandbox, policy.mode), ownPolicy.mode)
     if (selected !== worker.sandbox) {
       await commit(worker.id, saved => { saved.sandbox = selected })
       check()
       agent.cancel({ kind: 'hook', reason: 'ds-bot/worker-permission-tightened' }, { keepInbox: true })
       worker = current(worker.id)
     }
-    const ownPolicy = ctx.get('sandboxPolicy').resolve({ session: agent.session })
     if (ownPolicy.mode !== selected) setters.setSandboxMode(agent.session, selected)
     if (ctx.get('approval').overrideOf(agent.session) !== 'never') setters.setApprovalPolicy(agent.session, 'never')
     const actual = ctx.get('sandboxPolicy').resolve({ session: agent.session })
@@ -269,6 +290,7 @@ export function install(rt) {
     await directory(worker.sandboxRoot, worker.canonicalRoot, rt.sessionFolder(agent.session), '.')
     check()
     await ctx.sessions.flush(agent.session)
+    if (rt.testPause) await rt.testPause('worker:permission-flushed', { workerId: worker.id })
     check()
     return worker
   }
@@ -326,7 +348,7 @@ export function install(rt) {
     policies.add(slot)
     return slot
   }
-  async function configure(agent, { fresh = false } = {}) {
+  async function configure(agent, { fresh = false, cold = false } = {}) {
     const slot = barrier(agent)
     slot.ready = false
     try {
@@ -335,20 +357,48 @@ export function install(rt) {
       if (ownershipDenial(agent.id)) throw new Error(ownershipDenial(agent.id))
       let worker = row.worker
       if (worker.admissionsClosed) throw new Error(`Worker ${worker.admissionBlockReason ?? 'admissions-closed'}: native activation is permanently closed`)
-      if (!fresh && worker.createdHost !== host && !agent.session.snapshotEvents().some(event => event.type === 'request/header')) {
+      if (cold && worker.createdHost === host && worker.createdGeneration !== generation
+        && unsettled(worker.runs[worker.currentRunId])) {
+        await commit(worker.id, saved => {
+          saved.admissionsClosed = true
+          saved.admissionBlockReason = 'plugin-reload'
+        })
+        throw new Error('Worker plugin-reload: native activation is permanently closed')
+      }
+      if (!fresh && (cold || worker.createdHost !== host)
+        && !agent.session.snapshotEvents().some(event => event.type === 'request/header')) {
         await commit(worker.id, saved => {
           saved.admissionsClosed = true
           saved.admissionBlockReason = 'restart-before-first-header'
         })
         throw new Error('Worker restart-before-first-header: native activation is permanently closed')
       }
-      if (!identities.get(agent.id)) {
+      if (cold) {
+        const owned = new Set(Object.values(worker.runs).map(run => run.promptRequestId))
+        for (const message of pendingInput(agent)) {
+          if (owned.has(message.source?.rpcId)) agent.inbox.remove(message.id)
+        }
+      }
+      if (!markedSessions.has(agent.id)) {
         await recordCreation(worker)
-        markSession(agent, worker)
+        const raw = await ctx.sessionController.inspect(agent.id, AbortSignal.timeout(HISTORY_TIMEOUT_MS))
+        check()
+        if (raw.events.some(isWorkerMarker)) {
+          markedSessions.add(agent.id)
+          identities.set(agent.id, true)
+        } else markSession(agent, worker)
       }
       await permission(agent, worker)
       check()
       worker = current(worker.id)
+      if (cold && unsettled(worker.runs[worker.currentRunId])) {
+        const events = await history(worker)
+        const evidence = workerEvidence(events, worker.runs[worker.currentRunId])
+        await finish(worker.id, evidence.finish ?? { kind: 'unknown',
+          reason: worker.createdHost !== host ? 'host-restart' : 'agent-resume' }, evidence)
+        worker = current(worker.id)
+        if (worker.admissionsClosed) throw new Error(`Worker ${worker.admissionBlockReason}: native activation is permanently closed`)
+      }
       const inherited = ctx.tools.schemas().map(schema => schema.name).filter(name => !permitted(name))
       if (inherited.length) agent.ctx.tools.restrict({ deny: inherited })
       check()
@@ -370,11 +420,13 @@ export function install(rt) {
     check()
     return { ...splitRef(ref), ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
   }
-  async function runWorker(args, exec) {
+  const runWorker = (args, exec) => admit(startWorker, args, exec)
+  const followupWorker = (args, exec) => admit(startFollowup, args, exec)
+  async function admit(start, args, exec) {
     const attempt = { active: true, signal: AbortSignal.any([safe.signal, AbortSignal.timeout(HISTORY_TIMEOUT_MS),
       ...(exec.signal ? [exec.signal] : [])]) }
     const timeout = Symbol('worker admission timeout')
-    const operation = startWorker(args, exec, attempt)
+    const operation = start(args, exec, attempt)
     try {
       const result = await safe.race(operation, HISTORY_TIMEOUT_MS, timeout)
       if (result !== timeout) return result
@@ -388,6 +440,124 @@ export function install(rt) {
       })
       throw new Error('Worker admission deadline exceeded; its reserved outcome remains under reconciliation')
     } finally { attempt.active = false }
+  }
+  function ownedWorker(args, exec) {
+    check()
+    const task = rt.taskForSession(exec.agent?.id)
+    const worker = task?.workers?.[args.worker]
+    if (!worker || worker.requesterSessionId !== exec.agent?.id
+      || task.sessions[worker.requestedBy] !== exec.agent.id
+      || claim(worker.sessionId)?.workerId !== worker.id) throw new Error('Worker does not belong to this requesting task Session')
+    return worker
+  }
+  async function startFollowup(args, exec, attempt) {
+    await rt.load()
+    let worker = ownedWorker(args, exec)
+    const admissionCheck = () => {
+      attempt.signal.throwIfAborted()
+      if (!attempt.active) throw new Error('Worker admission attempt expired')
+      eligible(exec.agent?.id)
+      const saved = ownedWorker(args, exec)
+      if (saved.id !== worker.id || saved.admissionsClosed || saved.cleanup.state !== 'none') throw new Error('Worker admissions are closed')
+      return saved
+    }
+    admissionCheck()
+    if (typeof args.message !== 'string' || !args.message.trim() || !exec.callId) throw new Error('Give a follow-up message and a tool invocation identity')
+    const admissionKey = JSON.stringify([exec.agent.id, exec.callId])
+    const digest = createHash('sha256').update(args.message).digest('hex')
+    const replay = Object.values(worker.runs).find(run => run.admissionKey === admissionKey)
+    if (replay) {
+      if (replay.promptDigest !== digest) throw new Error('Worker admission replay changed its prompt')
+      return `started worker ${worker.id}; run ${replay.id}`
+    }
+    const ready = (saved, agent) => {
+      const run = saved.runs[saved.currentRunId]
+      if (!['completed', 'failed', 'unknown'].includes(run.state)
+        || rt.taskOf(saved.taskId).sends?.[run.result?.id]?.delivery.state !== 'delivered') throw new Error('Worker run and result must be settled before follow-up')
+      if ((agent && (agent.status !== 'idle' || pendingWork(agent).length))
+        || admissions.has(saved.id) || sharedAdmission(saved)) throw new Error('Worker must be idle with no pending input or admission')
+    }
+    ready(worker, agents.get(worker.sessionId))
+    const beforeResume = await history(worker)
+    worker = admissionCheck()
+    const ownedInputs = new Set(Object.values(worker.runs).map(run => run.promptRequestId))
+    if (workerEvidence(beforeResume, worker.runs[worker.currentRunId]).pending.some(message =>
+      !CONTEXT.has(message.source?.kind) && !ownedInputs.has(message.source?.rpcId))) {
+      throw new Error('Worker has pending outside input')
+    }
+    const resolved = await ctx.sessionController.resolveAgent(worker.sessionId)
+    if (rt.testPause) await rt.testPause('worker:resolved', { workerId: worker.id })
+    admissionCheck()
+    const agent = resolved?.agent
+    if (!agent) throw new Error('Worker Session is unavailable')
+    ready(worker, agent)
+    await configure(agent)
+    if (rt.testPause) await rt.testPause('worker:configured', { workerId: worker.id })
+    admissionCheck()
+    const events = await history(worker)
+    if (rt.testPause) await rt.testPause('worker:flushed', { workerId: worker.id })
+    worker = admissionCheck()
+    ready(worker, agent)
+    if (worker.runs[worker.currentRunId].state === 'unknown' && !events.some(event => event.type === 'request/header')) throw new Error('Unknown worker without a durable request header cannot be continued')
+    limits()
+    const previousRunId = worker.currentRunId
+    const ordinal = worker.followupCount + 1
+    const runId = `${worker.id}:followup:${ordinal}`
+    await commit(worker.id, saved => {
+      admissionCheck()
+      ready(saved, agent)
+      if (saved.currentRunId !== previousRunId || saved.followupCount + 1 !== ordinal) throw new Error('Worker follow-up raced another admission')
+      if (ordinal > (rt.config.maxWorkerFollowups ?? 2)) throw new Error('Worker follow-up lifetime limit reached')
+      saved.followupCount = ordinal
+      saved.currentRunId = runId
+      saved.runs[runId] = { id: runId, ordinal, state: 'pending', admissionKey,
+        promptRequestId: runId, promptDigest: digest, openedAt: Date.now(), admission: { state: 'reserved' } }
+    })
+    attempt.workerId = worker.id
+    try {
+      if (rt.testPause) await rt.testPause('worker:reserved', { workerId: worker.id, runId })
+      admissionCheck()
+      await commit(worker.id, saved => {
+        admissionCheck()
+        if (agent.status !== 'idle' || pendingWork(agent).length) throw new Error('Worker became busy before follow-up admission')
+        saved.runs[runId].admission.state = 'intent'
+      })
+      if (rt.testPause) await rt.testPause('worker:intent', { workerId: worker.id, runId })
+      admissionCheck()
+      if (agent.status !== 'idle' || pendingWork(agent).length) throw new Error('Worker became busy before follow-up admission')
+      const pending = ctx.sessionController.prompt({ sessionId: worker.sessionId, requestId: runId,
+        mode: 'queue', content: [{ type: 'text', text: args.message }] }, attempt.signal)
+      admissions.set(worker.id, pending)
+      trackAdmission(agent, runId, pending)
+      try {
+        if (rt.testPause) await rt.testPause('worker:admitting', { workerId: worker.id, runId })
+        const receipt = await pending
+        if (rt.testPause) await rt.testPause('worker:accepted', { workerId: worker.id, runId })
+        admissionCheck()
+        if (!receipt?.accepted || receipt.error) throw new Error('Worker follow-up was not accepted')
+      } finally { if (admissions.get(worker.id) === pending) admissions.delete(worker.id) }
+      await reconcile(worker.id).catch(error => {
+        check()
+        rt.warn('ds-bot: worker %s follow-up accepted; result reconciliation remains pending: %s', worker.id, error.message)
+      })
+      return `started worker ${worker.id}; run ${runId}`
+    } catch (error) {
+      if (safe.stopped) agent.cancel({ kind: 'hook', reason: 'ds-bot/stale-worker-admission' })
+      else {
+        if (current(worker.id).runs[runId].admission.state === 'intent'
+          || current(worker.id).admissionsClosed || rt.taskOf(worker.taskId)?.state !== 'open') await stop(worker.id)
+        else await finish(worker.id, { kind: 'setup-error', message: points(error.message, 500) })
+        await reconcile(worker.id)
+      }
+      throw error
+    }
+  }
+  async function cancelWorker(args, exec) {
+    await rt.load()
+    const worker = ownedWorker(args, exec)
+    const stopped = await stop(worker.id)
+    const saved = current(worker.id)
+    return stopped ? `worker ${worker.id}: ${saved.runs[saved.currentRunId].state}; admissions closed` : `cancelling worker ${worker.id}`
   }
   async function startWorker(args, exec, attempt) {
     await rt.load()
@@ -411,6 +581,7 @@ export function install(rt) {
       return `started worker ${replay.id}`
     }
     const setters = await services(mode)
+    if (rt.testPause) await rt.testPause('worker:services', { taskId: task.id })
     admissionEligible()
     const policy = ctx.get('sandboxPolicy').resolve({ session: exec.agent.session })
     if (rank(policy.mode) < 0) throw new Error('Unknown requester sandbox')
@@ -422,10 +593,13 @@ export function install(rt) {
     const canonicalRoot = await realpath(sandboxRoot)
     if (await realpath(policy.workspaceRoot) !== canonicalRoot) throw new Error('Requester sandbox root differs from its header')
     const initialWorkdir = await directory(sandboxRoot, canonicalRoot, rt.sessionFolder(exec.agent.session), args.workdir ?? '.')
+    if (rt.testPause) await rt.testPause('worker:directory', { taskId: task.id })
     admissionEligible()
     const initialModel = await route({ ...args, mode }, rt.botOf(owner), exec.agent)
+    if (rt.testPause) await rt.testPause('worker:route', { taskId: task.id })
     admissionEligible()
     const preset = await ctx.get('agentPresets').resolve()
+    if (rt.testPause) await rt.testPause('worker:preset', { taskId: task.id })
     admissionEligible()
     if (!preset?.id || preset.broken) throw new Error('Worker default preset is unavailable')
     const id = randomUUID()
@@ -436,7 +610,7 @@ export function install(rt) {
       followupCount: 0, currentRunId: id, admissionsClosed: false, admissionBlockReason: null,
       createdHost: host, createdGeneration: generation, openedAt: Date.now(),
       runs: { [id]: { id, ordinal: 0, state: 'pending', admissionKey, promptRequestId: id,
-        promptDigest: digest, admission: { state: 'reserved' } } },
+        promptDigest: digest, openedAt: Date.now(), admission: { state: 'reserved' } } },
       cleanup: { state: 'none', cancelRequestedAt: null, confirmedIdleAt: null }, archivedAt: null,
     }
     await rt.withTask(task.id, () => rt.commitTask(task.id, saved => {
@@ -455,11 +629,15 @@ export function install(rt) {
       if (current(id).admissionsClosed) throw new Error('Worker admission is closed')
     }
     try {
+      if (rt.testPause) await rt.testPause('worker:reserved', { workerId: id, runId: id })
       admissionCheck()
       await recordCreation(worker)
+      if (rt.testPause) await rt.testPause('worker:creation-record', { workerId: id, runId: id })
+      admissionCheck()
+      let handle
+      if (rt.testPause) await rt.testPause('worker:create', { workerId: id, runId: id })
       admissionCheck()
       creations.add(id)
-      let handle
       try { handle = await agents.create({
         sessionId: worker.sessionId, signal: attempt.signal, agentOptions: initialModel,
         meta: { cwd: sandboxRoot, agentPreset: preset.id },
@@ -467,10 +645,12 @@ export function install(rt) {
           barrier(created)
           markSession(created, worker)
           await ctx.get('agentPresets').mount(scope, preset.id)
+          if (rt.testPause) await rt.testPause('worker:setup', { workerId: id, runId: id })
           admissionCheck()
           setters.setSandboxMode(created.session, sandbox)
           setters.setApprovalPolicy(created.session, 'never')
           await ctx.get('workingDirectory').set(created, initialWorkdir)
+          if (rt.testPause) await rt.testPause('worker:setup-directory', { workerId: id, runId: id })
           admissionCheck()
           // Publication is the final synchronous ownership/eligibility boundary.
           return { commit() {
@@ -480,15 +660,19 @@ export function install(rt) {
         },
       }) } finally { creations.delete(id) }
       agent = handle.agent
+      if (rt.testPause) await rt.testPause('worker:published', { workerId: id, runId: id })
       admissionCheck()
       await configure(agent, { fresh: true })
+      if (rt.testPause) await rt.testPause('worker:configured', { workerId: id, runId: id })
       admissionCheck()
       await ctx.sessions.flush(agent.session)
+      if (rt.testPause) await rt.testPause('worker:flushed', { workerId: id, runId: id })
       admissionCheck()
       await commit(id, saved => {
         admissionCheck()
         saved.runs[id].admission.state = 'intent'
       })
+      if (rt.testPause) await rt.testPause('worker:intent', { workerId: id, runId: id })
       admissionCheck()
       check()
       exec.signal?.throwIfAborted()
@@ -498,8 +682,11 @@ export function install(rt) {
         sessionId: worker.sessionId, requestId: id, mode: 'queue', content: [{ type: 'text', text: args.prompt }],
       }, signal)
       admissions.set(id, pending)
+      trackAdmission(agent, id, pending)
       try {
+        if (rt.testPause) await rt.testPause('worker:admitting', { workerId: id, runId: id })
         const result = await pending
+        if (rt.testPause) await rt.testPause('worker:accepted', { workerId: id, runId: id })
         if (safe.stopped || !attempt.active || current(id).admissionsClosed || rt.taskOf(task.id)?.state !== 'open') {
           admissions.delete(id)
           if (safe.stopped) agent.cancel({ kind: 'hook', reason: 'ds-bot/stale-worker-admission' })
@@ -518,7 +705,8 @@ export function install(rt) {
       if (agent && safe.stopped) agent.cancel({ kind: 'hook', reason: 'ds-bot/stale-worker-admission' })
       if (!safe.stopped) {
         const saved = current(id)
-        if (admissions.has(id) || saved.runs[id].admission.state === 'intent') {
+        if (admissions.has(id) || saved.runs[id].admission.state === 'intent' || saved.cleanup.state === 'cancelling'
+          || rt.taskOf(task.id)?.state !== 'open') {
           await stop(id)
           await reconcile(id)
         } else {
@@ -531,19 +719,49 @@ export function install(rt) {
   }
   async function history(worker, args) {
     const live = agents.get(worker.sessionId)
+    if (rt.testPause) await rt.testPause('worker:source-flush:before', { workerId: worker.id, runId: worker.currentRunId })
+    check(args)
+    const flushedThrough = live?.session.seq
     if (live) await ctx.sessions.flush(live.session)
+    if (rt.testPause) await rt.testPause('worker:source-flush:after', { workerId: worker.id, runId: worker.currentRunId })
     check(args)
     const result = await ctx.sessionController.inspect(worker.sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS))
     check(args)
     if (!Array.isArray(result?.events)) throw new Error('Worker raw history is unavailable')
+    if (live && result.events.length > flushedThrough) {
+      await ctx.sessions.flush(live.session)
+      check(args)
+    }
     return result.events
   }
+  async function sessionAbsent(worker, args) {
+    const query = ctx.get('sessionQuery')
+    if (!query?.observeSession) return false
+    try {
+      const observation = await query.observeSession(worker.sessionId,
+        { projectionMode: 'none', signal: AbortSignal.timeout(HISTORY_TIMEOUT_MS) })
+      observation[Symbol.dispose]()
+      check(args)
+      return false
+    } catch (error) {
+      check(args)
+      if (error.code === 'SESSION_QUERY_SESSION_NOT_FOUND') return true
+      throw error
+    }
+  }
   async function finish(id, reason, evidence = {}, args) {
+    if (rt.testPause) await rt.testPause('worker:result:before', { workerId: id })
     check(args)
     await commit(id, (worker, task) => {
       const run = worker.runs[worker.currentRunId]
+      const live = agents.get(worker.sessionId)
+      if (evidence.quiescentAt !== undefined && (admissions.has(id) || sharedAdmission(worker) || creations.has(id)
+        || (live && (live.status !== 'idle' || pendingInput(live).length)))) {
+        throw Object.assign(new Error('Worker quiescence changed before settlement'), { code: 'worker/quiescence-changed' })
+      }
       if (evidence.quiescentAt !== undefined) worker.cleanup = {
         ...worker.cleanup, state: 'settled', confirmedIdleAt: evidence.quiescentAt,
+        ...(evidence.sessionAbsent ? { sessionAbsentAt: evidence.quiescentAt } : {}),
       }
       if (!unsettled(run)) return
       let finish = reason ?? evidence.finish
@@ -565,6 +783,7 @@ export function install(rt) {
       }
       run.state = finish.kind === 'interrupted' || finish.kind === 'unknown' ? 'unknown'
         : finish.kind === 'completed' ? 'completed' : finish.kind === 'cancelled' ? 'cancelled' : 'failed'
+      run.finishedAt = evidence.endedAt ?? Date.now()
       for (const key of ['messageId', 'insertedSeq', 'turn', 'claimSeq', 'requestHeaderSeq', 'endSeq', 'droppedSeq']) {
         if (evidence[key] !== undefined) run[key] = evidence[key]
       }
@@ -580,6 +799,8 @@ export function install(rt) {
           delivery: { summaryId: run.result.id, targets: [], state: 'pending' } }
       } else late(task, worker, run)
     }, args)
+    if (rt.testPause) await rt.testPause('worker:result:after', { workerId: id })
+    check(args)
   }
   const resultArgs = (worker, run) => ({
     kind: 'worker-result', role: 'worker-result', taskId: worker.taskId, workerId: worker.id,
@@ -621,7 +842,14 @@ export function install(rt) {
         || rt.taskOf(worker.taskId).sends?.[run.result.id]?.delivery.state === 'delivered')) return
       return rt.attemptTaskResult(args, async scoped => {
         if (unsettled(current(id).runs[run.id])) {
-          const events = await history(worker, scoped)
+          let events
+          try { events = await history(worker, scoped) } catch (error) {
+            if (!(flight.restart || flight.reload) || agents.get(worker.sessionId)
+              || !(await sessionAbsent(worker, scoped))) throw error
+            check(scoped)
+            // A durable reservation can outlive a crash before native publication.
+            events = []
+          }
           const evidence = workerEvidence(events, run)
           check(scoped)
           const live = agents.get(worker.sessionId)
@@ -666,7 +894,23 @@ export function install(rt) {
       if (succeeded && !safe.stopped) poll(id)
     }
   }
-  async function stop(id) {
+  function stop(id) {
+    if (stopFlights.has(id)) return stopFlights.get(id)
+    const pending = Promise.resolve().then(() => stopWorker(id)).finally(() => {
+      if (stopFlights.get(id) === pending) stopFlights.delete(id)
+      if (safe.stopped) return
+      safe.run('worker stop retry', () => {
+        if (current(id).cleanup.state === 'settled') { stopRetries.delete(id); return }
+        const attempts = (stopRetries.get(id) ?? 0) + 1
+        stopRetries.set(id, attempts)
+        if (attempts < 5) safe.setTimeout(() => safe.run('worker stop retry', () => stop(id)), 1000 * 2 ** (attempts - 1))?.unref?.()
+        else rt.warn('ds-bot: worker %s cancellation retry budget exhausted; recovery remains pending', id)
+      })
+    })
+    stopFlights.set(id, pending)
+    return pending
+  }
+  async function stopWorker(id) {
     let worker = current(id)
     await commit(id, saved => {
       saved.admissionsClosed = true
@@ -677,42 +921,70 @@ export function install(rt) {
       saved.cleanup.cancelAfterSeq ??= (agents.get(saved.sessionId)?.session.seq ?? 0) - 1
       if (unsettled(run)) run.state = 'cancelling'
     })
+    worker = current(id)
     let stopActive = true
     const stopCheck = () => {
       check()
       if (!stopActive) throw new Error('Worker stop attempt expired')
     }
     const attempt = (async () => {
+      if (rt.testPause) await rt.testPause('worker:cancel-intent', { workerId: id })
+      stopCheck()
       let agent = agents.get(worker.sessionId)
       agent?.cancel({ kind: 'hook', reason: 'ds-bot/worker-stop' }, { keepInbox: true })
-      await admissions.get(id)?.catch(() => {})
+      if (rt.testPause) await rt.testPause('worker:cancel-requested', { workerId: id })
       stopCheck()
+      const admission = admissions.get(id) ?? sharedAdmission(worker)
+      await admission?.catch(() => {})
+      stopCheck()
+      if (admissions.get(id) === admission) admissions.delete(id)
+      while (creations.has(id)) {
+        await safe.delay(20)
+        stopCheck()
+      }
       agent = agents.get(worker.sessionId)
       agent?.cancel({ kind: 'hook', reason: 'ds-bot/worker-stop' }, { keepInbox: true })
       await agent?.whenIdle()
+      if (rt.testPause) await rt.testPause('worker:idle', { workerId: id })
       stopCheck()
-      if (agent && agent.status !== 'idle') throw new Error('Worker is not idle')
+      if (agent && agent.status !== 'idle') throw Object.assign(new Error('Worker is not idle'), { code: 'worker/quiescence-changed' })
       if (agent) {
         agent.inbox.clear()
         await ctx.sessions.flush(agent.session)
+        if (rt.testPause) await rt.testPause('worker:drained', { workerId: id })
         stopCheck()
-        if (agent.status !== 'idle' || pendingInput(agent).length || admissions.has(id)) throw new Error('Worker input is not drained')
+        if (agent.status !== 'idle' || pendingInput(agent).length || admissions.has(id) || sharedAdmission(worker)) {
+          throw Object.assign(new Error('Worker input is not drained'), { code: 'worker/quiescence-changed' })
+        }
       }
-      if (creations.has(id)) throw new Error('Worker creation has not drained')
       return agent
     })()
     const timeout = Symbol('stop timeout')
-    const agent = await safe.race(attempt, HISTORY_TIMEOUT_MS, timeout)
+    let agent
+    try { agent = await safe.race(attempt, HISTORY_TIMEOUT_MS, timeout) } catch (error) {
+      stopActive = false
+      if (error.code === 'worker/quiescence-changed') return false
+      throw error
+    }
     check()
     if (agent === timeout) {
       stopActive = false
       rt.warn('ds-bot: worker %s still cancelling; stop evidence timed out', id)
       return false
     }
-    const events = await history(worker)
     const run = current(id).runs[worker.currentRunId]
+    const absent = !agent && await sessionAbsent(worker)
+    // A drained unpublished creation with no prompt intent proves this run never entered an inbox.
+    const events = absent || (!agent && run.admission.state === 'reserved') ? [] : await history(worker)
     const evidence = workerEvidence(events, run)
-    await finish(id, evidence.finish ?? { kind: 'cancelled' }, { ...evidence, quiescentAt: Date.now() })
+    try {
+      await finish(id, evidence.finish ?? (absent && run.admission.state !== 'reserved'
+        ? { kind: 'unknown', reason: 'session-unavailable' } : { kind: 'cancelled' }),
+      { ...evidence, quiescentAt: Date.now(), sessionAbsent: absent })
+    } catch (error) {
+      if (error.code === 'worker/quiescence-changed') return false
+      throw error
+    }
     if (rt.taskOf(worker.taskId)?.state === 'open') await reconcile(id)
     return true
   }
@@ -721,23 +993,27 @@ export function install(rt) {
     let incomplete = false
     for (const worker of workers) {
       try {
+        if (cleaned.has(worker.id) && cleanHistory(worker, rt.taskOf(taskId))) continue
         if (worker.cleanup.state !== 'settled' && !(await stop(worker.id))) { incomplete = true; continue }
         for (const run of Object.values(current(worker.id).runs)) {
           if (!run.result || current(worker.id).cleanup.resultWithdrawals?.[run.result.id]) continue
           let copy
+          let inactive = false
           if (rt.taskOf(taskId).sends?.[run.result.id]?.delivery.targets.length) {
-            const receiver = await rt.resolveAgent(worker.requesterSessionId)
-            check()
-            copy = pendingInput(receiver).find(message => message.source?.kind === 'worker-result'
-              && message.source.resultId === run.result.id && message.source.workerId === worker.id)
+            const receiver = agents.get(worker.requesterSessionId)
             if (rt.taskOf(taskId).state === 'open') throw new Error('Worker cleanup requires terminal task')
-            if (copy) receiver.inbox.remove(copy.id)
-            await ctx.sessions.flush(receiver.session)
-            check()
+            if (receiver) {
+              copy = pendingInput(receiver).find(message => message.source?.kind === 'worker-result'
+                && message.source.resultId === run.result.id && message.source.workerId === worker.id)
+              if (copy) receiver.inbox.remove(copy.id)
+              await ctx.sessions.flush(receiver.session)
+              check()
+            } else inactive = true
           }
           await commit(worker.id, saved => {
             saved.cleanup.resultWithdrawals ??= {}
-            saved.cleanup.resultWithdrawals[run.result.id] = { at: Date.now(), pendingMessageId: copy?.id ?? null }
+            saved.cleanup.resultWithdrawals[run.result.id] = { at: Date.now(), pendingMessageId: copy?.id ?? null,
+              ...(inactive ? { retained: 'receiver-not-active' } : {}) }
           })
         }
         await commit(worker.id, (saved, task) => {
@@ -747,10 +1023,11 @@ export function install(rt) {
         const saved = current(worker.id)
         const agent = agents.get(saved.sessionId)
         if (!saved.archivedAt && !admissions.has(saved.id) && (!agent || (agent.status === 'idle' && !pendingInput(agent).length))) {
-          await ctx.workspaceRegistry.archiveSession(saved.sessionId)
+          if (!saved.cleanup.sessionAbsentAt) await ctx.workspaceRegistry.archiveSession(saved.sessionId)
           check()
           await commit(saved.id, worker => { worker.archivedAt = Date.now() })
         }
+        if (cleanHistory(current(worker.id), rt.taskOf(taskId))) cleaned.add(worker.id)
       } catch (error) {
         check()
         incomplete = true
@@ -769,6 +1046,7 @@ export function install(rt) {
       const worker = row.worker
       try {
         check()
+        if (cleaned.has(worker.id) && cleanHistory(worker, rt.taskOf(row.taskId))) continue
         const live = agents.get(worker.sessionId)
         if (live) await configure(live)
         await reconcile(worker.id, { restart: worker.createdHost !== host && !live,
@@ -786,14 +1064,18 @@ export function install(rt) {
   function registerTool(agent) {
     let allowed = !safe.stopped && rt.config.nativeWorkers === true && !!rt.taskForSession(agent.id)
     if (allowed) try { eligible(agent.id) } catch { allowed = false }
+    const task = rt.taskForSession(agent.id)
+    const canCancel = allowed || Object.values(task?.workers ?? {}).some(worker => worker.requesterSessionId === agent.id)
+    const mode = `${allowed}:${canCancel}`
     const previous = agent[TOOL]
-    if (!allowed) {
+    if (!allowed && !canCancel) {
       if (previous?.owner === safe) { previous.dispose(); delete agent[TOOL]; tools.delete(agent) }
       return
     }
-    if (previous?.owner === safe) return
+    if (previous?.owner === safe && previous.mode === mode) return
     previous?.dispose()
-    const dispose = agent.ctx.tools.register(defineTool({
+    const disposers = []
+    if (allowed) disposers.push(agent.ctx.tools.register(defineTool({
       name: 'run_worker', description: 'Start one self-contained native worker asynchronously. Its result returns to this exact task Session. Verify is read-only. Inspect evidence before follow-up.',
       parameters: {
         prompt: { type: 'string', required: true }, title: { type: 'string' },
@@ -803,9 +1085,21 @@ export function install(rt) {
       },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
       execute: runWorker,
-    }))
+    })), agent.ctx.tools.register(defineTool({
+      name: 'worker_followup', description: 'Continue your settled, idle worker in its same native Session. Inspect unknown outcomes before proceeding. Closed workers cannot continue.',
+      parameters: { worker: { type: 'string', required: true }, message: { type: 'string', required: true } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: followupWorker,
+    })))
+    if (canCancel) disposers.push(agent.ctx.tools.register(defineTool({
+      name: 'cancel_worker', description: 'Close your worker admissions and request stop. Reports cancelling until native work and pending input are confirmed drained. Repeating is safe.',
+      parameters: { worker: { type: 'string', required: true } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: cancelWorker,
+    })))
+    const dispose = () => disposers.forEach(dispose => dispose())
     tools.set(agent, dispose)
-    const slot = agent[TOOL] = { owner: safe, dispose }
+    const slot = agent[TOOL] = { owner: safe, mode, dispose }
     safe.effect(() => () => {
       dispose()
       if (agent[TOOL] === slot) delete agent[TOOL]
@@ -826,6 +1120,7 @@ export function install(rt) {
       }
       const unavailable = ownershipDenial(exec.agent?.id)
       if (unavailable) return { kind: 'deny', reason: unavailable }
+      if (rt.testPause && claim(exec.agent?.id)) await rt.testPause('worker:dispatch', { sessionId: exec.agent.id, name: exec.name })
       let row
       try { row = claim(exec.agent?.id) } catch (error) { return { kind: 'deny', reason: error.message } }
       if (!row && !exec.agent?.[POLICY] && !identities.get(exec.agent?.id)) return next()
@@ -840,7 +1135,8 @@ export function install(rt) {
     })
     safe.on('agent/created', async ({ agent }) => {
       await rt.load()
-      if (claim(agent.id)) await configure(agent)
+      const row = claim(agent.id)
+      if (row) await configure(agent, { cold: !creations.has(row.workerId) })
       else if (await identify(agent)) {
         barrier(agent)
         throw new Error('Worker ownership is unavailable; native activation and all tools are denied')
@@ -870,7 +1166,10 @@ export function install(rt) {
     })
     safe.on('agent/status', ({ agent, status }) => {
       const row = status === 'idle' && claim(agent.id)
-      if (row) safe.setImmediate(() => safe.run('worker idle evidence', () => reconcile(row.workerId)))
+      if (row) {
+        safe.setImmediate(() => safe.run('worker idle evidence', () => reconcile(row.workerId)))
+        if (rt.taskOf(row.taskId)?.state !== 'open') rt.scheduleWorkerSettlement(row.taskId)
+      }
     })
     safe.effect(() => () => { for (const slot of policies) if (slot.owner === safe) slot.ready = false }, 'ds-bot: worker HMR barrier')
     safe.effect(() => () => {
@@ -893,8 +1192,14 @@ export function install(rt) {
     }
   }
   Object.assign(rt, {
-    workerClaim: claim, runWorker, registerWorkerTool: registerTool, indexWorkers: () => {
+    workerClaim: claim, runWorker, followupWorker, cancelWorker, registerWorkerTool: registerTool, indexWorkers: () => {
       ownershipIndexed = rt.stateReadError?.() === undefined
+      if (!cleanupIndexed && ownershipIndexed) {
+        cleanupIndexed = true
+        for (const row of [...workerClaims(rt.state).values()].flat()) {
+          if (cleanHistory(row.worker, rt.taskOf(row.taskId))) cleaned.add(row.workerId)
+        }
+      }
       activate()
       if (activated) for (const agent of agents?.list?.() ?? []) registerTool(agent)
     },
@@ -907,6 +1212,8 @@ export function install(rt) {
       }))
     },
     workerDependencies: task => Object.values(task.workers ?? {}).some(worker => admissions.has(worker.id) || creations.has(worker.id)
+      || sharedAdmission(worker) || (agents.get(worker.sessionId)
+        && (agents.get(worker.sessionId).status !== 'idle' || pendingWork(agents.get(worker.sessionId)).length))
       || worker.cleanup.state === 'cancelling' || Object.values(worker.runs).some(run =>
         unsettled(run) || (run.result && task.sends?.[run.result.id]?.delivery.state !== 'delivered'))),
     reconcileWorkerPermissions: async botId => {
