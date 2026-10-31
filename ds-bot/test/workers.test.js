@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import fsp from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -141,6 +143,17 @@ test('flag-off with no workers registers identical tools, schemas and prompt sec
   t.after(async () => { await a.dispose(); await b.dispose(); for (const root of roots) await rm(root, { recursive: true, force: true }) })
 })
 
+test('the final worker guard denies unknown ownership before loading even when pre-execute is skipped', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'worker-unloaded-'))
+  const ctx = fakeContext()
+  createRuntime(ctx, { home, nativeWorkers: true, memory: false })
+  const reason = ctx.guards[0]({ name: 'worker_escape_probe', agent: { id: 'renamed-worker' } })
+  assert.match(reason, /ownership is unavailable/)
+  assert.equal(ctx.guards[0]({ name: 'worker_escape_probe' }), undefined)
+  await ctx.dispose()
+  t.after(() => rm(home, { recursive: true, force: true }))
+})
+
 class WorkerMock extends LlmAdapter {
   requests = []
   fault
@@ -153,6 +166,7 @@ class WorkerMock extends LlmAdapter {
     this.requests.push(options)
     if (this.fault === 'hang') {
       await new Promise((resolve, reject) => {
+        this.release = resolve
         if (options.signal.aborted) return reject(options.signal.reason)
         options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
       })
@@ -167,7 +181,7 @@ class WorkerMock extends LlmAdapter {
 
 // Native factory, scoped tools, inbox/claim, loop, sandbox and approval are real DSH.
 // The controller/persistence facade below is a unit fixture, not Web/cold-controller acceptance.
-async function nativeHarness(t, config = {}) {
+async function nativeHarness(t, config = {}, { beforeLoad, mountPreset } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'worker-native-'))
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = join(root, 'dsh')
@@ -176,6 +190,7 @@ async function nativeHarness(t, config = {}) {
   await mkdir(join(cwd, 'child'), { recursive: true })
   await mkdir(home)
   await writeFile(join(home, 'state.json'), JSON.stringify(seed()))
+  await beforeLoad?.({ home, cwd, statePath: join(home, 'state.json') })
   const ctx = new Context()
   for (const [plugin, options] of [[LlmRuntime], [SessionStore], [SessionProjections], [SystemPrompt],
     [ToolRuntime], [AgentRegistry], [AgentLoop, { agents: [] }], [SandboxPolicy], [Approval]]) await ctx.plugin(plugin, options)
@@ -185,10 +200,12 @@ async function nativeHarness(t, config = {}) {
   const flushes = []
   ctx.provide('workingDirectory', { get: session => dirs.get(session.id) ?? session.header.cwd,
     set: async (agent, path) => { dirs.set(agent.id, path) } })
-  ctx.provide('agentPresets', { resolve: async () => ({ id: 'test-default' }), mount: async () => {}, serviceFor: () => undefined })
+  ctx.provide('agentPresets', { resolve: async () => ({ id: 'test-default' }), mount: mountPreset ?? (async () => {}), serviceFor: () => undefined })
   ctx.provide('workspaceRegistry', { get: () => ({ id: 'unit-workspace', path: cwd, title: 'Unit workspace' }),
     archiveSession: async () => {}, archivedSessionIds: [] })
-  ctx.provide('sessionTitle', { rename: async () => {} })
+  const titles = new Map()
+  ctx.provide('sessionTitle', { get: session => titles.get(session?.id), rename: async (session, title) => { titles.set(session.id, { title }) } })
+  ctx.provide('sessionQuery', {})
   const originalFlush = ctx.sessions.flush.bind(ctx.sessions)
   ctx.sessions.flush = async session => { flushes.push(session.id); return originalFlush(session) }
   let admissionWait
@@ -240,7 +257,7 @@ async function nativeHarness(t, config = {}) {
     else process.env.DSH_HOME = previousHome
     await rm(root, { recursive: true, force: true, maxRetries: 5 })
   })
-  return { ctx, rt, adapter, exec, cwd, dirs, get, wait, flushes, fiber,
+  return { ctx, rt, adapter, exec, cwd, home, dirs, get, wait, flushes, fiber,
     pauseAdmission: callback => { admissionWait = callback } }
 }
 
@@ -366,6 +383,9 @@ test('done refuses running workers; terminal-first close drains them without cha
   assert.equal(h.rt.taskOf('task').state, 'blocked')
   const conclusion = structuredClone(h.rt.taskOf('task').conclusion)
   await h.wait(() => h.get()?.cleanup.state === 'settled')
+  assert.equal(h.get().runs[h.get().id].state, 'cancelled')
+  assert.equal(h.get().runs[h.get().id].finish.reason.kind, 'aborted')
+  assert.equal(h.get().runs[h.get().id].finish.reason.reason.reason, 'ds-bot/worker-stop')
   assert.equal(h.get().admissionsClosed, true)
   assert.deepEqual(h.rt.taskOf('task').conclusion, conclusion)
   assert.equal(h.rt.taskOf('task').delivery.summaryId, 'task:closed')
@@ -376,6 +396,7 @@ test('done refuses running workers; terminal-first close drains them without cha
 
 test('a late prompt admission after terminal commit is fenced, drained and never becomes an unowned run', async t => {
   const h = await nativeHarness(t)
+  h.adapter.fault = 'hang'
   let release
   let waiting = false
   h.pauseAdmission(() => new Promise(resolve => { waiting = true; release = resolve }))
@@ -391,7 +412,9 @@ test('a late prompt admission after terminal commit is fenced, drained and never
   })
   release()
   await assert.rejects(start, /stopped/)
+  h.adapter.fault = undefined
   await h.wait(() => h.get()?.cleanup.state === 'settled')
+  assert.equal(h.get().runs[h.get().id].state, 'cancelled')
   assert.equal(h.get().admissionsClosed, true)
   assert.equal(h.rt.taskOf('task').state, 'failed')
   assert.equal(h.rt.taskOf('task').lateReplies.count, 1)
@@ -490,3 +513,197 @@ for (const withUser of [false, true]) {
     assert.equal(h.get().admissionBlockReason, 'restart-before-first-header')
   })
 }
+
+for (const failure of ['EACCES', 'EISDIR', 'version']) {
+  test(`real storage ${failure} denies a renamed cold worker even with the rollout off`, async t => {
+    let restore
+    const originalRead = fsp.readFile
+    t.after(() => { fsp.readFile = originalRead; syncBuiltinESMExports() })
+    const h = await nativeHarness(t, { nativeWorkers: false }, {
+      async beforeLoad({ cwd, statePath }) {
+        const data = seed()
+        const w = worker()
+        Object.assign(w, { sandboxRoot: cwd, canonicalRoot: cwd, initialWorkdir: cwd })
+        data.tasks.task.workers = { w }
+        const saved = JSON.stringify(data)
+        await writeFile(statePath, saved)
+        if (failure === 'EACCES') {
+          let failing = true
+          fsp.readFile = async (path, ...args) => {
+            if (failing && path === statePath) throw Object.assign(new Error('worker storage read failure'), { code: 'EACCES' })
+            return originalRead(path, ...args)
+          }
+          syncBuiltinESMExports()
+          restore = async () => { failing = false }
+        } else if (failure === 'EISDIR') {
+          await rm(statePath)
+          await mkdir(statePath)
+          restore = async () => { await rm(statePath, { recursive: true }); await writeFile(statePath, saved) }
+        } else {
+          await writeFile(statePath, JSON.stringify({ ...data, version: 2 }))
+          restore = async () => writeFile(statePath, saved)
+        }
+      },
+    })
+    const { agent } = await h.ctx.agents.create({ sessionId: 'ws', meta: { cwd: h.cwd }, agentOptions: { provider: 'mock', model: 'model' } })
+    await h.ctx.sessionTitle.rename(agent.session, 'Ordinary renamed Session')
+    let bodies = 0
+    agent.ctx.tools.register(defineTool({ name: 'worker_escape_probe', parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
+      execute: () => { bodies++; return 'escaped' } }))
+    const execute = () => h.ctx.tools.execute({ agent, name: 'worker_escape_probe', arguments: {}, callId: randomId(), signal: AbortSignal.timeout(2000) })
+    assert.equal((await execute()).isError, true)
+    assert.equal(bodies, 0)
+    assert.notEqual(h.rt.stateReadError(), undefined)
+    await restore()
+    assert.equal((await execute()).isError, true)
+    assert.equal(h.rt.stateReadError(), undefined)
+    assert.equal(h.rt.workerClaim('ws').workerId, 'w')
+    assert.equal(bodies, 0)
+  })
+}
+
+test('a failed real refresh retains positive Bot/task/plain ownership and worker tombstones', async t => {
+  const h = await nativeHarness(t)
+  await h.rt.runWorker({ prompt: 'Stored owner.' }, h.exec)
+  await h.wait(() => h.get().runs[h.get().id].result)
+  const { agent: plain } = await h.ctx.agents.create({ sessionId: 'plain', meta: { cwd: h.cwd },
+    agentOptions: { provider: 'mock', model: 'model' } })
+  h.rt.state.agents['plain-owner'] = { id: 'plain-owner', sessions: ['plain'], name: 'Plain Agent', createdAt: 1 }
+  await h.rt.save({ required: true })
+  const saved = JSON.parse(await fsp.readFile(join(h.home, 'state.json'), 'utf8'))
+  await writeFile(join(h.home, 'state.json'), JSON.stringify({ ...saved, version: 2 }))
+  await rm(join(h.home, 'state.lock'))
+  await h.rt.refresh()
+  assert.notEqual(h.rt.stateReadError(), undefined)
+  assert.equal(h.rt.selfOf('ta'), 'a')
+  assert.equal(h.rt.agentOf('plain').id, 'plain-owner')
+  assert.equal(h.rt.workerClaim(h.get().sessionId).workerId, h.get().id)
+  plain.ctx.tools.register(defineTool({ name: 'plain_owned_probe', description: 'Known plain Session remains usable',
+    parameters: {}, output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
+    execute: () => 'known owner' }))
+  assert.equal((await h.ctx.tools.execute({ agent: plain, name: 'plain_owned_probe', arguments: {},
+    callId: randomId(), signal: AbortSignal.timeout(2000) })).isError, false)
+  await writeFile(join(h.home, 'state.json'), JSON.stringify(saved))
+  await h.rt.refresh()
+  assert.equal(h.rt.stateReadError(), undefined)
+})
+
+test('scoped-only default-preset tools stay visible but cannot fail setup or execute', async t => {
+  let bodies = 0
+  const h = await nativeHarness(t, {}, {
+    async mountPreset(scope) {
+      scope.tools.register(defineTool({ name: 'subagent', description: 'Scoped preset regression sentinel', parameters: {},
+        output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
+        execute: () => { bodies++; return 'escaped' } }))
+    },
+  })
+  await h.rt.runWorker({ prompt: 'Use the scoped preset.' }, h.exec)
+  await h.wait(() => h.get().runs[h.get().id].result)
+  assert.equal(h.get().runs[h.get().id].state, 'completed', JSON.stringify(h.get().runs[h.get().id].finish))
+  const agent = h.ctx.agents.get(h.get().sessionId)
+  assert.equal(h.ctx.tools.schemas(agent).some(tool => tool.name === 'subagent'), true)
+  assert.equal((await h.ctx.tools.execute({ agent, name: 'subagent', arguments: {}, callId: randomId(), signal: AbortSignal.timeout(2000) })).isError, true)
+  assert.equal(bodies, 0)
+})
+
+for (const boundary of ['inspect', 'save', 'flush']) {
+  test(`native terminal during ${boundary} await settles without HMR and delivers exactly once`, async t => {
+    const h = await nativeHarness(t)
+    h.adapter.fault = 'hang'
+    await h.rt.runWorker({ prompt: 'Hold a native model call.' }, h.exec)
+    // Startup recovery must not rescue the missed notification this regression targets.
+    if (boundary === 'inspect') await new Promise(resolve => setTimeout(resolve, 3200))
+    const id = h.get().sessionId
+    let release
+    let paused = false
+    const gate = () => new Promise(resolve => { paused = true; release = resolve })
+    if (boundary === 'inspect') {
+      const inspect = h.ctx.sessionController.inspect
+      h.ctx.sessionController.inspect = async sessionId => {
+        const snapshot = await inspect(sessionId)
+        if (sessionId === id && !paused) await gate()
+        return snapshot
+      }
+    } else if (boundary === 'save') {
+      const save = h.rt.save
+      h.rt.save = async options => {
+        if (!paused && h.get().runs[h.get().id].state === 'running') await gate()
+        return save(options)
+      }
+    } else {
+      const flush = h.ctx.sessions.flush.bind(h.ctx.sessions)
+      h.ctx.sessions.flush = async session => {
+        if (session.id === id && !paused) await gate()
+        return flush(session)
+      }
+    }
+    const recovery = h.rt.recoverWorkers()
+    await h.wait(() => paused)
+    h.adapter.fault = undefined
+    h.adapter.release()
+    await h.ctx.agents.get(id).whenIdle()
+    release()
+    await recovery
+    await h.wait(() => h.get().runs[h.get().id].state === 'completed'
+      && h.rt.taskOf('task').sends?.[`${h.get().id}:result`]?.delivery.state === 'delivered')
+    const copies = h.ctx.agents.get('ta').session.snapshotEvents().filter(e => e.type === 'agent/inbox/spliced')
+      .flatMap(e => e.data.inserted).filter(message => message.source?.kind === 'worker-result')
+    assert.equal(copies.length, 1)
+  })
+}
+
+test('periodic evidence check recovers an idle completed turn after stale snapshots', async t => {
+  const h = await nativeHarness(t)
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Leave stale history snapshots.' }, h.exec)
+  const workerId = h.get().sessionId
+  const inspect = h.ctx.sessionController.inspect
+  const stale = await inspect(workerId)
+  let reads = 0
+  h.ctx.sessionController.inspect = async id => id === workerId && ++reads <= 2 ? stale : inspect(id)
+  h.adapter.fault = undefined
+  h.adapter.release()
+  await h.ctx.agents.get(workerId).whenIdle()
+  await h.wait(() => h.get().runs[h.get().id].state === 'completed')
+  assert.ok(reads >= 3)
+})
+
+test('own native abort waits for quiescence before cancelled and keeps its exact native reason', async t => {
+  const h = await nativeHarness(t)
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Cancel only after drain.' }, h.exec)
+  const agent = h.ctx.agents.get(h.get().sessionId)
+  const nativeIdle = agent.whenIdle.bind(agent)
+  let release
+  const confirmation = new Promise(resolve => { release = resolve })
+  agent.whenIdle = async () => { await nativeIdle(); await confirmation }
+  const stopping = h.rt.stopNativeWorker(h.get().id)
+  await h.wait(() => agent.status === 'idle')
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(h.get().runs[h.get().id].state, 'cancelling')
+  assert.equal(h.get().runs[h.get().id].result, undefined)
+  h.adapter.fault = undefined
+  release()
+  await stopping
+  const run = h.get().runs[h.get().id]
+  assert.equal(run.state, 'cancelled')
+  assert.deepEqual(run.finish, { kind: 'cancelled', reason: { kind: 'aborted', reason: { kind: 'hook', reason: 'ds-bot/worker-stop' } } })
+})
+
+test('a prior completed run and an unrelated abort are not rewritten as cancelled', async t => {
+  const h = await nativeHarness(t)
+  await h.rt.runWorker({ prompt: 'Complete before stop.' }, h.exec)
+  await h.wait(() => h.get().runs[h.get().id].state === 'completed')
+  const before = structuredClone(h.get().runs[h.get().id])
+  await h.rt.stopNativeWorker(h.get().id)
+  assert.deepEqual(h.get().runs[h.get().id], before)
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Unrelated abort.' }, { ...h.exec, callId: 'unrelated' })
+  const other = Object.values(h.rt.taskOf('task').workers)[1]
+  h.ctx.agents.get(other.sessionId).cancel({ kind: 'hook', reason: 'unrelated-user-action' })
+  h.adapter.fault = undefined
+  await h.wait(() => h.rt.taskOf('task').workers[other.id].runs[other.id].state === 'failed')
+  await h.rt.stopNativeWorker(other.id)
+  assert.equal(h.rt.taskOf('task').workers[other.id].runs[other.id].state, 'failed')
+})
