@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import fsp from 'node:fs/promises'
-import { syncBuiltinESMExports } from 'node:module'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -21,6 +21,9 @@ import { hasWorkers, validateWorkerUpdate, workerClaims } from '../src/host/work
 import { workerEvidence, workerResult } from '../src/host/workers.js'
 import { historyEntry } from '../src/host/parts.js'
 import { fakeContext } from './fake-ctx.js'
+
+// The checkout bundle exposes persistence, not all of its transitive format libraries.
+const { sessionFormatCatalog } = createRequire(import.meta.resolve('@deepseek-ai/dsh-session-persistence-jsonl'))('@deepseek-ai/dsh-session-format-catalog')
 
 const task = () => ({
   id: 'task', mode: 'v2', title: 'Worker test', brief: 'Run isolated work.',
@@ -76,6 +79,9 @@ test('worker tombstones, permissions, settled outcomes and terminal admission co
   const changed = structuredClone(old)
   changed.w.sandboxRoot = '/other'
   assert.throws(() => validateWorkerUpdate(old, changed), /identity/)
+  const generationChanged = structuredClone(old)
+  generationChanged.w.createdGeneration = 'rewritten-generation'
+  assert.throws(() => validateWorkerUpdate(old, generationChanged), /identity/)
   old.w.sandbox = 'read-only'
   changed.w = { ...old.w, sandbox: 'workspace-write' }
   assert.throws(() => validateWorkerUpdate(old, changed), /permission/)
@@ -181,7 +187,7 @@ class WorkerMock extends LlmAdapter {
 
 // Native factory, scoped tools, inbox/claim, loop, sandbox and approval are real DSH.
 // The controller/persistence facade below is a unit fixture, not Web/cold-controller acceptance.
-async function nativeHarness(t, config = {}, { beforeLoad, mountPreset } = {}) {
+async function nativeHarness(t, config = {}, { beforeLoad, beforeRuntime, mountPreset } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'worker-native-'))
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = join(root, 'dsh')
@@ -204,23 +210,38 @@ async function nativeHarness(t, config = {}, { beforeLoad, mountPreset } = {}) {
   ctx.provide('workspaceRegistry', { get: () => ({ id: 'unit-workspace', path: cwd, title: 'Unit workspace' }),
     archiveSession: async () => {}, archivedSessionIds: [] })
   const titles = new Map()
-  ctx.provide('sessionTitle', { get: session => titles.get(session?.id), rename: async (session, title) => { titles.set(session.id, { title }) } })
+  ctx.provide('sessionTitle', { get: session => titles.get(session?.id), rename: async (session, title) => {
+    titles.set(session.id, { title })
+    session.append('session/title', { title, messageSeqs: [], source: { kind: 'user' } })
+  } })
   ctx.provide('sessionQuery', {})
   const originalFlush = ctx.sessions.flush.bind(ctx.sessions)
   ctx.sessions.flush = async session => { flushes.push(session.id); return originalFlush(session) }
   let admissionWait
+  const histories = new Map()
+  const resolve = async id => {
+    if (ctx.agents.get(id)) return ctx.agents.get(id)
+    const raw = histories.get(id)
+    if (!raw) throw new Error('fixture Session missing')
+    return (await ctx.agents.create({ sessionId: id, seed: raw.events, meta: { cwd: raw.meta.cwd },
+      agentOptions: { provider: 'mock', model: 'model' } })).agent
+  }
   ctx.provide('sessionController', {
-    resolveAgent: async id => ({ agent: ctx.agents.get(id) }),
+    resolveAgent: async id => ({ agent: ctx.agents.get(id) ?? (histories.has(id) ? await resolve(id) : undefined) }),
     inspect: async id => {
       const agent = ctx.agents.get(id)
-      if (!agent) throw new Error('fixture Session missing')
+      if (!agent) {
+        if (histories.has(id)) return histories.get(id)
+        throw new Error('fixture Session missing')
+      }
       return { meta: agent.session.header, events: agent.session.snapshotEvents() }
     },
     page: async ({ address }) => ({ records: ctx.agents.get(address.sessionId).session.snapshotEvents().map(event => ({ event })), hasMore: false }),
     prompt: async (request, signal) => {
       signal.throwIfAborted()
       await admissionWait?.()
-      ctx.agents.get(request.sessionId).followup(createUserMessage({
+      const agent = await resolve(request.sessionId)
+      agent.followup(createUserMessage({
         content: request.content, source: { kind: 'user', rpcId: request.requestId },
       }))
       return { accepted: true }
@@ -230,9 +251,11 @@ async function nativeHarness(t, config = {}, { beforeLoad, mountPreset } = {}) {
     scope.provide('connection', { fetch: { register: () => () => {} } })
   })
   let rt
-  const fiber = await ctx.plugin({ inject, apply(scope) {
+  await beforeRuntime?.({ ctx, cwd, home })
+  const mount = () => ctx.plugin({ inject, apply(scope) {
     rt = createRuntime(scope, { home, memory: false, nativeWorkers: true, taskSessions: ['PM', 'Dev'], ...config })
   } })
+  let fiber = await mount()
   await rt.load()
   // Skip unrelated Bot capability restoration in this native worker unit harness.
   rt.ensureCapabilities = async () => {}
@@ -257,7 +280,18 @@ async function nativeHarness(t, config = {}, { beforeLoad, mountPreset } = {}) {
     else process.env.DSH_HOME = previousHome
     await rm(root, { recursive: true, force: true, maxRetries: 5 })
   })
-  return { ctx, rt, adapter, exec, cwd, home, dirs, get, wait, flushes, fiber,
+  return { ctx, get rt() { return rt }, adapter, exec, cwd, home, dirs, get, wait, flushes,
+    get fiber() { return fiber },
+    reload: async () => {
+      const previous = ctx.agents.list()
+      await fiber.dispose()
+      for (const agent of previous) histories.set(agent.id, {
+        meta: agent.session.header, events: agent.session.snapshotEvents(),
+      })
+      fiber = await mount()
+      await rt.load()
+      rt.ensureCapabilities = async () => {}
+    },
     pauseAdmission: callback => { admissionWait = callback } }
 }
 
@@ -519,6 +553,7 @@ for (const failure of ['EACCES', 'EISDIR', 'version']) {
     let restore
     const originalRead = fsp.readFile
     t.after(() => { fsp.readFile = originalRead; syncBuiltinESMExports() })
+    let agent
     const h = await nativeHarness(t, { nativeWorkers: false }, {
       async beforeLoad({ cwd, statePath }) {
         const data = seed()
@@ -526,6 +561,9 @@ for (const failure of ['EACCES', 'EISDIR', 'version']) {
         Object.assign(w, { sandboxRoot: cwd, canonicalRoot: cwd, initialWorkdir: cwd })
         data.tasks.task.workers = { w }
         const saved = JSON.stringify(data)
+        await writeFile(join(cwd, '..', 'bot', 'workers.created.jsonl'), JSON.stringify({
+          version: 1, sessionId: 'ws', marker: w.marker,
+        }) + '\n')
         await writeFile(statePath, saved)
         if (failure === 'EACCES') {
           let failing = true
@@ -544,24 +582,133 @@ for (const failure of ['EACCES', 'EISDIR', 'version']) {
           restore = async () => writeFile(statePath, saved)
         }
       },
+      async beforeRuntime({ ctx, cwd }) {
+        ;({ agent } = await ctx.agents.create({ sessionId: 'ws', meta: { cwd },
+          agentOptions: { provider: 'mock', model: 'model' } }))
+        agent.session.append('session/title', { title: 'worker:task:w', messageSeqs: [],
+          source: { kind: 'user' } })
+        await ctx.sessionTitle.rename(agent.session, 'Ordinary renamed Session')
+      },
     })
-    const { agent } = await h.ctx.agents.create({ sessionId: 'ws', meta: { cwd: h.cwd }, agentOptions: { provider: 'mock', model: 'model' } })
-    await h.ctx.sessionTitle.rename(agent.session, 'Ordinary renamed Session')
     let bodies = 0
-    agent.ctx.tools.register(defineTool({ name: 'worker_escape_probe', parameters: {},
-      output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
-      execute: () => { bodies++; return 'escaped' } }))
-    const execute = () => h.ctx.tools.execute({ agent, name: 'worker_escape_probe', arguments: {}, callId: randomId(), signal: AbortSignal.timeout(2000) })
-    assert.equal((await execute()).isError, true)
+    for (const name of ['send_message', 'pwsh']) {
+      agent.ctx.tools.register(defineTool({ name, parameters: {},
+        output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
+        execute: () => { bodies++; return 'escaped' } }))
+    }
+    const execute = name => h.ctx.tools.execute({ agent, name, arguments: {}, callId: randomId(), signal: AbortSignal.timeout(2000) })
+    for (const name of ['send_message', 'pwsh']) assert.equal((await execute(name)).isError, true)
     assert.equal(bodies, 0)
     assert.notEqual(h.rt.stateReadError(), undefined)
+    const rawSeed = agent.session.snapshotEvents()
+    await assert.rejects(h.ctx.agents.create({ sessionId: 'cold-worker', seed: rawSeed, meta: { cwd: h.cwd },
+      agentOptions: { provider: 'mock', model: 'model' } }), /ownership is unavailable/)
+    const { agent: plain } = await h.ctx.agents.create({ sessionId: 'plain-user', meta: { cwd: h.cwd },
+      agentOptions: { provider: 'mock', model: 'model' } })
+    plain.ctx.tools.register(defineTool({ name: 'pwsh', parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
+      execute: () => 'plain Session works' }))
+    assert.equal((await h.ctx.tools.execute({ agent: plain, name: 'pwsh', arguments: {},
+      callId: randomId(), signal: AbortSignal.timeout(2000) })).isError, false)
     await restore()
-    assert.equal((await execute()).isError, true)
+    assert.equal((await execute('send_message')).isError, true)
     assert.equal(h.rt.stateReadError(), undefined)
     assert.equal(h.rt.workerClaim('ws').workerId, 'w')
     assert.equal(bodies, 0)
   })
 }
+
+test('worker marker and creation tombstone are durable before the first prompt and survive rename', async t => {
+  const h = await nativeHarness(t)
+  let checked = false
+  h.pauseAdmission(async () => {
+    const w = h.get()
+    const raw = await h.ctx.sessionController.inspect(w.sessionId)
+    const marker = raw.events.find(e => e.type === 'session/title' && e.data.title === w.marker)
+    assert.equal(marker.data.title, w.marker)
+    assert.equal(raw.events.some(e => e.type === 'request/header'), false)
+    const restore = sessionFormatCatalog.createRestore(sessionFormatCatalog.encodeCurrentHeader({
+      ...raw.meta, delegationDepth: raw.meta.delegationDepth ?? 0,
+    }, 0),
+      { recovery: 'strict', validation: 'current' })
+    for (const event of raw.events) restore.decodeRow(sessionFormatCatalog.encodeCurrentEvent(event))
+    assert.equal(restore.finish().events[marker.seq].data.title, w.marker)
+    assert.equal(h.flushes.includes(w.sessionId), true)
+    const rows = (await fsp.readFile(join(h.home, 'workers.created.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse)
+    assert.equal(rows.filter(row => row.sessionId === w.sessionId).length, 1)
+    checked = true
+  })
+  await h.rt.runWorker({ prompt: 'Check durable marker.' }, h.exec)
+  assert.equal(checked, true)
+  const w = h.get()
+  const agent = h.ctx.agents.get(w.sessionId)
+  await h.ctx.sessionTitle.rename(agent.session, 'Ordinary renamed Session')
+  assert.equal(agent.session.snapshotEvents().filter(e => e.type === 'session/title' && e.data.title === w.marker).length, 1)
+})
+
+for (const unavailable of ['index', 'index-and-marker', 'index-and-ledger']) {
+  test(`renamed cold worker refuses native prompt with unreadable ${unavailable}; plain user Session remains usable`, async t => {
+    const h = await nativeHarness(t)
+    await h.rt.runWorker({ prompt: 'Must never run twice.' }, h.exec)
+    await h.wait(() => h.get().runs[h.get().id].result)
+    const id = h.get().sessionId
+    await h.ctx.sessionTitle.rename(h.ctx.agents.get(id).session, 'Ordinary renamed Session')
+    const data = JSON.parse(await fsp.readFile(join(h.home, 'state.json'), 'utf8'))
+    await writeFile(join(h.home, 'state.json'), JSON.stringify({ ...data, version: 2 }))
+    if (unavailable === 'index-and-marker') {
+      const inspect = h.ctx.sessionController.inspect
+      h.ctx.sessionController.inspect = async session => {
+        if (session === id) throw new Error('marker storage read failure')
+        return inspect(session)
+      }
+    }
+    if (unavailable === 'index-and-ledger') {
+      await rm(join(h.home, 'workers.created.jsonl'))
+      await mkdir(join(h.home, 'workers.created.jsonl'))
+    }
+    await h.reload()
+    const count = h.adapter.requests.length
+    await assert.rejects(h.ctx.sessionController.prompt({ sessionId: id, requestId: randomId(), mode: 'queue',
+      content: [{ type: 'text', text: 'Must be refused before a model request.' }] }, AbortSignal.timeout(2000)),
+    /ownership is unavailable/)
+    assert.equal(h.adapter.requests.length, count)
+    assert.equal(h.ctx.agents.get(id), undefined)
+    const { agent } = await h.ctx.agents.create({ sessionId: 'user-created', meta: { cwd: h.cwd },
+      agentOptions: { provider: 'mock', model: 'model' } })
+    await h.ctx.sessionController.prompt({ sessionId: agent.id, requestId: randomId(), mode: 'queue',
+      content: [{ type: 'text', text: 'Plain Session prompt.' }] }, AbortSignal.timeout(2000))
+    await agent.whenIdle()
+    assert.equal(h.adapter.requests.length, count + 1)
+  })
+}
+
+test('plugin HMR disposal settles unknown/plugin-reload once with warning, closed activation and no re-prompt', async t => {
+  const h = await nativeHarness(t)
+  h.adapter.fault = 'hang'
+  await h.rt.runWorker({ prompt: 'Interrupted only by plugin reload.' }, h.exec)
+  await h.wait(() => h.get().runs[h.get().id].state === 'running')
+  const w = h.get()
+  const requests = () => h.adapter.requests.filter(request => request.messages.some(message =>
+    message.content?.some(block => block.text === 'Interrupted only by plugin reload.'))).length
+  assert.equal(requests(), 1)
+  h.adapter.fault = undefined
+  await h.reload()
+  await h.rt.recoverWorkers()
+  await h.wait(() => h.get().runs[w.id].result)
+  const run = h.get().runs[w.id]
+  assert.equal(run.state, 'unknown')
+  assert.equal(run.finish.reason, 'plugin-reload')
+  assert.deepEqual(run.finish.cause, { kind: 'aborted', reason: { kind: 'disposed' } })
+  assert.match(run.result.text, /may have partially run; not re-run/)
+  assert.equal(h.get().admissionBlockReason, 'plugin-reload')
+  await h.wait(() => h.rt.taskOf('task').sends?.[run.result.id]?.delivery.state === 'delivered')
+  await h.rt.recoverWorkers()
+  assert.equal(h.ctx.agents.get('ta').session.snapshotEvents().filter(e => e.type === 'agent/inbox/spliced')
+    .flatMap(e => e.data.inserted).filter(m => m.source?.resultId === run.result.id).length, 1)
+  await assert.rejects(h.ctx.sessionController.prompt({ sessionId: w.sessionId, requestId: randomId(), mode: 'queue',
+    content: [{ type: 'text', text: 'Never re-prompt a disposed worker.' }] }, AbortSignal.timeout(2000)), /plugin-reload.*permanently closed/)
+  assert.equal(requests(), 1)
+})
 
 test('a failed real refresh retains positive Bot/task/plain ownership and worker tombstones', async t => {
   const h = await nativeHarness(t)

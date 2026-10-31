@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { realpath, stat } from 'node:fs/promises'
+import { appendFile, readFile, realpath, stat } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { asyncScope } from './async.js'
@@ -12,6 +12,8 @@ import { hasWorkers, unsettled, workerClaims } from './worker-data.js'
 
 const POLICY = Symbol.for('ds-bot/native-worker-policy')
 const TOOL = Symbol.for('ds-bot/native-worker-tool')
+const isWorkerMarker = event => event.type === 'session/title' && event.data.source?.kind === 'user'
+  && /^worker:[^:]+:[^:]+$/.test(event.data.title)
 const POLL_MS = 1000
 const STOP_REASONS = new Set(['ds-bot/worker-stop', 'ds-bot/stale-worker-admission'])
 const ALLOWED = new Set(['read', 'read_image', 'write', 'edit', 'bash', 'pwsh',
@@ -83,7 +85,7 @@ export function workerResult(worker, run, finish, text = '(no final text)', outs
     `Finish: ${points(JSON.stringify(finish), 1000)}`,
     `Session: session:${worker.sessionId}`,
     ...(outsideInput ? ['worker received outside input'] : []),
-    ...(finish.kind === 'interrupted' ? ['may have partially run; not re-run'] : []),
+    ...(finish.kind === 'interrupted' || finish.reason === 'plugin-reload' ? ['may have partially run; not re-run'] : []),
     ...(finish.kind === 'unknown' ? ['unknown outcome; not rerun'] : []),
   ].join('\n') + '\n'
   return header + points(text, Math.max(0, 4000 - Array.from(header).length))
@@ -94,6 +96,11 @@ export function install(rt) {
   const { ctx } = rt
   const agents = ctx.get?.('agents')
   const host = `${process.pid}:${performance.timeOrigin}`
+  const generation = randomUUID()
+  const identities = new Map()
+  const createdSessions = new Set()
+  const creationPath = join(rt.home, 'workers.created.jsonl')
+  let creationRead
   const admissions = new Map()
   const creations = new Set()
   const active = new Map()
@@ -121,6 +128,57 @@ export function install(rt) {
     || rt.botOf(id) !== undefined || rt.roomOf(id) !== undefined || rt.agentOf?.(id) !== undefined)
   const unknownOwnership = id => id !== undefined && (!ownershipIndexed || ownershipFailed
     || rt.stateReadError?.() !== undefined) && !positivelyOwned(id)
+  const ownershipDenial = id => unknownOwnership(id)
+    && (identities.get(id) !== false || createdSessions.has(id))
+    ? 'Worker ownership is unavailable; native activation and all tools are denied' : undefined
+  async function readCreations() {
+    creationRead ??= readFile(creationPath, 'utf8').then(text => {
+      for (const line of text.split('\n').filter(Boolean)) {
+        const record = JSON.parse(line)
+        if (record.version !== 1 || typeof record.sessionId !== 'string') throw new Error('Invalid worker creation record')
+        createdSessions.add(record.sessionId)
+      }
+    }).catch(error => {
+      creationRead = undefined
+      if (error.code !== 'ENOENT') throw error
+    })
+    await creationRead
+    safe.signal.throwIfAborted()
+  }
+  async function recordCreation(worker) {
+    await readCreations()
+    if (createdSessions.has(worker.sessionId)) return
+    await appendFile(creationPath, JSON.stringify({ version: 1, sessionId: worker.sessionId,
+      taskId: worker.taskId, workerId: worker.id, marker: worker.marker }) + '\n', { flush: true })
+    createdSessions.add(worker.sessionId)
+    check()
+  }
+  async function identify(agent) {
+    if (identities.has(agent.id)) return identities.get(agent.id)
+    let ledgerError
+    try { await readCreations() } catch (error) { ledgerError = error }
+    try {
+      const raw = await ctx.sessionController.inspect(agent.id, AbortSignal.timeout(HISTORY_TIMEOUT_MS))
+      safe.signal.throwIfAborted()
+      if (!Array.isArray(raw?.events)) throw new Error('Worker identity history is unavailable')
+      const marked = raw.events.some(isWorkerMarker)
+      const owned = marked || createdSessions.has(agent.id)
+      identities.set(agent.id, owned)
+      return owned
+    } catch {
+      safe.signal.throwIfAborted()
+      if (createdSessions.has(agent.id)) { identities.set(agent.id, true); return true }
+      // A readable creation ledger excludes user-created Sessions even if history is unavailable.
+      if (!ledgerError) { identities.set(agent.id, false); return false }
+      throw new Error('Worker identity is unavailable')
+    }
+  }
+  function markSession(agent, worker) {
+    // This log-only event survives rename/compaction; the current title is never an identity.
+    agent.session.append('session/title', { title: worker.marker, messageSeqs: [],
+      source: { kind: 'user' } })
+    identities.set(agent.id, true)
+  }
   const current = id => {
     check()
     const rows = [...workerClaims(rt.state).values()].flat().filter(row => row.workerId === id)
@@ -216,11 +274,14 @@ export function install(rt) {
   }
   const permitted = name => ALLOWED.has(name) && !TEAM_TOOLS.includes(name)
   function denial(exec) {
-    if (unknownOwnership(exec.agent?.id) && !permitted(exec.name)) return 'Worker ownership is unavailable; unclassified Session tools are denied'
+    const unavailable = ownershipDenial(exec.agent?.id)
+    if (unavailable) return unavailable
     const slot = exec.agent?.[POLICY]
     let row
     try { row = claim(exec.agent?.id) } catch { return 'Worker ownership is unresolved' }
-    if (!row && !slot) return
+    if (!row && !slot && exec.agent?.id !== undefined
+      && !positivelyOwned(exec.agent.id) && !identities.has(exec.agent.id)) return 'Worker identity has not been checked'
+    if (!row && !slot && !identities.get(exec.agent?.id) && !createdSessions.has(exec.agent?.id)) return
     if (!row) return 'Worker ownership reservation is missing'
     if (!slot || slot.owner !== safe || safe.stopped || !slot.ready) return 'Worker policy is not ready'
     const worker = row.worker
@@ -244,10 +305,24 @@ export function install(rt) {
       // Agent scope outlives a plugin-only replacement; the old closure stays deny-all.
       agent.ctx.tools.guard(exec => slot.ready && !slot.owner.stopped
         ? slot.deny(exec) : 'Worker policy transition is closed')
+      agent.ctx.on('agent/pre-step', (payload, next) => slot.ready && !slot.owner.stopped
+        ? slot.admit(payload, next) : { kind: 'reject' })
     }
     if (slot.owner !== safe) slot.ready = false
     slot.owner = safe
     slot.deny = denial
+    slot.admit = async (_payload, next) => {
+      try {
+        await rt.refresh()
+        check()
+        const row = claim(agent.id)
+        if (ownershipDenial(agent.id) || !row || row.worker.admissionsClosed
+          || rt.taskOf(row.taskId)?.state !== 'open') return { kind: 'reject' }
+        await permission(agent, row.worker)
+        check()
+        return slot.ready ? next() : { kind: 'reject' }
+      } catch { return { kind: 'reject' } }
+    }
     policies.add(slot)
     return slot
   }
@@ -257,13 +332,19 @@ export function install(rt) {
     try {
       const row = claim(agent.id)
       if (!row) throw new Error('Worker has no durable reservation')
+      if (ownershipDenial(agent.id)) throw new Error(ownershipDenial(agent.id))
       let worker = row.worker
+      if (worker.admissionsClosed) throw new Error(`Worker ${worker.admissionBlockReason ?? 'admissions-closed'}: native activation is permanently closed`)
       if (!fresh && worker.createdHost !== host && !agent.session.snapshotEvents().some(event => event.type === 'request/header')) {
         await commit(worker.id, saved => {
           saved.admissionsClosed = true
           saved.admissionBlockReason = 'restart-before-first-header'
         })
         throw new Error('Worker restart-before-first-header: native activation is permanently closed')
+      }
+      if (!identities.get(agent.id)) {
+        await recordCreation(worker)
+        markSession(agent, worker)
       }
       await permission(agent, worker)
       check()
@@ -353,7 +434,7 @@ export function install(rt) {
       sessionId: randomUUID(), marker: `worker:${task.id}:${id}`, title: points((args.title ?? args.prompt.split(/\r?\n/).find(line => line.trim()) ?? '').trim(), 80),
       mode, sandboxRoot, canonicalRoot, initialWorkdir, sandbox, approval: 'never', initialModel,
       followupCount: 0, currentRunId: id, admissionsClosed: false, admissionBlockReason: null,
-      createdHost: host, openedAt: Date.now(),
+      createdHost: host, createdGeneration: generation, openedAt: Date.now(),
       runs: { [id]: { id, ordinal: 0, state: 'pending', admissionKey, promptRequestId: id,
         promptDigest: digest, admission: { state: 'reserved' } } },
       cleanup: { state: 'none', cancelRequestedAt: null, confirmedIdleAt: null }, archivedAt: null,
@@ -375,6 +456,8 @@ export function install(rt) {
     }
     try {
       admissionCheck()
+      await recordCreation(worker)
+      admissionCheck()
       creations.add(id)
       let handle
       try { handle = await agents.create({
@@ -382,6 +465,7 @@ export function install(rt) {
         meta: { cwd: sandboxRoot, agentPreset: preset.id },
         setup: async (scope, created) => {
           barrier(created)
+          markSession(created, worker)
           await ctx.get('agentPresets').mount(scope, preset.id)
           admissionCheck()
           setters.setSandboxMode(created.session, sandbox)
@@ -396,8 +480,6 @@ export function install(rt) {
         },
       }) } finally { creations.delete(id) }
       agent = handle.agent
-      admissionCheck()
-      await ctx.sessionTitle.rename(agent.session, worker.marker)
       admissionCheck()
       await configure(agent, { fresh: true })
       admissionCheck()
@@ -465,8 +547,16 @@ export function install(rt) {
       }
       if (!unsettled(run)) return
       let finish = reason ?? evidence.finish
-      const ownStop = finish.kind === 'aborted' && finish.reason?.kind === 'hook'
-        && STOP_REASONS.has(finish.reason.reason) && worker.cleanup.cancelRunId === run.id
+      if (finish.kind === 'aborted' && finish.reason?.kind === 'disposed') {
+        finish = { kind: 'unknown', reason: 'plugin-reload', cause: finish }
+      }
+      if (finish.kind === 'unknown' && finish.reason === 'plugin-reload') {
+        worker.admissionsClosed = true
+        worker.admissionBlockReason = 'plugin-reload'
+      }
+      const ownStop = ((finish.kind === 'aborted' && finish.reason?.kind === 'hook'
+        && STOP_REASONS.has(finish.reason.reason)) || finish.kind === 'blocked')
+        && worker.cleanup.cancelRunId === run.id
         && evidence.endSeq > worker.cleanup.cancelAfterSeq
       if (ownStop) {
         // A native abort proves the turn ended, not that late admissions or input drained.
@@ -514,14 +604,15 @@ export function install(rt) {
     timer?.unref?.()
     polls.set(id, timer)
   }
-  async function reconcile(id, { restart = false } = {}) {
+  async function reconcile(id, { restart = false, reload = false } = {}) {
     const existing = active.get(id)
     if (existing) {
       existing.dirty = true
       existing.restart ||= restart
+      existing.reload ||= reload
       return existing.promise
     }
-    const flight = { dirty: true, restart }
+    const flight = { dirty: true, restart, reload }
     const once = async () => {
       let worker = current(id)
       const run = worker.runs[worker.currentRunId]
@@ -540,6 +631,7 @@ export function install(rt) {
             saved.admissionBlockReason = 'restart-before-first-header'
           }, scoped)
           if (evidence.finish) await finish(id, undefined, evidence, scoped)
+          else if (flight.reload && !live) await finish(id, { kind: 'unknown', reason: 'plugin-reload' }, evidence, scoped)
           else if (flight.restart && live?.status !== 'running') await finish(id, { kind: 'unknown', reason: header ? 'host-restart' : 'restart-before-first-header' }, evidence, scoped)
           else if (evidence.droppedSeq !== undefined && !admissions.has(id) && live?.status === 'idle') {
             await finish(id, { kind: 'failed', reason: 'input-dropped-before-claim' }, evidence, scoped)
@@ -555,7 +647,7 @@ export function install(rt) {
         worker = current(id)
         const saved = worker.runs[worker.currentRunId]
         if (saved.result) await rt.deliverWorkerResult(resultArgs(worker, saved), scoped)
-      }, () => reconcile(id, { restart: flight.restart }))
+      }, () => reconcile(id, { restart: flight.restart, reload: flight.reload }))
     }
     safe.clearTimeout(polls.get(id))
     polls.delete(id)
@@ -679,7 +771,8 @@ export function install(rt) {
         check()
         const live = agents.get(worker.sessionId)
         if (live) await configure(live)
-        await reconcile(worker.id, { restart: worker.createdHost !== host && !live })
+        await reconcile(worker.id, { restart: worker.createdHost !== host && !live,
+          reload: worker.createdHost === host && worker.createdGeneration !== generation && !live })
         if (current(worker.id).cleanup.state === 'cancelling') await stop(worker.id)
         if (rt.taskOf(row.taskId)?.state !== 'open') await settleTaskWorkers(row.taskId)
       } catch (error) {
@@ -728,10 +821,14 @@ export function install(rt) {
         await rt.refresh()
         ownershipFailed = false
       } catch { ownershipFailed = true }
-      if (unknownOwnership(exec.agent?.id) && !permitted(exec.name)) return { kind: 'deny', reason: 'Worker ownership is unavailable; unclassified Session tools are denied' }
+      if (exec.agent && !positivelyOwned(exec.agent.id)) {
+        try { await identify(exec.agent) } catch (error) { return { kind: 'deny', reason: error.message } }
+      }
+      const unavailable = ownershipDenial(exec.agent?.id)
+      if (unavailable) return { kind: 'deny', reason: unavailable }
       let row
       try { row = claim(exec.agent?.id) } catch (error) { return { kind: 'deny', reason: error.message } }
-      if (!row && !exec.agent?.[POLICY]) return next()
+      if (!row && !exec.agent?.[POLICY] && !identities.get(exec.agent?.id)) return next()
       if (!row || !permitted(exec.name)) return { kind: 'deny', reason: `Native workers cannot execute ${exec.name}` }
       try {
         const worker = await permission(exec.agent, row.worker)
@@ -744,6 +841,10 @@ export function install(rt) {
     safe.on('agent/created', async ({ agent }) => {
       await rt.load()
       if (claim(agent.id)) await configure(agent)
+      else if (await identify(agent)) {
+        barrier(agent)
+        throw new Error('Worker ownership is unavailable; native activation and all tools are denied')
+      }
       else registerTool(agent)
     })
     safe.on('session/event', (session, event) => {
@@ -783,7 +884,12 @@ export function install(rt) {
       if (claim(agent.id)) {
         barrier(agent)
         safe.setImmediate(() => safe.run('worker policy takeover', () => configure(agent).then(() => reconcile(claim(agent.id).workerId))))
-      } else registerTool(agent)
+      } else {
+        safe.setImmediate(() => safe.run('worker identity takeover', async () => {
+          if (await identify(agent)) barrier(agent)
+          else registerTool(agent)
+        }))
+      }
     }
   }
   Object.assign(rt, {

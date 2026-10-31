@@ -31,6 +31,8 @@ export function validateWorkers(task) {
       && worker.taskId === task.id && worker.marker === `worker:${task.id}:${id}`, 'invalid identity')
     require(text(worker.sessionId) && !sessions.has(worker.sessionId)
       && !Object.values(task.sessions).includes(worker.sessionId), 'conflicting Session')
+    require((worker.createdHost === undefined || text(worker.createdHost))
+      && (worker.createdGeneration === undefined || text(worker.createdGeneration)), 'invalid creation generation')
     sessions.add(worker.sessionId)
     require(text(worker.requestedBy) && task.participants[worker.requestedBy]?.kind !== 'trunk'
       && task.sessions[worker.requestedBy] === worker.requesterSessionId, 'invalid requester endpoint')
@@ -74,7 +76,7 @@ export function validateWorkerUpdate(before = {}, after = {}, terminal = false) 
     const next = after[id]
     require(next, 'ownership tombstones cannot be removed')
     const immutable = ['id', 'kind', 'taskId', 'requestedBy', 'requesterSessionId', 'sessionId', 'marker',
-      'title', 'mode', 'sandboxRoot', 'canonicalRoot', 'initialWorkdir', 'initialModel']
+      'title', 'mode', 'sandboxRoot', 'canonicalRoot', 'initialWorkdir', 'initialModel', 'createdHost', 'createdGeneration']
     require(immutable.every(key => isDeepStrictEqual(old[key], next[key])), 'immutable worker identity changed')
     require(!old.admissionsClosed || next.admissionsClosed, 'closed admissions cannot reopen')
     require(old.sandbox !== 'read-only' || next.sandbox === 'read-only', 'permission cannot increase')
