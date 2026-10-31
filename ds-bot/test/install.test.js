@@ -57,6 +57,8 @@ test('apply registers listeners, tools, and effects in a fixed order', (t) => {
     'on settings/document-updated',
     'on session/event',
     'effect ds-bot: branch answer retries',
+    'on tools/pre-execute',
+    'tools guard',
     'effect ds-bot: agent tool restrict retry',
     'on agent/created',
     'effect ds-bot: identity section',

@@ -238,6 +238,36 @@ CONTEXT_WINDOW=100000 CHECK_RATIO=0.45 dev/bench.sh smoke 3101 8801 reset && nod
 dev/check.sh                             # all checks (see below)
 ```
 
+On Windows, use PowerShell 7.4 or later. Run these commands in `ds-bot/` in the
+worktree you want to test. Set `DSH_HARNESS` if the harness checkout is elsewhere;
+otherwise the launcher looks for `../deepseek-harness` beside the repository,
+then inside this checkout or beside the main worktree.
+
+```powershell
+$env:DSH_HARNESS = 'D:/path/to/deepseek-harness'
+pwsh -NoProfile -File dev/bench.ps1 -Name dev -WebPort 3100 -MockPort 8800 -Action start
+pwsh -NoProfile -File dev/bench.ps1 -Name dev -WebPort 3100 -MockPort 8800 -Action status
+pwsh -NoProfile -File dev/bench.ps1 -Name dev -WebPort 3100 -MockPort 8800 -Action stop
+
+$env:CONTEXT_WINDOW = '100000'
+$env:CHECK_RATIO = '0.45'
+pwsh -NoProfile -File dev/bench.ps1 -Name smoke -WebPort 3101 -MockPort 8801 -Action reset
+if ($LASTEXITCODE -eq 0) { node dev/smoke.mjs smoke 3101 }
+pwsh -NoProfile -File dev/bench.ps1 -Name smoke -WebPort 3101 -MockPort 8801 -Action stop
+```
+
+`bench.ps1` uses a Windows `link:` path to this worktree's plugin and starts hidden
+Node processes. It waits up to 120 seconds for the Web log marker and both listening
+ports; failures show log tails with login tokens omitted. `stop` walks only the
+recorded PID trees and verifies the ports are free. `status` starts no processes and
+shows each recorded PID and the current port owners. Choose different ports for
+each bench; port 3080 is reserved. Data and logs stay in the repository's
+`.dsh-test-<name>/`: `web.log` / `web.err`, `mock.out` / `mock.err`, and `mock.jsonl`.
+`reset` clears the same runtime data as `bench.sh` and starts again, keeping the
+profile. `CONTEXT_WINDOW`, `CHECK_RATIO` and `MOCK_DELAY_MS` work as in the shell
+bench. Add `-Patch path/to/extra.yml` to layer an extra DSH patch after the bench
+overlay.
+
 - `client.js` is built from `src/client/` and committed, so `link:` and Git installs need no build. Do not edit `client.js` by hand; `npm test` checks that it matches the source. After a change in `src/client/`, run `npm run build` and reload the page. After a change in `index.js` or `src/host/`, restart dsh.
 - **Web test bench** `dev/bench.sh <name> <web port> <mock port> [start|stop|reset|status]`: a scripted mock model (`dev/mock-llm.mjs`, no real tokens; its commands are listed at the top of the file) and a dsh Web server. Data goes in `../.dsh-test-<name>/`; `reset` clears the team and Sessions first. The login address with its token is in `../.dsh-test-<name>/web.log`.
 - **Desktop test bench** `dev/desktop-linux/desktop.sh <name> [start|stop|reset|status]`: dsh does not run Desktop on Linux; `launch.mts` runs the unpackaged Desktop in Xvfb. The first start downloads Electron and a Linux runtime (a few minutes). `start` returns when the team shows in a 1400×860 window.

@@ -36,9 +36,20 @@ npm run build                          # src/client → client.js
 npm test                               # unit tests; also fail if client.js is stale
 node scripts/build-client.mjs --check  # client.js matches src/client
 npm run lint                           # oxlint
-CONTEXT_WINDOW=100000 CHECK_RATIO=0.45 dev/bench.sh smoke 3096 8796 reset && node dev/smoke.mjs smoke 3096   # smoke test
-dev/bench.sh smoke 3096 8796 stop
 ```
+
+On Windows (PowerShell 7.4 or later), run the smoke test with the native launcher:
+
+```powershell
+$env:CONTEXT_WINDOW = '100000'
+$env:CHECK_RATIO = '0.45'
+pwsh -NoProfile -File dev/bench.ps1 -Name smoke -WebPort 3096 -MockPort 8796 -Action reset
+if ($LASTEXITCODE -eq 0) { node dev/smoke.mjs smoke 3096 }
+pwsh -NoProfile -File dev/bench.ps1 -Name smoke -WebPort 3096 -MockPort 8796 -Action stop
+```
+
+On POSIX systems use `dev/bench.sh smoke 3096 8796 reset` with the same environment
+settings, then `node dev/smoke.mjs smoke 3096` and `dev/bench.sh smoke 3096 8796 stop`.
 
 A change is done when `npm test`, the `--check` and `npm run lint` pass; CI runs them on every pull request. Run the smoke test as well for changes to `index.js` or `src/host/`. Use a free port for each bench, and stop every bench and process that you started.
 
