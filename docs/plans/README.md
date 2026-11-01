@@ -51,4 +51,4 @@
 | [消息布局和宽度](2026-10-22-message-layout.md) | 气泡 / 平铺两种布局；平铺时 Bot 的话带头像、名字、时间；气泡宽度和平铺正文宽度各用一个滑块，按正文列的百分比调 |
 | [任务会话](2026-10-30-task-sessions.md) | 长期 Bot 之间派活：发起方 fork 主干、接收方用新 Session，任务内消息互通，关闭时只向发起方主干交一条结论；开关、资格、关闭规则和数据字段 |
 | [发布与回滚](2026-10-30-release-procedure.md) | 场外发布：退出 Desktop、备份、切换发布 checkout 的提交、重开验证；回滚同理 |
-| [一次性 worker](2026-11-01-workers.md) | ADA 和 PM 派出的一次性执行者：一个 DSH Agent Session 一份简报，结构化汇报只回派活的 Session，可补消息、可取消，Sir 可围观（待确认） |
+| [一次性 worker](2026-11-01-workers.md) | ADA 和 PM 派出的一次性执行者：一个 DSH Agent Session 一份简报，结构化汇报只回派活的 Session，可补消息、可取消，Sir 可围观 |

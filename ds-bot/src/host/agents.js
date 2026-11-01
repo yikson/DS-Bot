@@ -115,15 +115,15 @@ export function install(rt) {
     return agent
   }
 
-  async function createAgentSession(agentId, workspaceId) {
+  // A worker passes its own folder and preset; the user's Sessions join a workspace.
+  async function createAgentSession(agentId, workspaceId, { cwd, agentPreset } = {}) {
     writeCheck()
     const agent = record(agentId)
     // A known workspace id wins (the Agent's latest Session may live outside the
     // team workspace after a workspace switch); anything else gets the team's own.
-    const target = typeof workspaceId === 'string' && ctx.workspaceRegistry.get(workspaceId)
-      ? workspaceId
-      : await rt.ensureWorkspace()
-    const { sessionId } = await ctx.sessionController.create({ workspaceId: target })
+    const place = cwd !== undefined ? { cwd }
+      : { workspaceId: typeof workspaceId === 'string' && ctx.workspaceRegistry.get(workspaceId) ? workspaceId : await rt.ensureWorkspace() }
+    const { sessionId } = await ctx.sessionController.create({ ...place, ...(agentPreset ? { agentPreset } : {}) })
     agent.sessions.push(sessionId)
     await rt.save()
     // agent/created fired before the session joined the index, so restrict again now.
@@ -165,6 +165,16 @@ export function install(rt) {
       await rt.save().catch(() => {})
       throw error
     }
+    return agent
+  }
+
+  // Workers need a DSH Agent; a team without one gets an empty record, no Session.
+  function ensureAgent() {
+    writeCheck()
+    const found = Object.values(state.agents)[0]
+    if (found) return found
+    const agent = { id: randomUUID(), name: AGENT_NAME, sessions: [], createdAt: Date.now() }
+    state.agents[agent.id] = agent
     return agent
   }
 
@@ -214,5 +224,5 @@ export function install(rt) {
     await rt.save()
   }
 
-  Object.assign(rt, { agentOf, addAgent, createAgentSession, adoptAgentSession, archiveAgentSession, renameAgentSession, removeAgent })
+  Object.assign(rt, { agentOf, addAgent, ensureAgent, createAgentSession, adoptAgentSession, archiveAgentSession, renameAgentSession, removeAgent })
 }

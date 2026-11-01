@@ -18,7 +18,7 @@
 // Commands to a Bot:
 //   建群 名: A, B · 群发[回报] 名: 消息 · 改群 名 公告|管理员|模式|加|踢: 值 · 删群 名
 //   看群 名 (read_group_chat) · 转告 名: 消息, also over several lines (message_bot) · 搜索：查询1 | 查询2 (web_search)
-//   进目录 路径 (working_directory with cd)
+//   进目录 路径 (working_directory with cd) · 派工 标题: 简报 (start_worker; the worker reports ready at once)
 //   插话 名: 消息 (message_bot when "now") · 排队 名: 消息 (message_bot when "queue") · 叫停 名: 原因 (stop_bot)
 //   In a message from a Bot: 转告 名: 消息 (hands it on with message_bot) · 慢慢做 N (answers after N seconds)
 //   长文 N / long N (N×1000 characters) · 长任务 N [K] (N steps of K×1000, default 4)
@@ -428,6 +428,11 @@ function decide(body) {
     return [tool('update_group', { group: order[1], ...field })]
   }
   if ((order = /^删群\s*(\S+)$/.exec(userText))) return [tool('delete_group', { group: order[1] })]
+  if ((order = /^派工\s*(\S+?)\s*[:：]\s*([\s\S]+)$/.exec(userText)) && tools.has('start_worker')) return [tool('start_worker', { title: order[1], brief: order[2] })]
+  if ((order = /^\[Worker brief from [^\]]+\]\nTitle: (.+)/.exec(userText)) && tools.has('worker_report')) {
+    return [tool('worker_report', { state: 'ready', summary: `mock worker finished ${order[1]}`, evidence: 'mock evidence' })]
+  }
+  if (userText.startsWith('[Worker report]')) return [text(`收到 worker 汇报：${userText.split('\n')[1] ?? ''}`)]
   if ((order = /^转告\s*(\S+?)\s*[:：]\s*([\s\S]+)$/.exec(userText))) return [tool('message_bot', { to: order[1], message: order[2] })]
   if ((order = /^插话\s*(\S+?)\s*[:：]\s*(.+)$/.exec(userText))) return [tool('message_bot', { to: order[1], message: order[2], when: 'now' })]
   if ((order = /^排队\s*(\S+?)\s*[:：]\s*(.+)$/.exec(userText))) return [tool('message_bot', { to: order[1], message: order[2], when: 'queue' })]
