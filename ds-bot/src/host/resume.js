@@ -15,9 +15,8 @@ import { readFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { FAILURE_RESUME_DELAY_MS, HISTORY_TIMEOUT_MS, MESSAGE_INLINE_MAX, SOURCE_KIND } from './constants.js'
-import { answerSender, failureLine, turnFailure } from './turns.js'
+import { answerSender, failureLine, replyTarget, turnFailure } from './turns.js'
 import { textOf } from './text.js'
-import { replyTarget, sourcesIn } from './branches.js'
 import { deliveryId } from './delivery-id.js'
 
 // Long enough for DSH to finish opening its workspaces after a start.
@@ -71,9 +70,8 @@ export function turnOf(events, exchangeId) {
 }
 
 // Whether a Session already holds the answer to an exchange.
-export function answeredIn(events, exchangeId, branch = false) {
-  return sourcesIn(branch ? events : events.filter(event => event.type === 'user/message'))
-    .some(source => source.replyTo === exchangeId)
+export function answeredIn(events, exchangeId) {
+  return events.some(event => event.type === 'user/message' && event.data?.source?.replyTo === exchangeId)
 }
 
 // The trigger fields a resumed turn needs to answer the same sender.
@@ -230,7 +228,7 @@ export function install(rt) {
       return args.exchangeId
     }
     const noted = args.exchangeId === undefined ? { ...args, exchangeId: exchangeOf(args) } : args
-    const sessionId = rt.deliverySession?.(noted) ?? noted.sessionId ?? rt.chatOf(noted.toId)
+    const sessionId = noted.sessionId ?? rt.chatOf(noted.toId)
     const pending = pendingResumes[noted.exchangeId]
     // One snapshot moves a due resume into queued; a reload sees one or the other.
     if (pending !== undefined && noted.failureResumes === pending.args.failureResumes) forgetResume(noted.exchangeId)
@@ -258,7 +256,7 @@ export function install(rt) {
   rt.replaceDelivery = (exchangeId, args) => {
     forgetQueued(exchangeId)
     forgetQueued(args.exchangeId)
-    const sessionId = rt.deliverySession?.(args) ?? args.sessionId ?? rt.chatOf(args.toId)
+    const sessionId = args.sessionId ?? rt.chatOf(args.toId)
     queued[sessionId] = [...(queued[sessionId] ?? []), { at: Date.now(), args }]
     persist()
   }
@@ -319,11 +317,6 @@ export function install(rt) {
 
   async function resumeTurn(sessionId, record) {
     if (stopped) return
-    const legacy = rt.branchOf?.(sessionId) ?? rt.branchForWork?.(record.trigger?.exchangeId)
-    if (legacy && legacy.state !== 'open') {
-      rt.warn('ds-bot: terminal legacy branch %s is display-only; interrupted work requires inspection', legacy.id)
-      return
-    }
     const bot = rt.botOf(record.botId)
     if (bot === undefined) return
     const text = resumeText(record)
@@ -347,11 +340,11 @@ export function install(rt) {
       || [...rt.live.values()].some(entry => entry.turn !== undefined && rt.workOf(entry.info) === work))) return
     if ((trigger?.role === 'request' || trigger?.role === 'stopped') && trigger.senderSessionId && trigger.audience !== 'user' && rt.botOf(trigger.senderSessionId)) {
       // The sender still waits for this turn's answer, so it goes on under the same exchange.
-      await rt.deliver({ fromId: trigger.senderSessionId, toId: bot.id, ...(rt.branchOwners?.has(sessionId) || taskId ? { sessionId } : {}), ...(taskId ? { taskId } : {}), ...continuation, role: trigger.role, ...(trigger.replySessionId ? { replySessionId: trigger.replySessionId } : {}), ...(trigger.exchangeId ? { exchangeId: trigger.exchangeId } : {}), ...(trigger.senderRoomId ? { fromRoomId: trigger.senderRoomId } : {}), ...(trigger.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}), resumed: true, text })
+      await rt.deliver({ fromId: trigger.senderSessionId, toId: bot.id, ...(taskId ? { sessionId, taskId } : {}), ...continuation, role: trigger.role, ...(trigger.replySessionId ? { replySessionId: trigger.replySessionId } : {}), ...(trigger.exchangeId ? { exchangeId: trigger.exchangeId } : {}), ...(trigger.senderRoomId ? { fromRoomId: trigger.senderRoomId } : {}), ...(trigger.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}), resumed: true, text })
       return
     }
     // A turn that went on with work another Bot asked for still owes that Bot its answer.
-    await rt.deliver({ toId: bot.id, ...(rt.branchOwners?.has(sessionId) || taskId ? { sessionId } : {}), ...(taskId ? { taskId } : {}), ...continuation, role: 'resume', resumed: true, text, ...(trigger?.work ? { work: trigger.work } : {}), ...(trigger?.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}) })
+    await rt.deliver({ toId: bot.id, ...(taskId ? { sessionId, taskId } : {}), ...continuation, role: 'resume', resumed: true, text, ...(trigger?.work ? { work: trigger.work } : {}), ...(trigger?.failureResumes !== undefined ? { failureResumes: trigger.failureResumes } : {}) })
   }
 
   // A hard stop keeps the inbox, which the Session runs once it wakes; only what DSH
@@ -362,11 +355,7 @@ export function install(rt) {
       if (rt.isBotSession(sessionId)) return sessionId
       return args.roomId === undefined ? rt.chatOf(args.toId) : rt.roomOf(args.roomId)?.sessions?.[args.toId]
     }
-    const routable = args => {
-      const branch = rt.branchOf?.(args.sessionId) ?? rt.branchOf?.(args.replySessionId) ?? rt.branchForWork?.(args.replyTo ?? args.exchangeId)
-      return !branch || branch.state === 'open'
-    }
-    const fresh = list.filter(item => routable(item.args) && Date.now() - item.at < QUEUED_KEPT_MS && rt.botOf(item.args?.toId) !== undefined
+    const fresh = list.filter(item => Date.now() - item.at < QUEUED_KEPT_MS && rt.botOf(item.args?.toId) !== undefined
       && current(item.args) !== undefined && taken?.has(deliveryId(item.args)) !== true)
     if (fresh.length === 0) return
     const target = current(fresh[0].args)
@@ -374,8 +363,6 @@ export function install(rt) {
     const waiting = new Set([...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])].map(message => deliveryId(message.source ?? {})))
     for (const { args } of fresh) {
       if (waiting.has(deliveryId(args)) || taken?.has(deliveryId(args)) === true) continue
-      if (!args.taskId && (rt.branchOf?.(current(args)) || rt.branchOf?.(args.replySessionId))
-        && await rt.branchDelivered(current(args), args.exchangeId, undefined, args.failureResumes)) continue
       await rt.deliver({ ...args, sessionId: current(args), steer: false, resent: true })
     }
   }
@@ -448,8 +435,7 @@ export function install(rt) {
     // The answer went up in another run: the work closes with what it said, and
     // nothing is sent twice.
     const sent = await logOf(replyTarget(rt, asker))
-    const branch = rt.branchOf?.(sessionId) || rt.branchForWork?.(workId) || rt.branchOf?.(asker.replySessionId)
-    if (sent !== undefined && answeredIn(sent, workId, !!branch)) {
+    if (sent !== undefined && answeredIn(sent, workId)) {
       rt.closeWork?.(workId, name, rt.answerText(workId, said, name))
       return
     }
@@ -490,45 +476,10 @@ export function install(rt) {
     if (stopped || rt.readOnly() !== undefined) return
     await rt.recoverTasks()
     if (stopped) return
-    for (const bot of Object.values(rt.state?.bots ?? {})) {
-      for (const branch of Object.values(bot.workBranches ?? {})) {
-        try {
-          if (rt.creatingBranches.has(branch.id)) continue
-          if (branch.state === 'closed') {
-            if (branch.pendingDelivery || branch.conclusion && !branch.summaryDelivered) rt.warn('ds-bot: closed legacy branch %s has a pending delivery; inspect it manually', branch.id)
-            continue
-          }
-          if (branch.state === 'creating') {
-            branch.state = 'failed'
-            await rt.save({ required: true })
-          }
-          if (branch.state === 'open') {
-            const readable = await logOf(branch.sessionId)
-            if (readable === undefined) {
-              branch.state = 'failed'
-              branch.closedAt = Date.now()
-              branch.summaryId = `${branch.id}:closed`
-              branch.conclusion = { status: 'blocked', text: `[Work branch closed] ${branch.title}\nBranch: ${branch.id}\nStatus: blocked\nConclusion: The branch Session cannot be read. Inspect it before retrying the task.\nLink: none` }
-              branch.summaryDelivered = false
-              await rt.save({ required: true })
-            }
-          }
-          if (branch.pendingDelivery) {
-            await rt.resumeBranchTask(branch)
-          }
-          if (branch.conclusion && !branch.summaryDelivered) await rt.sendBranchSummary(bot, branch)
-        } catch (error) { rt.warn('ds-bot: recovering branch %s failed: %s', branch.id, error) }
-      }
-    }
     for (const [workId, work] of Object.entries(rt.state?.works ?? {})) {
-      if (!work.pendingAnswer) continue
-      const branch = rt.branchForWork?.(workId) ?? rt.branchOf?.(work.pendingAnswer.args?.sessionId)
-      if (!work.taskId && branch?.state === 'closed') {
-        rt.warn('ds-bot: closed legacy reply %s requires inspection', workId)
-        continue
-      }
+      if (!work.pendingAnswer?.args?.taskId) continue
       try {
-        await rt.resumeBranchAnswer(workId)
+        await rt.resumeTaskAnswer(workId)
       } catch (error) { rt.warn('ds-bot: recovering reply %s failed: %s', workId, error) }
     }
     const { turns: noted, queued: dropped } = interrupted
@@ -583,16 +534,13 @@ export function install(rt) {
       for (const [exchangeId, record] of Object.entries(pendingResumes)) armResume(exchangeId, record)
     }).catch(error => rt.warn('ds-bot: loading pending failure resumes failed: %s', error)))
     let timer
-    const hasBranches = bots => Object.values(bots ?? {}).some(bot => Object.keys(bot.workBranches ?? {}).length > 0)
     const hasTasks = saved => Object.keys(saved?.tasks ?? {}).length > 0
     let pending = Object.keys(interrupted.turns).length > 0 || Object.keys(interrupted.queued).length > 0
-      || hasBranches(rt.state?.bots) || hasTasks(rt.state)
-    // Preserve the baseline timer and lazy load; disabled pairs can still have
-    // persisted branches whose replies or conclusions need recovery.
+      || hasTasks(rt.state)
     if (!pending && rt.statePath) {
       try {
         const saved = JSON.parse(readFileSync(rt.statePath, 'utf8'))
-        pending = hasBranches(saved.bots) || hasTasks(saved)
+        pending = hasTasks(saved)
       } catch {}
     }
     if (pending) {

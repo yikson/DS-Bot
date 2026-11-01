@@ -276,7 +276,7 @@ for (const shared of [false, true]) {
     await f.send(cSession, 'D', { request_id: 'same' })
     await f.send(cSession, 'D', { message: 'another message' })
     assert.equal(f.fresh.length, n)
-    for (const extra of [{ task: 'new' }, { task: 'missing' }, { work: 'new' }, { reply_to: 'user' }]) {
+    for (const extra of [{ task: 'new' }, { task: 'missing' }, { reply_to: 'user' }]) {
       await assert.rejects(f.send(cSession, 'D', { ...extra, request_id: 'refused' }), /inherited task/)
     }
     assert.equal(f.tasks().length, 1)
@@ -334,26 +334,6 @@ test('task selector wins over work and refuses unknown/terminal/nonmember before
   await assert.rejects(f.send('a', 'B', { task: id, request_id: 'refused' }), /not open/)
   assert.equal(Object.keys(f.rt.state.requests).length, 0)
 })
-
-for (const gate of [false, true]) {
-  test(`legacy precedence and alias routing with gate=${gate}`, async t => {
-    const f = await setup(t, { taskSessionsEnabled: gate, taskSessions: [], workBranches: [['A', 'B']] })
-    await f.send('a', 'B', { work: 'new' })
-    const legacy = Object.values(f.rt.botOf('a').workBranches)[0]
-    assert.equal(f.tasks().length, 0)
-    await f.send('a', 'B', { work: legacy.id })
-    f.handling('b', f.incoming('b'))
-    await f.send('b', 'A')
-    assert.equal(f.forks.length, 1)
-    await assert.rejects(f.send('b', 'A', { task: 'new', request_id: 'escape' }), /inherited legacy/)
-    await f.send('a', 'B')
-    assert.equal(f.tasks().length, Number(gate))
-    assert.equal(f.agentOf('b').calls.length, gate ? 2 : 3)
-    f.rt.config.workBranches = []
-    await f.send('a', 'B', { work: legacy.id })
-    assert.equal(f.forks.length, 1 + Number(gate))
-  })
-}
 
 test('reply_to user and group calls never open root tasks; explicit task is refused', async t => {
   const f = await setup(t)

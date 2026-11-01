@@ -320,7 +320,6 @@ export function install(rt) {
     await rt.load()
     check()
     const id = args.task ?? rt.taskForSession(sessionId)?.id
-    if (!id && rt.branchOf(sessionId)) return rt.closeBranch(sessionId, args)
     const selected = taskOf(id)
     if (selected.sessions[selected.requester] !== sessionId || rt.selfOf(sessionId) !== selected.requester) {
       throw new Error('Only the root requester task Session can close this task')

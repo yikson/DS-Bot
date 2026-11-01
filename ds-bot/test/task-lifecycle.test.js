@@ -984,11 +984,3 @@ test('the complete conclusion includes header, evidence and link in its Unicode 
   await f.close({ ...closeArgs, conclusion: 'Accepted \u{1f680}', link: 'https://example.test/evidence' })
   assert.ok(Array.from(f.agentOf('a').calls[0][1].content[0].text).length <= 1000)
 })
-test('close_task aliases explicit legacy closure without creating a v2 task', async t => {
-  const f = await setup(t, { taskSessionsEnabled: false, taskSessions: [], workBranches: [['A', 'B']] })
-  await f.send('a', 'B', { work: 'new' })
-  const branch = Object.values(f.rt.botOf('a').workBranches)[0]
-  await f.tool('close_task', { status: 'blocked', conclusion: 'legacy conclusion' }, branch.sessionId)
-  assert.equal(f.tasks().length, 0)
-  assert.equal(branch.state, 'closed')
-})

@@ -134,7 +134,6 @@ export function install(rt) {
         '',
         rooms.length === 0 ? 'Group chats: none you can see.' : 'Group chats:',
         ...rooms.map(room => roomLine(room, self)),
-        ...(rt.workBranchChoices?.(self) ?? []),
       ].join('\n')
     },
   }))
@@ -165,7 +164,7 @@ export function install(rt) {
         || [...rt.taskById.values()].some(task => Object.hasOwn(task.participants, self)))
     const dispose = taskToolAgents.get(agent)
     const task = rt.taskForSession(agent.session?.id)
-    const closer = rt.botOf(self) !== undefined && (task?.requester === self && task !== undefined || rt.branchOf(agent.session?.id))
+    const closer = rt.botOf(self) !== undefined && task?.requester === self && task !== undefined
     const mode = `${eligible ? 1 : 0}:${closer ? 1 : 0}`
     if (dispose?.mode === mode) return
     dispose?.()
@@ -180,19 +179,15 @@ export function install(rt) {
     taskToolAgents.clear()
   }, 'ds-bot: task tools')
 
-  // Sessions a Bot is running in right now, including its open work branches.
+  // Sessions a Bot is running in right now, including its task Sessions.
   const activeSessions = (botId) => {
-    const branches = Object.values(rt.botOf(botId)?.workBranches ?? {})
-      .filter(branch => branch.state === 'open').map(branch => branch.sessionId).filter(Boolean)
     const tasks = [...rt.taskOwners].filter(([, owner]) => owner.botId === botId).map(([sessionId]) => sessionId)
-    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId), ...branches, ...tasks])]
+    const running = [...new Set([rt.chatOf(botId), ...rt.groupSessionsOf(botId), ...tasks])]
       .filter(sessionId => rt.live.get(sessionId)?.turn !== undefined)
     return { running, idle: running.length === 0 }
   }
   const whereOf = (sessionId) => {
     const room = rt.roomOf(rt.groupOwners.get(sessionId)?.roomId)
-    const branch = rt.branchOf?.(sessionId)
-    if (branch) return `work branch "${branch.title}"`
     return room ? `group "${room.name}"` : 'its own chat'
   }
   // A Bot request still in the inbox: no step or turn has taken it out yet.
@@ -266,10 +261,6 @@ export function install(rt) {
         type: 'string',
         description: `Your own name for this request, up to ${NAME_MAX} characters, so that a repeat of it is not sent twice. Send the same request_id with the same message when you repeat a call: the receipt of the first call comes back and nothing is sent again. A request_id names one request: with other content it is refused.`,
       },
-      work: {
-        type: 'string',
-        description: 'For a configured work-branch pair, use an open branch id from list_bots or the work-branch prompt, or "new" for a separate task. Outside that branch\'s turn, one open branch is reused by default; multiple open branches require a choice. Ignored for unconfigured pairs.',
-      },
     },
     output,
     async execute(args, exec) {
@@ -284,25 +275,22 @@ export function install(rt) {
       if (name.length > NAME_MAX) return `The request_id is ${name.length} characters long; a request name is at most ${NAME_MAX}.`
       const text = absoluteLinks(String(args.message), rt.sessionFolder?.(exec.agent?.session ?? exec.agent))
       const room = rt.roomOf(rt.groupOwners.get(exec.agent?.id)?.roomId)
-      const branchContext = rt.branchOf?.(exec.agent?.id) ?? rt.relatedBranch?.(exec.agent?.id, target.id)
       const choice = rt.selectTaskRoute(sender, target, exec.agent?.id, args, room)
       if (args.workdir !== undefined && (choice.kind !== 'new' || typeof args.workdir !== 'string' || !args.workdir.trim())) {
         refuse('workdir is a full folder path used only when opening a new task')
       }
       const workdir = args.workdir === undefined ? undefined
         : await rt.cleanWorkDir(args.workdir) ?? await rt.real(rt.teamFolder())
-      const workChoice = choice.kind === 'legacy' ? choice.work : undefined
       // The request the caller named: it is admitted once, and a repeat of it is not sent again.
       const request = name === '' ? undefined : rt.requestIdentity({
         caller: sender.id,
-        context: choice.id ? `task:${choice.id}` : room === undefined ? (branchContext ? `branch:${branchContext.sessionId}` : 'chat') : `room:${room.id}`,
+        context: choice.id ? `task:${choice.id}` : room === undefined ? 'chat' : `room:${room.id}`,
         name,
         payload: {
           to: target.id,
           message: String(args.message ?? '').replace(/\r\n?/g, '\n').trim(),
           reply_to: args.reply_to === 'user' ? 'user' : 'me',
           when: args.when === 'queue' ? 'queue' : 'now',
-          ...(workChoice === undefined ? {} : { work: workChoice }),
           ...(choice.id || choice.kind === 'new' ? { task: choice.id ?? 'new' } : {}),
           ...(workdir === undefined ? {} : { workdir }),
         },
@@ -340,9 +328,7 @@ export function install(rt) {
       const send = async () => {
         const toUser = args.reply_to === 'user'
         const work = toUser ? undefined : works[0]
-        const route = choice.kind === 'legacy'
-          ? await rt.routeBranch(sender, target, exec.agent?.id, text, toUser, choice.inherited ? undefined : workChoice)
-          : await rt.routeTask(choice, sender, target, exec.agent?.id, text, { ...args, ...(workdir === undefined ? {} : { workdir }) })
+        const route = await rt.routeTask(choice, sender, target, exec.agent?.id, text, { ...args, ...(workdir === undefined ? {} : { workdir }) })
         const taskId = route.task?.id
         if (request && taskId) rt.bindRequestTask(request, taskId)
         const chat = route.sessionId ?? rt.chatOf(target.id)
@@ -370,22 +356,17 @@ export function install(rt) {
           rt.taskLifecycleCheck()
           if (rt.taskOf(taskId)?.state !== 'open') throw new Error('This task is not open')
         }
-        if (route.replySessionId && route.branch && !route.branch.workIds.includes(exchangeId)) {
-          route.branch.workIds.push(exchangeId)
-          rt.indexSessions()
-        }
         if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work, taskId })
-        if ((route.branch || route.task) && state.works[exchangeId]) {
+        if (route.task && state.works[exchangeId]) {
           Object.assign(state.works[exchangeId], { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) })
         }
         const receipt = {}
         try {
-          const delivery = { fromId: sender.id, toId: target.id, text: long.text, files: long.files, ...(long.length === undefined ? {} : { length: long.length }), role: 'request', steer, exchangeId, ...(taskId ? { taskId } : {}), ...((route.branch || route.task) ? { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) } : {}), ...(merge ? { merge } : {}), ...(toUser ? { audience: 'user' } : {}) }
+          const delivery = { fromId: sender.id, toId: target.id, text: long.text, files: long.files, ...(long.length === undefined ? {} : { length: long.length }), role: 'request', steer, exchangeId, ...(taskId ? { taskId } : {}), ...(route.task ? { sessionId: chat, ...(route.replySessionId ? { replySessionId: route.replySessionId } : {}) } : {}), ...(merge ? { merge } : {}), ...(toUser ? { audience: 'user' } : {}) }
           if (route.task) await rt.sendTask(taskId, delivery, receipt)
-          else if (route.branch) await rt.sendBranchTask(route.branch, delivery, receipt)
           else await rt.deliver(delivery, receipt)
         } catch (error) {
-          if (!route.branch && !route.task) rt.dropWork(exchangeId)
+          if (!route.task) rt.dropWork(exchangeId)
           throw error
         }
         const sent = toUser
@@ -402,7 +383,7 @@ export function install(rt) {
           asker ? `When you have handed on everything, end your turn: each reply brings you back to this work, and your answer goes to ${asker} once all of it is back.` : '',
         ].filter(Boolean)
         if (receipt.skipped) refuse('Not delivered: this host stopped; the task send remains pending.')
-        const out = [sent, ...notes, ...(route.task ? [`Task: ${taskId}. Caller Session: ${route.replySessionId}.`] : []), ...(route.branch ? [`Work branch: ${route.branch.id} (${route.branch.sessionId}). Follow up there; its conclusion returns to the main chat.`] : [])].join(' ')
+        const out = [sent, ...notes, ...(route.task ? [`Task: ${taskId}. Caller Session: ${route.replySessionId}.`] : [])].join(' ')
         // Messages reach a Bot's own chat only; work in a group goes on without them.
         const groups = activeSessions(target.id).running.filter(sessionId => sessionId !== chat)
         if (groups.length === 0) return out
@@ -417,22 +398,18 @@ export function install(rt) {
     ...messageBot,
     parameters: {
       ...messageBot.parameters,
-      work: {
-        type: 'string',
-        description: 'Explicit legacy work-branch id, or "new" for a configured legacy pair. Root calls never implicitly reuse a legacy branch. Ignored when task is supplied.',
-      },
       task: {
         type: 'string',
-        description: 'An open task id from list_tasks, or "new" from an eligible root trunk. Inside a task, omit this or use its current id; new or different tasks are refused. Takes precedence over work.',
+        description: 'An open task id from list_tasks, or "new" from an eligible root trunk. Inside a task, omit this or use its current id; new or different tasks are refused.',
       },
       workdir: { ...WORK_DIR_PARAM, description: 'Initial full folder path for every new task-owned participant Session. Only when opening a new task; later Session cd does not synchronize it.' },
     },
   })
   const closeTaskTool = defineTool({
     name: 'close_task',
-    description: 'Root requester task Session only. Close the task and deliver one concise conclusion to its requester main chat. Done requires evidence and no other open work. In a legacy work branch this is an alias for close_work_branch.',
+    description: 'Root requester task Session only. Close the task and deliver one concise conclusion to its requester main chat. Done requires evidence and no other open work.',
     parameters: {
-      task: { type: 'string', description: 'Current task id; omit only in this task Session or a legacy work branch.' },
+      task: { type: 'string', description: 'Current task id; omit only in this task Session.' },
       status: { type: 'string', required: true, enum: ['done', 'blocked', 'cancelled', 'failed'] },
       conclusion: { type: 'string', required: true, description: 'Concise conclusion; the complete rendered conclusion is at most 1000 Unicode code points.' },
       evidence: { type: 'string', description: 'PR, commit, test or path evidence; required for done.' },
@@ -821,7 +798,7 @@ export function install(rt) {
       await rt.load()
       const id = exec.agent?.id
       if (rt.groupOwners.has(id)) return 'Question cards only work in your own chat. In a group, ask in your message instead.'
-      if (!rt.chatOwners.has(id) && !rt.branchOwners?.has(id)) return `Only Bots on the team can use ask_user. Use ${BLOCKING_QUESTION_TOOL} if it is available in this session, or ask the user in your reply.`
+      if (!rt.chatOwners.has(id)) return `Only Bots on the team can use ask_user. Use ${BLOCKING_QUESTION_TOOL} if it is available in this session, or ask the user in your reply.`
       const options = (Array.isArray(args.options) ? args.options : [])
         .map(option => (typeof option === 'string' ? { label: option } : option ?? {}))
         .map(option => ({
@@ -869,7 +846,7 @@ export function install(rt) {
       await rt.load()
       const id = exec.agent?.id
       if (rt.groupOwners.has(id)) return 'View cards only work in your own chat. In a group, ask in your message instead.'
-      if (!rt.chatOwners.has(id) && !rt.branchOwners?.has(id)) return `Only Bots on the team can use show_view. Use ${BLOCKING_QUESTION_TOOL} if it is available in this session, or ask the user in your reply.`
+      if (!rt.chatOwners.has(id)) return `Only Bots on the team can use show_view. Use ${BLOCKING_QUESTION_TOOL} if it is available in this session, or ask the user in your reply.`
       const checked = checkShownView(args.title, args.view)
       if (checked.error !== undefined) return checked.error
       const title = checked.title
@@ -907,7 +884,6 @@ export function install(rt) {
       // restrict() throws on a name this profile does not serve.
       const served = new Set(ctx.tools.schemas(agent).map(schema => schema.name))
       const deny = HIDDEN_TOOLS.filter(name => served.has(name))
-      if (!rt.branchOwners?.has(agent.session?.id) && served.has('close_work_branch')) deny.push('close_work_branch')
       if (deny.length === 0) return
       agent.ctx.tools.restrict({ deny })
       hiddenTools.add(agent)
@@ -1093,30 +1069,15 @@ export function install(rt) {
     }))
   }
 
-  ctx.tools.register(defineTool({
-    name: 'close_work_branch',
-    description: 'Close this work branch and deliver one concise conclusion to its main chat.',
-    parameters: {
-      status: { type: 'string', required: true, enum: ['done', 'blocked', 'cancelled'] },
-      conclusion: { type: 'string', required: true, description: 'Concise conclusion; the complete rendered card must fit 1000 characters.' },
-      link: { type: 'string', description: 'One URL, absolute file path or Session link.' },
-    },
-    output,
-    async execute(args, exec) {
-      await rt.load()
-      return rt.closeBranch(exec.agent?.id, args)
-    },
-  }))
-
   Object.assign(rt, { pickRoom, hideBotUnusedTools, registerTaskTools })
   safe.effect(() => {
     rt.taskToolsReady = rt.load().then(async () => {
       const enabled = rt.config.taskSessionsEnabled === true ? rt.taskCapabilities() : new Set()
-      const ids = new Set([...rt.chatOwners.keys(), ...rt.groupOwners.keys(), ...rt.branchOwners.keys(), ...rt.taskOwners.keys()])
+      const ids = new Set([...rt.chatOwners.keys(), ...rt.groupOwners.keys(), ...rt.taskOwners.keys()])
       for (const id of ids) {
         if (safe.stopped) return
         const botId = rt.selfOf(id)
-        if (!enabled.has(botId) && ![...rt.taskById.values()].some(task => Object.hasOwn(task.participants, botId)) && rt.branchOf(id)?.state !== 'open') continue
+        if (!enabled.has(botId) && ![...rt.taskById.values()].some(task => Object.hasOwn(task.participants, botId))) continue
         await rt.resolveAgent(id).catch(error => { if (!safe.stopped) rt.warn('ds-bot: restoring tools for %s failed: %s', id, error) })
       }
     })

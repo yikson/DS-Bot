@@ -1107,7 +1107,7 @@ export function install(rt) {
       await forward(past, payload.messages).catch(error => rt.warn('ds-bot: input for %s was not handed on: %s', agent.id, error))
       return { kind: 'reject' }
     }
-    if (!rt.isBotSession(agent.id) || rt.branchOwners?.has(agent.id)) return next()
+    if (!rt.isBotSession(agent.id)) return next()
     adoptCompaction(agent)
     const job = switches.get(agent.id)
     if (job !== undefined) {
@@ -1173,7 +1173,7 @@ export function install(rt) {
     if (current === undefined || await rt.isFolder(current)) return next()
     await rt.load()
     const team = await rt.keepTeamFolder()
-    if (current === team || !rt.isBotSession(agent.id) || rt.branchOwners?.has(agent.id) || rt.taskForSession?.(agent.id)) return next()
+    if (current === team || !rt.isBotSession(agent.id) || rt.taskForSession?.(agent.id)) return next()
     const place = placeOf(agent.id)
     const wanted = rt.workDirOf(place)
     const target = wanted !== undefined && await rt.isFolder(wanted) ? wanted : team
@@ -1204,7 +1204,7 @@ export function install(rt) {
     if (decided !== undefined || payload.signal?.aborted) return decided
     await rt.load()
     const { agent } = payload
-    if (!rt.isBotSession(agent.id) || rt.branchOwners?.has(agent.id) || rt.taskForSession?.(agent.id) || switches.has(agent.id) || readOnly() || rescued.get(agent.id) === 'bare') return decided
+    if (!rt.isBotSession(agent.id) || rt.taskForSession?.(agent.id) || switches.has(agent.id) || readOnly() || rescued.get(agent.id) === 'bare') return decided
     // A provider may turn down one request for reasons of its own; a history that
     // breaks every request fails the next turn as well.
     if (failure.code === 'INVALID_REQUEST' && !STUCK_CODES.includes(lastTurnEnd(agent)?.data?.reason?.error?.code)) return decided
@@ -1219,7 +1219,7 @@ export function install(rt) {
     if (payload.failure?.code !== OVERFLOW || payload.signal?.aborted) return next()
     await rt.load()
     const { agent } = payload
-    if (!rt.isBotSession(agent.id) || rt.branchOwners?.has(agent.id) || rt.taskForSession?.(agent.id) || switches.has(agent.id) || readOnly()) return next()
+    if (!rt.isBotSession(agent.id) || rt.taskForSession?.(agent.id) || switches.has(agent.id) || readOnly()) return next()
     const entry = rt.liveOf(agent.id)
     entry.switched = true
     startSwitch(agent, { resume: true, info: entry.info, joined: [...(entry.joined ?? [])], overflow: true })
@@ -1272,7 +1272,7 @@ export function install(rt) {
   }, 'ds-bot: hand on input kept in earlier parts')
 
   safe.on('agent/status', ({ agent, status }) => {
-    if (status === 'idle' && rt.isBotSession(agent.id) && !rt.branchOwners?.has(agent.id) && !rt.taskForSession?.(agent.id)) {
+    if (status === 'idle' && rt.isBotSession(agent.id) && !rt.taskForSession?.(agent.id)) {
       releaseRescued(agent)
       safe.run('parts background job', () => checkContext(agent).catch(error => rt.warn('ds-bot: context check for %s failed: %s', agent.id, error)))
     }

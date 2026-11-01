@@ -50,7 +50,7 @@ export function install(rt) {
     await applyPermission({ ...bot, permission: wanted }, rt.chatOf(bot.id))
     for (const sessionId of rt.taskSessionsOf(bot.id)) await applyPermission({ ...bot, permission: wanted }, sessionId)
     bot.permission = wanted
-    for (const sessionId of [...rt.groupSessionsOf(bot.id), ...Object.values(bot.workBranches ?? {}).map(branch => branch.sessionId).filter(Boolean)]) {
+    for (const sessionId of rt.groupSessionsOf(bot.id)) {
       if (roomOfSession(sessionId)?.permission) continue
       await applyPermission(bot, sessionId)
         .catch(error => rt.warn('ds-bot: permission for %s in a group not applied: %s', bot.name, error))

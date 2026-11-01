@@ -96,10 +96,7 @@ export function install(rt) {
         status: task.state !== 'open' ? task.state : Object.values(task.sessions).some(id => rt.live.get(id)?.turn !== undefined && rt.taskOfTurn(id) === task.id)
           ? 'Working' : Object.values(state.works ?? {}).some(work => work.taskId === task.id) ? 'Waiting' : 'Needs close',
       }])) } : {}),
-      branches: Object.fromEntries(Object.values(state.bots).flatMap(bot => Object.values(bot.workBranches ?? {}).filter(branch => branch.sessionId).map(branch => [branch.sessionId,
-        Object.values(state.works ?? {}).some(work => work.pendingAnswer?.failed
-          && (work.sessionId === branch.sessionId || work.replySessionId === branch.sessionId)) ? 'Delivery failed; retry pending'
-          : rt.live.get(branch.sessionId)?.turn !== undefined ? 'Working' : branch.workIds.some(id => state.works?.[id]) ? 'Waiting' : 'Needs close']))) },
+    },
     memoryNews: rt.memoryNews(),
     memoryReviews: rt.memoryReviews(),
     connectors: rt.connectorsView(),

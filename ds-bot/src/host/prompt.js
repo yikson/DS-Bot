@@ -50,7 +50,6 @@ export function install(rt) {
     if (bot !== undefined) {
       const taskId = rt.taskContext?.(id)
       const task = taskId && rt.taskOf(taskId)
-      const choices = taskId ? [] : rt.workBranchChoices?.(self) ?? []
       return [
         '# Your identity',
         `You are ${bot.name}, a Bot on the user's team in DS Bot.${bot.role ? ` Your role: ${bot.role}.` : ''}`,
@@ -60,18 +59,8 @@ export function install(rt) {
         ...(task ? [
           '\n## Task Session',
           taskBrief(task),
-          'Every message_bot call stays in this task. Omit task or use this id; do not start another task or use a legacy work selector. Replies return to the actual calling Session.',
+          'Every message_bot call stays in this task. Omit task or use this id; do not start another task. Replies return to the actual calling Session.',
           ...(task.requester === self ? ['When the task is settled, call close_task with a concise conclusion. Done requires evidence and no other open work; only this requester Session can close the task.'] : []),
-        ] : []),
-        ...(rt.branchOf?.(id) ? [
-          '\n## Work branch',
-          `Branch: ${rt.branchOwners.get(id).branchId}\nTask: ${rt.branchOf(id).brief}`,
-          'Work and follow up in this branch. Read read_own_chat for newer main-chat decisions before deciding. When finished, call close_work_branch with a concise conclusion; it sends one conclusion to the main chat.',
-        ] : []),
-        ...(choices.length > 0 ? [
-          '\n## Open work branches',
-          ...choices,
-          'Use message_bot work with a branch id for a related legacy follow-up, or "new" for an explicit legacy operation. Pull list_bots for current choices; use read_own_chat to review your task context.',
         ] : []),
       ].join('\n')
     }

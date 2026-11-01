@@ -10,7 +10,6 @@ import {
 import { absoluteLinks } from './links.js'
 import { textOf } from './text.js'
 import { reminderText } from './schedules.js'
-import { replyTarget } from './branches.js'
 
 const CONTEXT_ONLY_KINDS = new Set([
   'agent-instructions', 'runtime-context', 'skill-catalog', 'time-context',
@@ -43,6 +42,11 @@ export function turnFailure(error) {
   }
 }
 
+// Where an answer to `source` goes: the asker's group Session, the Session it asked
+// from, or its own chat.
+export const replyTarget = (rt, source) => rt.roomOf(source.senderRoomId)?.sessions?.[source.senderSessionId]
+  ?? source.replySessionId ?? rt.chatOf?.(source.senderSessionId)
+
 export const failureLine = failure => `${failure.code}${failure.status ? ` ${failure.status}` : ''}${failure.message ? `: ${failure.message.slice(0, 200)}` : ''}`
 
 // The reply a sender waits for, sent the way a finished turn sends it: the work it was
@@ -51,9 +55,6 @@ export const failureLine = failure => `${failure.code}${failure.status ? ` ${fai
 export function answerSender(rt, id, source, text, long) {
   if (source.taskId || rt.state.works?.[source.exchangeId]?.taskId) {
     return rt.sendTaskAnswer(id, source, text, long).catch(error => rt.warn('ds-bot: task reply delivery failed: %s', error))
-  }
-  if (rt.branchOf?.(id) || rt.branchForWork?.(source.exchangeId) || rt.branchOf?.(source.replySessionId)) {
-    return rt.sendAnswer(id, source, text, long).catch(error => rt.warn('ds-bot: reply delivery failed: %s', error))
   }
   const back = replyTarget(rt, source)
   const work = rt.closeWork?.(source.exchangeId, rt.botOf(rt.selfOf(id))?.name ?? 'The other Bot', text)

@@ -31,10 +31,6 @@
       "request_id": {
         "type": "string",
         "description": "Your own name for this request, up to 200 characters, so that a repeat of it is not sent twice. Send the same request_id with the same message when you repeat a call: the receipt of the first call comes back and nothing is sent again. A request_id names one request: with other content it is refused."
-      },
-      "work": {
-        "type": "string",
-        "description": "For a configured work-branch pair, use an open branch id from list_bots or the work-branch prompt, or \"new\" for a separate task. Outside that branch's turn, one open branch is reused by default; multiple open branches require a choice. Ignored for unconfigured pairs."
       }
     },
     "required": [

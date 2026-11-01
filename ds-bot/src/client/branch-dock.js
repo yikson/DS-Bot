@@ -12,11 +12,10 @@ export function BranchDock({ sessionId, useRoster, useWork, actions }) {
   if (task) return h(TaskHeader, { task, sessionId, roster, work, actions })
   const bot = roster.byId[sessionId]
   if (!bot || sessionId !== (bot.sessionId ?? bot.id)) return null
-  const branches = Object.values(bot.workBranches ?? {}).filter(branch => branch.state !== 'closed')
   const tasks = (roster.tasks ?? []).filter(task => task.participants[bot.id])
   const closed = tasks.filter(task => task.state !== 'open')
     .sort((a, b) => (b.closedAt ?? b.updatedAt ?? b.openedAt) - (a.closedAt ?? a.updatedAt ?? a.openedAt))
-  if (!branches.length && !tasks.length) return null
+  if (!tasks.length) return null
   const taskButton = task => {
     const participant = task.participants[bot.id]
     const endpoint = participant.kind === 'trunk' ? bot.sessionId ?? bot.id : task.sessions[bot.id]
@@ -32,16 +31,7 @@ export function BranchDock({ sessionId, useRoster, useWork, actions }) {
       h(Elapsed, { at: task.openedAt })))
   }
   return h('div', { className: 'bt-branch-dock', 'aria-label': t('Tasks') },
-    ...tasks.filter(task => task.state === 'open').map(taskButton), ...branches.map(branch => {
-    const target = roster.byId[branch.targetBotId]
-    const status = branch.state === 'open' ? work.branches?.[branch.sessionId] ?? 'Needs close' : branch.state === 'failed' ? 'Failed' : 'Creating'
-    return h('button', { key: branch.id, type: 'button', className: 'bt-mw-pill', disabled: !branch.sessionId,
-      onClick: () => actions.openBranch(branch.sessionId), title: branch.title },
-    h('span', { className: 'bt-mw-pill-in' },
-      target ? h(BotMark, { bot: target, size: 24 }) : null,
-      h('span', { className: 'bt-branch-label' }, `${target?.name ?? ''} · ${branch.title} · ${t(status)}`),
-      h(Elapsed, { at: branch.openedAt })))
-  }), closed.length ? h('details', { key: bot.id, className: 'bt-closed-tasks' },
+    ...tasks.filter(task => task.state === 'open').map(taskButton), closed.length ? h('details', { key: bot.id, className: 'bt-closed-tasks' },
     h('summary', null, `${t('Closed tasks')} (${closed.length})`),
     h('div', { className: 'bt-closed-task-list' }, ...closed.slice(0, closedLimit).map(taskButton),
       closed.length > closedLimit ? h('button', { type: 'button', className: 'bt-mini',

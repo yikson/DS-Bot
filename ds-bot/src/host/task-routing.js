@@ -48,23 +48,16 @@ export function install(rt) {
   // Pure admission runs before receipts, Session creation, or group dispatch.
   function selectTaskRoute(sender, target, sessionId, args, room) {
     const inherited = taskContext(sessionId)
-    const info = rt.live.get(sessionId)?.info
-    const legacy = rt.branchOf(sessionId) ?? rt.branchForWork(rt.workOf(info))
-      ?? rt.branchOf(info?.replySessionId)
-    const selected = args.task !== undefined ? 'task' : args.work !== undefined ? 'work' : undefined
+    const selected = args.task !== undefined ? 'task' : undefined
     if (inherited) {
       const task = openTask(inherited)
-      if (selected === 'work' || (selected === 'task' && args.task !== inherited)
+      if ((selected === 'task' && args.task !== inherited)
         || args.reply_to === 'user' || room) throw new Error('Cannot leave the inherited task')
       if (!Object.hasOwn(task.participants, sender.id)) throw new Error('Caller is not a task participant')
       if (task.participants[sender.id].kind !== 'trunk' && task.sessions[sender.id] !== sessionId) {
         throw new Error('Caller is not in its task-owned Session')
       }
       return { kind: 'task', id: inherited, inherited: true }
-    }
-    if (legacy) {
-      if (selected === 'task' || (selected === 'work' && args.work !== legacy.id)) throw new Error('Cannot leave the inherited legacy work branch')
-      return { kind: 'legacy', work: legacy.id, inherited: true }
     }
     if (selected === 'task') {
       if (room || args.reply_to === 'user') throw new Error('Task routing requires a private Bot request outside a group')
@@ -75,13 +68,24 @@ export function install(rt) {
         }
         return { kind: 'task', id: task.id }
       }
-    } else if (selected === 'work') return { kind: 'legacy', work: args.work }
+    }
     const root = sessionId === rt.chatOf(sender.id) && !room && args.reply_to !== 'user'
     if (root && rt.canStartTask(sender.id, target.id)) return { kind: 'new' }
     if (selected === 'task') throw new Error('New tasks require an eligible root trunk and two task-enabled Bots')
     return { kind: 'trunk' }
   }
 
+  // Includes messages durably queued but not yet consumed by an agent turn.
+  async function delivered(sessionId, exchangeId, failureResumes) {
+    const agent = await rt.resolveAgent(sessionId)
+    const pending = [...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])].map(message => message.source)
+    const seen = await rt.ctx.sessionController.inspect(sessionId, AbortSignal.timeout(HISTORY_TIMEOUT_MS))
+    if (!Array.isArray(seen?.events)) throw new Error('Cannot inspect delivery history')
+    const logged = seen.events.flatMap(event => event.type === 'user/message' ? [event.data?.source]
+      : event.type === 'agent/inbox/spliced' ? (event.data?.inserted ?? []).map(message => message.source) : [])
+    return [...pending, ...logged].some(source => source && source.exchangeId === exchangeId
+      && (failureResumes === undefined || source.failureResumes === failureResumes))
+  }
   const commit = async (id, update) => {
     checkGeneration()
     const result = await rt.commitTask(id, task => {
@@ -329,7 +333,7 @@ export function install(rt) {
       return task
     })
     checkTaskDelivery(args)
-    const seen = inspect && await rt.branchDelivered(args.sessionId, args.exchangeId, undefined, args.failureResumes)
+    const seen = inspect && await delivered(args.sessionId, args.exchangeId, args.failureResumes)
     checkGeneration()
     if (inspect && args.merge && !seen) {
       await commit(id, task => {
