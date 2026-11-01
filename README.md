@@ -41,7 +41,7 @@ If npm is not reachable, in step 2 you can also enter the full path of `ds-bot-0
 
 **Out-of-band updates (personal fork)**
 
-This fork checks for newer releases but never installs or removes its running plugin, and Bot or DSH Agent Sessions cannot change `ds-bot` through `plugin_manager`. Release from a separate terminal: fully quit Desktop, back up `<DSH_HOME>/bot/`, check out the new commit in the linked release checkout, reopen once and verify. Roll back the same way. The steps are in [docs/plans/2026-10-30-release-procedure.md](docs/plans/2026-10-30-release-procedure.md).
+This fork checks for newer releases but never installs or removes its running plugin, and Bot and DSH Agent Sessions cannot change any plugin through `plugin_manager` (they can still list them). Release from a separate terminal: fully quit Desktop, back up `<DSH_HOME>/bot/`, check out the new commit in the linked release checkout, reopen once and verify. Roll back the same way. The steps are in [docs/plans/2026-10-30-release-procedure.md](docs/plans/2026-10-30-release-procedure.md).
 
 **DSH Web (Windows, macOS, Linux)**
 

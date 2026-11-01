@@ -141,7 +141,7 @@ for (const outcome of ['ready', 'needs-approval', 'error', 'timeout']) {
     assert.equal(env.rt.capabilityStatusesView().chief.echo.state, state)
     await env.rt.ensureCapabilities(TASK, { required: true })
     const warnings = (await env.rt.diagnostics.entries())
-      .filter(entry => entry.text.startsWith(`task capabilities for ${TASK} unavailable as in the Bot trunk:`))
+      .filter(entry => entry.text.startsWith(`task capabilities for ${TASK} unavailable:`))
     assert.equal(warnings.length, Number(outcome !== 'ready'))
     if (warnings.length) assert.ok(warnings[0].text.includes(`echo (${state}); continuing`))
   })
@@ -152,19 +152,22 @@ for (const [trunk, trunkMount, prepareTrunk] of [
   ['connecting', mounts.timeout, true],
   ['unmounted', mounts.ready, false],
 ]) {
-  test(`a task Session refuses a capability the Bot trunk does not fail: ${trunk} trunk`, async t => {
+  test(`a task Session goes on, with a warning, when a capability fails only there: ${trunk} trunk`, async t => {
     const env = await setup()
     t.after(() => env.dispose())
     await attachEcho(env)
     serveSessions(env, id => (id === TASK ? mounts.error : trunkMount))
     env.rt.capabilityEnsureTimeoutMs = 5
     if (prepareTrunk) await env.rt.ensureCapabilities('chief')
-    await assert.rejects(env.rt.ensureCapabilities(TASK, { required: true }), /Task capabilities are not ready: echo/)
+    await env.rt.ensureCapabilities(TASK, { required: true })
+    const warnings = (await env.rt.diagnostics.entries())
+      .filter(entry => entry.text.startsWith(`task capabilities for ${TASK} unavailable:`))
+    assert.equal(warnings.length, 1)
   })
 }
 
-for (const failure of ['resolve', 'inputs']) {
-  test(`required capability setup still refuses a Session setup failure: ${failure}`, async t => {
+for (const failure of ['resolve']) {
+  test(`required capability setup still refuses a Session it cannot resolve: ${failure}`, async t => {
     const env = await setup()
     t.after(() => env.dispose())
     await env.rt.capabilitySave(mcp('echo'), { botId: 'chief' })

@@ -169,7 +169,6 @@ export function install(rt) {
   let selecting = Promise.resolve()
   function selectSessionModel(sessionId, { provider, model, reasoningEffort }) {
     const run = selecting.then(async () => {
-      if (rt.taskOwners?.has(sessionId) && safe.stopped) throw new Error('Task model setup stopped')
       const defaults = ctx.get?.('agentDefaultModel')
       const before = defaults?.currentSelection?.()
       const result = await ctx.sessionController.selectModel({
