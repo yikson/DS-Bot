@@ -2,6 +2,11 @@ import { createElement as h, useEffect, useState } from 'react'
 import { BotMark } from './mark.js'
 import { Elapsed } from './cells.js'
 import { t } from './i18n.js'
+import { elapsedLabel } from './text.js'
+
+const taskElapsed = (task, at) => task.state === 'open'
+  ? h(Elapsed, { at })
+  : h('span', null, `· ${elapsedLabel(task.closedAt - task.openedAt)}`)
 
 export function BranchDock({ sessionId, useRoster, useWork, actions }) {
   const roster = useRoster(value => value)
@@ -28,7 +33,7 @@ export function BranchDock({ sessionId, useRoster, useWork, actions }) {
     h('span', { className: 'bt-mw-pill-in' },
       target ? h(BotMark, { bot: target, size: 24 }) : null,
       h('span', { className: 'bt-branch-label' }, `${task.title} · ${t(status)} · ${suffix}${task.lateReplies.count ? ` · ${t('Late results')}: ${task.lateReplies.count}` : ''}`),
-      h(Elapsed, { at: task.openedAt })))
+      taskElapsed(task, task.openedAt)))
   }
   return h('div', { className: 'bt-branch-dock', 'aria-label': t('Tasks') },
     ...tasks.filter(task => task.state === 'open').map(taskButton), closed.length ? h('details', { key: bot.id, className: 'bt-closed-tasks' },
@@ -54,7 +59,7 @@ export function TaskHeader({ task, sessionId, roster, work, actions }) {
           endpoint && endpoint !== sessionId ? h('button', { type: 'button', className: 'bt-mini',
             'aria-label': `${t('Open task')}: ${bot?.name ?? botId}`, onClick: () => actions.openBranch(endpoint) }, label)
             : h('span', null, label),
-          h(Elapsed, { at: since ?? task.updatedAt ?? task.openedAt }))
+          taskElapsed(task, since ?? task.updatedAt ?? task.openedAt))
       })))
 }
 

@@ -106,6 +106,19 @@ test('an empty requester task shows its brief and live peers without prompting a
   assert.ok(JSON.stringify(render({})).includes('B · Idle'))
   assert.equal(peers[2].props.children[0].props['aria-label'], 'Open task: C')
 })
+test('closed tasks show a fixed duration without live timers', () => {
+  const task = { ...record('t1', 'done'), openedAt: 1_000, closedAt: 66_000 }
+  const roster = indexRoster({ bots: ['a', 'b', 'c'].map(id => ({ id, name: id.toUpperCase() })), rooms: [], tasks: [task] })
+  const dock = BranchDock({ sessionId: 'a', useRoster: pick => pick(roster), useWork: pick => pick({}), actions: {} })
+  const dockDuration = descendants(dock).find(node => node.type === 'span' && node.props.children[0] === '· 1m 5s')
+  assert.ok(dockDuration)
+  assert.equal(descendants(dock).filter(node => 'at' in node.props).length, 0)
+
+  const header = TaskHeader({ task, sessionId: 't1-a', roster, work: { turns: {} }, actions: {} })
+  const peers = header.props.children[2].props.children.flat()
+  assert.deepEqual(peers.map(peer => peer.props.children[1].props.children[0]), ['· 1m 5s', '· 1m 5s', '· 1m 5s'])
+  assert.equal(descendants(header).filter(node => 'at' in node.props).length, 0)
+})
 test('creating task endpoints are not opened before setup is ready', () => {
   const task = { ...record('t1'), phase: 'creating' }
   const roster = indexRoster({ bots: [{ id: 'a', name: 'A' }], rooms: [], tasks: [task] })

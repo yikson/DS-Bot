@@ -19226,6 +19226,7 @@ function listedOpener({ list, open, refresh, current }) {
 
 // src/client/branch-dock.js
 var import_react47 = require("react");
+var taskElapsed = (task, at) => task.state === "open" ? (0, import_react47.createElement)(Elapsed, { at }) : (0, import_react47.createElement)("span", null, `· ${elapsedLabel(task.closedAt - task.openedAt)}`);
 function BranchDock({ sessionId, useRoster, useWork, actions }) {
   const roster = useRoster((value) => value);
   const work = useWork((value) => value);
@@ -19264,7 +19265,7 @@ ${endpoint ?? t("Creating")}`
         { className: "bt-mw-pill-in" },
         target ? (0, import_react47.createElement)(BotMark, { bot: target, size: 24 }) : null,
         (0, import_react47.createElement)("span", { className: "bt-branch-label" }, `${task2.title} · ${t(status)} · ${suffix}${task2.lateReplies.count ? ` · ${t("Late results")}: ${task2.lateReplies.count}` : ""}`),
-        (0, import_react47.createElement)(Elapsed, { at: task2.openedAt })
+        taskElapsed(task2, task2.openedAt)
       )
     );
   };
@@ -19318,7 +19319,7 @@ function TaskHeader({ task, sessionId, roster, work, actions }) {
             "aria-label": `${t("Open task")}: ${bot?.name ?? botId}`,
             onClick: () => actions.openBranch(endpoint)
           }, label) : (0, import_react47.createElement)("span", null, label),
-          (0, import_react47.createElement)(Elapsed, { at: since ?? task.updatedAt ?? task.openedAt })
+          taskElapsed(task, since ?? task.updatedAt ?? task.openedAt)
         );
       })
     )
