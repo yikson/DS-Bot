@@ -132,8 +132,7 @@ export function install(rt) {
     if (taskId) rt.checkTaskDelivery({ ...args, sessionId: targetSessionId })
     // Work can finish while capabilities or the Session are being resolved.
     const failureWork = work ?? (role === 'request' && audience !== 'user' ? exchangeId : undefined)
-    if (failureResumes !== undefined && (rt.failureResumePending?.(exchangeId, failureResumes) === false
-      || (failureWork !== undefined && !rt.ownsWork(toId, failureWork)))) {
+    if (failureResumes !== undefined && failureWork !== undefined && !rt.ownsWork(toId, failureWork)) {
       rt.forgetDelivery?.(exchangeId)
       return exchangeId
     }
