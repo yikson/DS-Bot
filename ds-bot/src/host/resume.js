@@ -94,9 +94,9 @@ const readNotes = (file) => {
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8'))
     const object = value => (value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {})
-    return { turns: object(parsed?.turns), queued: object(parsed?.queued), pendingResumes: object(parsed?.pendingResumes) }
+    return { turns: object(parsed?.turns), queued: object(parsed?.queued) }
   } catch {
-    return { turns: {}, queued: {}, pendingResumes: {} }
+    return { turns: {}, queued: {} }
   }
 }
 
@@ -112,9 +112,6 @@ export function install(rt) {
   let turns = {}
   /** @type {Record<string, {at:number, args:any}[]>} deliveries no turn has taken up, by Session */
   let queued = {}
-  // Waiting resumes stay durable until they move into the delivery queue.
-  let pendingResumes = interrupted.pendingResumes
-  const failureTimers = new Map()
   let writing = Promise.resolve()
   let stopped = false
   rt.isStopped = () => stopped
@@ -128,7 +125,7 @@ export function install(rt) {
       deliveries[id] = [...new Map([...(interrupted.queued[id] ?? []), ...(queued[id] ?? [])]
         .map(item => [deliveryId(item.args), item])).values()]
     }
-    latest = JSON.stringify({ turns: { ...interrupted.turns, ...turns }, queued: deliveries, pendingResumes })
+    latest = JSON.stringify({ turns: { ...interrupted.turns, ...turns }, queued: deliveries })
     // One write waits at a time and takes the latest notes, so a busy round does not
     // write the file once per change.
     if (due) return
@@ -165,60 +162,39 @@ export function install(rt) {
     if (changed) persist()
   }
 
-  const forgetResume = (exchangeId) => {
-    safe.clearTimeout(failureTimers.get(exchangeId))
-    failureTimers.delete(exchangeId)
-    delete pendingResumes[exchangeId]
+  // A turn cut off by a transient model failure is retried in memory with a growing
+  // delay; after a restart the interrupted turn is picked up with a recovery note.
+  const failureTimers = new Map()
+  const openResume = ({ work, args }) => rt.botOf(args.toId) !== undefined
+    && (!args.taskId || rt.taskOf(args.taskId)?.state === 'open')
+    && (work === undefined || rt.ownsWork(args.toId, work))
+  const forgetResume = (key) => {
+    safe.clearTimeout(failureTimers.get(key)?.timer)
+    failureTimers.delete(key)
   }
-  const openResume = record => (!record.args.taskId || rt.taskOf(record.args.taskId)?.state === 'open')
-    && (record.work === undefined || rt.ownsWork(record.args.toId, record.work))
-  const workOfDelivery = args => args.work ?? (args.role === 'request' && args.audience !== 'user' ? args.exchangeId : undefined)
   const exchangeOf = args => args.exchangeId ?? (args.taskId && args.continuationId
     ? JSON.stringify([args.taskId, 'continuation', args.continuationId]) : randomUUID())
-  const queuedFailures = () => [...Object.values(interrupted.queued), ...Object.values(queued)].flat().filter(item => item.args.failureResumes !== undefined)
-  const hasFailureResume = work => Object.values(pendingResumes).some(record => record.work === work)
-    || queuedFailures().some(item => workOfDelivery(item.args) === work)
-  rt.failureResumePending = (exchangeId, attempt) => queuedFailures().some(item => item.args.exchangeId === exchangeId && item.args.failureResumes === attempt)
-  rt.taskFailureResumes = id => Object.values(pendingResumes).some(record => record.args.taskId === id)
-    || queuedFailures().some(item => item.args.taskId === id)
-  rt.cancelTaskFailureResumes = id => {
-    for (const [exchangeId, record] of Object.entries(pendingResumes)) if (record.args.taskId === id) forgetResume(exchangeId)
-    for (const { args } of queuedFailures()) if (args.taskId === id) forgetQueued(args.exchangeId)
-    persist()
+  const hasFailureResume = work => [...failureTimers.values()].some(record => record.work === work)
+  rt.taskFailureResumes = id => [...failureTimers.values()].some(record => record.args.taskId === id)
+  rt.cancelTaskFailureResumes = (id) => {
+    for (const [key, record] of failureTimers) if (record.args.taskId === id) forgetResume(key)
   }
-  const armResume = (exchangeId, record) => {
-    safe.clearTimeout(failureTimers.get(exchangeId))
-    const timer = safe.setTimeout(() => {
-      failureTimers.delete(exchangeId)
-      if (stopped || pendingResumes[exchangeId] !== record) return
-      if (!openResume(record) || rt.botOf(record.args.toId) === undefined) {
-        forgetResume(exchangeId)
-        persist()
-        return
-      }
-      safe.run('resume background job', () => rt.deliver(record.args).catch(error => rt.warn('ds-bot: resuming the turn of %s failed: %s', record.args.sessionId, error)))
-    }, Math.max(0, record.due - Date.now()))
-    timer?.unref?.()
-    failureTimers.set(exchangeId, timer)
+  rt.cancelFailureResumes = (work) => {
+    for (const [key, record] of failureTimers) if (record.work === work || key === work) forgetResume(key)
   }
   rt.scheduleFailureResume = ({ work, args }) => {
     if (stopped || rt.readOnly() !== undefined) return
-    if (args.taskId && rt.taskOf(args.taskId)?.state !== 'open') return
-    const exchangeId = exchangeOf(args)
-    const record = { due: Date.now() + FAILURE_RESUME_DELAY_MS, ...(work ? { work } : {}), args: { ...args, exchangeId } }
-    pendingResumes[exchangeId] = record
-    persist()
-    armResume(exchangeId, record)
-  }
-  rt.cancelFailureResumes = (work) => {
-    for (const [exchangeId, record] of Object.entries(pendingResumes)) {
-      if (record.work !== work && exchangeId !== work) continue
-      forgetResume(exchangeId)
-      persist()
-    }
-    for (const { args } of queuedFailures()) {
-      if (workOfDelivery(args) === work || args.exchangeId === work) forgetQueued(args.exchangeId)
-    }
+    const record = { work, args: { ...args, exchangeId: exchangeOf(args) } }
+    if (!openResume(record)) return
+    const key = record.args.exchangeId
+    forgetResume(key)
+    record.timer = safe.setTimeout(() => {
+      failureTimers.delete(key)
+      if (stopped || !openResume(record)) return
+      safe.run('resume background job', () => rt.deliver(record.args).catch(error => rt.warn('ds-bot: resuming the turn of %s failed: %s', record.args.sessionId, error)))
+    }, FAILURE_RESUME_DELAY_MS * 2 ** ((args.failureResumes ?? 1) - 1))
+    record.timer?.unref?.()
+    failureTimers.set(key, record)
   }
 
   const deliver = rt.deliver
@@ -229,9 +205,6 @@ export function install(rt) {
     }
     const noted = args.exchangeId === undefined ? { ...args, exchangeId: exchangeOf(args) } : args
     const sessionId = noted.sessionId ?? rt.chatOf(noted.toId)
-    const pending = pendingResumes[noted.exchangeId]
-    // One snapshot moves a due resume into queued; a reload sees one or the other.
-    if (pending !== undefined && noted.failureResumes === pending.args.failureResumes) forgetResume(noted.exchangeId)
     // Noted before it is sent: a turn may take it up before the send returns.
     queued = { ...queued, [sessionId]: [...(queued[sessionId] ?? []), { at: Date.now(), args: noted }].slice(-QUEUED_MAX) }
     persist()
@@ -241,11 +214,6 @@ export function install(rt) {
       // A stopped host leaves the durable queue for the next install.
       if (stopped || safe.stopped) throw error
       forgetQueued(noted.exchangeId, noted)
-      if (pending !== undefined && openResume(pending) && !stopped) {
-        pendingResumes[noted.exchangeId] = { ...pending, due: Date.now() + FAILURE_RESUME_DELAY_MS }
-        persist()
-        armResume(noted.exchangeId, pendingResumes[noted.exchangeId])
-      }
       throw error
     }
   }
@@ -523,16 +491,6 @@ export function install(rt) {
   }
 
   safe.effect(() => {
-    if (Object.keys(pendingResumes).length > 0) safe.run('resume background job', () => rt.load().then(() => {
-      if (stopped || rt.readOnly() !== undefined) return
-      // An interrupted continuation owns its work. Older snapshots may still carry
-      // the failure wait it superseded; do not arm both recovery paths.
-      for (const record of Object.values(interrupted.turns)) {
-        const work = rt.workOf(record.trigger)
-        if (work !== undefined) rt.cancelFailureResumes(work)
-      }
-      for (const [exchangeId, record] of Object.entries(pendingResumes)) armResume(exchangeId, record)
-    }).catch(error => rt.warn('ds-bot: loading pending failure resumes failed: %s', error)))
     let timer
     const hasTasks = saved => Object.keys(saved?.tasks ?? {}).length > 0
     let pending = Object.keys(interrupted.turns).length > 0 || Object.keys(interrupted.queued).length > 0
@@ -551,7 +509,7 @@ export function install(rt) {
     return () => {
       stopped = true
       safe.clearTimeout(timer)
-      for (const failureTimer of failureTimers.values()) safe.clearTimeout(failureTimer)
+      for (const record of failureTimers.values()) safe.clearTimeout(record.timer)
       failureTimers.clear()
       return writing
     }

@@ -48,7 +48,7 @@ for (const kind of ['written', 'failure']) {
     const original = consume(f)
     const timers = [], safe = asyncScope(f.rt), schedule = safe.setTimeout
     safe.setTimeout = (callback, ms, ...args) => {
-      if (ms < 59_000 || ms > 60_000) return schedule(callback, ms, ...args)
+      if (ms !== 15_000) return schedule(callback, ms, ...args)
       timers.push(callback)
       return { unref() {} }
     }
