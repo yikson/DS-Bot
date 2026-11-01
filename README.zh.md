@@ -41,7 +41,7 @@ DS Bot 是一个基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepsee
 
 **带外更新（个人 fork）**
 
-此 fork 只检查新版本，不会安装或移除正在运行的自身插件；Bot 会话和 DSH Agent 会话不能通过 `plugin_manager` 修改 `ds-bot`。发布在独立终端里做：完全退出 Desktop，备份 `<DSH_HOME>/bot/`，在链接的发布 checkout 里切到新提交，重新打开一次并验证；回滚同理。步骤见 [docs/plans/2026-10-30-release-procedure.md](docs/plans/2026-10-30-release-procedure.md)。
+此 fork 只检查新版本，不会安装或移除正在运行的自身插件；Bot 会话和 DSH Agent 会话不能通过 `plugin_manager` 修改任何插件（仍可查看）。发布在独立终端里做：完全退出 Desktop，备份 `<DSH_HOME>/bot/`，在链接的发布 checkout 里切到新提交，重新打开一次并验证；回滚同理。步骤见 [docs/plans/2026-10-30-release-procedure.md](docs/plans/2026-10-30-release-procedure.md)。
 
 **dsh Web（Windows、macOS、Linux）**
 
