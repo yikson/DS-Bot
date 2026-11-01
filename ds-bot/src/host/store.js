@@ -2,7 +2,6 @@
 // host on the same data from writing it, and the indexes that map a Session to the Bot
 // or group chat it belongs to.
 import { asyncScope } from './async.js'
-import { validateTask } from './tasks.js'
 import { mkdirSync, statSync } from 'node:fs'
 import { copyFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -373,57 +372,20 @@ export function install(rt) {
   const groupOwners = new Map()
   /** @type {Map<string, {botId:string, roomId?:string}>} */
   const pastOwners = new Map()
-  // Task bindings stay separate from live Bot identity until lifecycle setup is installed.
   const taskById = new Map()
   const taskBySession = new Map()
   const taskOwners = new Map()
-  const taskDiagnostics = new Map()
-  const taskSessionClaims = () => {
-    const claims = new Map()
-    for (const [id, task] of Object.entries(state.tasks ?? {})) {
-      try { validateTask(task, id) } catch { continue }
-      for (const [botId, sessionId] of Object.entries(task.sessions)) {
-        const claim = claims.get(sessionId) ?? { all: new Set(), owned: new Set() }
-        claim.all.add(id)
-        if (task.participants[botId].kind !== 'trunk') claim.owned.add(id)
-        claims.set(sessionId, claim)
-      }
-    }
-    return claims
-  }
-  const validateTaskSessions = (task, claims = taskSessionClaims()) => {
-    // Read persisted Agent claims directly: their live index rebuilds after task validation.
-    const agentSessions = new Set(Object.values(state.agents).flatMap(agent => agent.sessions ?? []))
-    for (const [botId, sessionId] of Object.entries(task.sessions)) {
-      const trunk = task.participants[botId].kind === 'trunk'
-      if (agentSessions.has(sessionId) || (!trunk && (own(state.bots, sessionId) || own(state.rooms, sessionId)
-        || chatOwners.has(sessionId) || groupOwners.has(sessionId) || pastOwners.has(sessionId)))) {
-        throw new Error(`Task ${task.id}: Session is already owned`)
-      }
-      if (trunk && (own(state.rooms, sessionId) || (own(state.bots, sessionId) && sessionId !== botId)
-        || groupOwners.has(sessionId)
-        || (chatOwners.has(sessionId) && chatOwners.get(sessionId) !== botId)
-        || (pastOwners.has(sessionId) && (pastOwners.get(sessionId).botId !== botId || pastOwners.get(sessionId).roomId !== undefined)))) {
-        throw new Error(`Task ${task.id}: endpoint is not this Bot's trunk`)
-      }
-      // Include every valid saved record, so conflicts fail closed in either load order.
-      const others = trunk ? claims.get(sessionId)?.owned : claims.get(sessionId)?.all
-      if (others && others.size > Number(others.has(task.id))) throw new Error(`Task ${task.id}: Session is already owned`)
-    }
-  }
   const taskOf = id => taskById.get(id)
   const taskForSession = sessionId => taskOf(taskBySession.get(sessionId))
   const openTasksOf = botId => [...taskById.values()].filter(task => task.state === 'open' && Object.hasOwn(task.participants, botId))
   const chatOf = botId => botOf(botId)?.sessionId ?? botId
   const indexSessions = () => {
-    const previousDiagnostics = new Map(taskDiagnostics)
     chatOwners.clear()
     groupOwners.clear()
     pastOwners.clear()
     taskById.clear()
     taskBySession.clear()
     taskOwners.clear()
-    taskDiagnostics.clear()
     for (const bot of Object.values(state.bots)) {
       // Sessions of the retired work branches stay readable as the Bot's archived ones.
       for (const branch of Object.values(bot.workBranches ?? {})) {
@@ -438,28 +400,15 @@ export function install(rt) {
       }
       for (const [botId, sessionId] of Object.entries(room.sessions ?? {})) groupOwners.set(sessionId, { botId, roomId: room.id })
     }
-    // Invalid v2 records stay on disk for diagnosis but can never claim a Session.
-    const invalidTask = (id, error) => {
-      taskDiagnostics.set(id, error.message)
-      if (previousDiagnostics.get(id) !== error.message) warn('ds-bot: %s', error.message)
-    }
-    if (state.tasks === null || typeof state.tasks !== 'object' || Array.isArray(state.tasks)) {
-      invalidTask('tasks', new Error('Invalid task table; expected a map'))
-    } else {
-      const claims = taskSessionClaims()
-      for (const [id, task] of Object.entries(state.tasks)) {
-        try {
-          validateTask(task, id)
-          validateTaskSessions(task, claims)
-          taskById.set(id, task)
-          for (const [botId, sessionId] of Object.entries(task.sessions)) {
-            if (task.participants[botId].kind === 'trunk') continue
-            taskBySession.set(sessionId, id)
-            taskOwners.set(sessionId, { taskId: id, botId })
-          }
-        } catch (error) {
-          invalidTask(id, error)
-        }
+    // A record this build cannot read stays on disk untouched and claims no Session.
+    for (const [id, task] of Object.entries(state.tasks ?? {})) {
+      if (task?.id !== id || typeof task.requester !== 'string' || !task.sessions || typeof task.sessions !== 'object'
+        || !task.participants || typeof task.participants !== 'object') continue
+      taskById.set(id, task)
+      for (const [botId, sessionId] of Object.entries(task.sessions)) {
+        if (task.participants?.[botId]?.kind === 'trunk' || typeof sessionId !== 'string') continue
+        taskBySession.set(sessionId, id)
+        taskOwners.set(sessionId, { taskId: id, botId })
       }
     }
     // The agents module owns the DSH Agent session index; it installs after this.
@@ -517,7 +466,7 @@ export function install(rt) {
     state, load, save, refresh, readOnly, own, stateReadError: () => readError,
     botOf, roomOf, isMain, chatOf, selfOf, isBotSession,
     chatOwners, groupOwners, pastOwners, indexSessions,
-    taskById, taskBySession, taskOwners, taskDiagnostics, taskOf, taskForSession, openTasksOf, taskSessionsOf, validateTaskSessions,
+    taskById, taskBySession, taskOwners, taskOf, taskForSession, openTasksOf, taskSessionsOf,
     groupSessionsOf, dropGroupSession, retireGroupSession, findBot, findRooms, isAdminOf,
   })
 }

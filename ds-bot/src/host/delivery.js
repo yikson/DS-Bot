@@ -4,8 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { HISTORY_TIMEOUT_MS, LONG_HEAD, MESSAGE_INLINE_MAX, READ_LINE_MAX, SOURCE_KIND, TEXT_KEPT, TEXT_SHOW_MAX } from './constants.js'
 import { headOf, textOf } from './text.js'
-import { taskBrief } from './task-routing.js'
-import { deliveryId } from './delivery-id.js'
+import { taskBrief } from './tasks.js'
 
 export function install(rt) {
   const safe = asyncScope(rt)
@@ -109,27 +108,11 @@ export function install(rt) {
       ...(askedBy ? { askedBy } : {}),
       ...(fromRoomId ? { senderRoomId: fromRoomId } : {}),
     }
-    let targetSessionId = sessionId ?? rt.chatOf(toId)
-    let agent
-    for (;;) {
-      if (taskId) {
-        await rt.prepareTaskDelivery(args)
-        targetSessionId = args.sessionId
-      }
-      await rt.ensureCapabilities(targetSessionId)
-      if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
-      agent = await resolveAgent(targetSessionId)
-      if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
-      if (taskId && rt.confirmTaskDeliveryTarget) {
-        await rt.confirmTaskDeliveryTarget(args)
-        if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
-        if (args.sessionId !== targetSessionId) continue
-      }
-      const task = taskId && rt.taskOf(taskId)
-      if ((role === 'task-conclusion' || task?.participants[toId]?.kind === 'trunk') && rt.chatOf(toId) !== targetSessionId) continue
-      break
-    }
-    if (taskId) rt.checkTaskDelivery({ ...args, sessionId: targetSessionId })
+    const targetSessionId = sessionId ?? rt.chatOf(toId)
+    await rt.ensureCapabilities(targetSessionId)
+    if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
+    const agent = await resolveAgent(targetSessionId)
+    if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
     // Work can finish while capabilities or the Session are being resolved.
     const failureWork = work ?? (role === 'request' && audience !== 'user' ? exchangeId : undefined)
     if (failureResumes !== undefined && failureWork !== undefined && !rt.ownsWork(toId, failureWork)) {
@@ -142,7 +125,6 @@ export function install(rt) {
     if (candidate && JSON.stringify(candidate.source) === merge.source && JSON.stringify(candidate.content) === merge.content
       && candidate.source.senderSessionId === fromId && candidate.source.replySessionId === replySessionId
       && !candidate.source.deferred && !candidate.source.resumed
-      && deliveryId(candidate.source) === candidate.source.exchangeId
       && (audience === 'user' ? candidate.source.audience === 'user' : samePrivateWork(source, candidate.source))
       && agent.inbox.remove(candidate.id)) {
       const replaced = exchangeId
@@ -183,7 +165,6 @@ export function install(rt) {
     receipt.merged = merged
     // This is the enqueue boundary: no await may follow the final turn/scope check.
     if (safe.stopped || rt.isStopped?.()) { receipt.skipped = true; return exchangeId }
-    if (taskId) rt.checkTaskDelivery({ ...args, sessionId: targetSessionId })
     receipt.steer = steer && (role !== 'request' || (audience !== 'user' && samePrivateWork(source, rt.privateTurn(targetSessionId))))
     if (receipt.steer) agent.steer(message)
     else agent.followup(message)

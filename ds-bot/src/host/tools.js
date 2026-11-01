@@ -9,8 +9,7 @@ import { within } from './folders.js'
 import { absoluteLinks } from './links.js'
 import { NAME_MAX } from './requests.js'
 import { unquote } from './text.js'
-import { taskBrief } from './task-routing.js'
-import { deliveryId } from './delivery-id.js'
+import { taskBrief } from './tasks.js'
 import { SELF_UPDATE_REFUSAL } from './update.js'
 import { mentionSpans } from '../shared/mentions.js'
 import { checkShownView } from '../shared/views.js'
@@ -195,8 +194,7 @@ export function install(rt) {
     for (const message of [...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])]) {
       const source = message.source
       if (source?.kind === SOURCE_KIND && source.role === 'request' && source.senderSessionId === senderId
-        && (source.audience === 'user') === toUser && !source.deferred && !source.resumed
-        && deliveryId(source) === source.exchangeId) return { message }
+        && (source.audience === 'user') === toUser && !source.deferred && !source.resumed) return { message }
     }
     return undefined
   }
@@ -353,7 +351,6 @@ export function install(rt) {
         const steer = args.when !== 'queue' && !toUser
         const exchangeId = route.exchangeId ?? randomUUID()
         if (route.task) {
-          rt.taskLifecycleCheck()
           if (rt.taskOf(taskId)?.state !== 'open') throw new Error('This task is not open')
         }
         if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work, taskId })
