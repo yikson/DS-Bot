@@ -9,7 +9,6 @@ import { fakeAttachments, fakeContext } from './fake-ctx.js'
 import { install as installTurns } from '../src/host/turns.js'
 import { install as installParts } from '../src/host/parts.js'
 import { install as installDelivery } from '../src/host/delivery.js'
-import { install as installBranches } from '../src/host/branches.js'
 import { REFERENCE_KIND, REPLY_KIND, SOURCE_KIND } from '../src/host/constants.js'
 import { isHiddenTurn } from '../src/client/text.js'
 
@@ -465,8 +464,6 @@ const assistantText = text => ({ message: { content: textBlock(text) } })
 function deliveryHost() {
   const { rt, emit } = turnsHost()
   rt.config = {}
-  rt.branchOwners = new Map()
-  rt.branchByWork = new Map()
   rt.state.exchanges = []
   rt.state.works = {
     root: { taskId: 'T1' },
@@ -507,7 +504,6 @@ function deliveryHost() {
   rt.ctx.sessionController = { resolveAgent: async () => ({ agent }) }
   rt.ctx.sessions = { flush: async () => {} }
   installDelivery(rt)
-  installBranches(rt)
   const trigger = source => {
     emit('b', 'turn/start', { turn: 1 })
     if (source) emit('b', 'user/message', { content: textBlock('running'), source })
@@ -520,14 +516,13 @@ function deliveryHost() {
     const wait = async () => { entered.resolve(); await release.promise }
     if (where === 'capabilities') rt.ensureCapabilities = wait
     if (where === 'resolve') rt.ctx.sessionController.resolveAgent = async () => { await wait(); return { agent } }
-    if (where === 'save') rt.save = wait
-    const send = where === 'save' ? () => rt.sendBranchTask({ id: 'legacy' }, args) : () => rt.deliver(args)
+    const send = () => rt.deliver(args)
     return { entered: entered.promise, release: release.resolve, send }
   }
   return { rt, emit, agent, calls, removed, args, trigger, pause, stop: () => { stopped = true } }
 }
 
-for (const where of ['capabilities', 'resolve', 'save']) {
+for (const where of ['capabilities', 'resolve']) {
   for (const kind of ['user', 'schedule', 'group', 'unknown', 'bot-unknown-role', 'missing', 'missing-work', 'other-task', 'other-work', 'incoming-task', 'incoming-work', 'stopped']) {
     test(`private enqueue rechecks ${kind} after awaiting ${where}`, async () => {
       const host = deliveryHost()
@@ -629,7 +624,7 @@ test('private scope validation and enqueue run in the same synchronous step', as
   assert.deepEqual(host.calls.map(([method]) => method), ['steer'])
 })
 
-for (const where of ['capabilities', 'resolve', 'save']) {
+for (const where of ['capabilities', 'resolve']) {
   for (const change of ['consume', 'replace', 'audience', 'task', 'work', 'incoming-task', 'incoming-work', 'text', 'matching']) {
     test(`unread candidate ${change} is rechecked after awaiting ${where}`, async () => {
       const host = deliveryHost()

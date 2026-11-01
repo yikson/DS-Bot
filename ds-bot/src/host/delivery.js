@@ -2,7 +2,7 @@
 import { asyncScope } from './async.js'
 import { randomUUID } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { BRANCH_SUMMARY_HEADER, HISTORY_TIMEOUT_MS, LONG_HEAD, MESSAGE_INLINE_MAX, READ_LINE_MAX, SOURCE_KIND, TEXT_KEPT, TEXT_SHOW_MAX } from './constants.js'
+import { HISTORY_TIMEOUT_MS, LONG_HEAD, MESSAGE_INLINE_MAX, READ_LINE_MAX, SOURCE_KIND, TEXT_KEPT, TEXT_SHOW_MAX } from './constants.js'
 import { headOf, textOf } from './text.js'
 import { taskBrief } from './task-routing.js'
 import { deliveryId } from './delivery-id.js'
@@ -33,7 +33,6 @@ export function install(rt) {
     if (resumed && role === 'resume') return '[DeepSeek Harness restarted while you were working]'
     if (resumed && role !== 'room') return `[Message from ${fromName} · DeepSeek Harness restarted while you were working on it]`
     if (role === 'reply') return `[Reply from ${fromName}${goesOn}]`
-    if (role === 'branch-summary') return BRANCH_SUMMARY_HEADER
     if (role === 'task-conclusion') return '[Task closed]'
     if (role === 'stopped') return `[Stopped by ${fromName}]`
     if (role === 'room') return `[Group chat "${roomName}" · ${note}]`
@@ -58,7 +57,7 @@ export function install(rt) {
     if (!id || !work || (work.parent && !state.works[work.parent])) return undefined
     // Follow-up requests share the caller's established work, never an absent parent.
     const parent = work.parent ?? id
-    const task = work.taskId ?? state.works[parent]?.taskId ?? rt.branchForWork?.(id)?.id
+    const task = work.taskId ?? state.works[parent]?.taskId
     if (source.taskId && task && source.taskId !== task) return undefined
     return { work: parent, task: source.taskId ?? task }
   }
@@ -110,7 +109,7 @@ export function install(rt) {
       ...(askedBy ? { askedBy } : {}),
       ...(fromRoomId ? { senderRoomId: fromRoomId } : {}),
     }
-    let targetSessionId = rt.deliverySession?.({ sessionId, toId, replyTo }) ?? sessionId ?? rt.chatOf(toId)
+    let targetSessionId = sessionId ?? rt.chatOf(toId)
     let agent
     for (;;) {
       if (taskId) {
@@ -130,7 +129,6 @@ export function install(rt) {
       if ((role === 'task-conclusion' || task?.participants[toId]?.kind === 'trunk') && rt.chatOf(toId) !== targetSessionId) continue
       break
     }
-    const branch = rt.branchOf?.(targetSessionId)
     if (taskId) rt.checkTaskDelivery({ ...args, sessionId: targetSessionId })
     // Work can finish while capabilities or the Session are being resolved.
     const failureWork = work ?? (role === 'request' && audience !== 'user' ? exchangeId : undefined)
@@ -177,7 +175,7 @@ export function install(rt) {
     const task = taskId && rt.taskOf(taskId)
     const message = createUserMessage({
       content: [
-        { type: 'text', text: role === 'task-conclusion' ? text : `${headerFor(role, fromName, room?.name, audience, note, deferred, { resumed, retried, asker, failureResumes })}\n${task ? `${taskBrief(task)}\n` : ''}${branch ? `[Work branch: ${branch.title}]\nBranch: ${branch.id}\n` : ''}${text}` },
+        { type: 'text', text: role === 'task-conclusion' ? text : `${headerFor(role, fromName, room?.name, audience, note, deferred, { resumed, retried, asker, failureResumes })}\n${task ? `${taskBrief(task)}\n` : ''}${text}` },
         ...files.map(attachment => ({ type: 'file', attachment })),
       ],
       source,

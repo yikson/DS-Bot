@@ -106,7 +106,7 @@ export function install(rt) {
     warned.add(key)
     rt.warn(message, value)
   }
-  // Resolve exact, unique names on each query, just like legacy work-branch pairs.
+  // Resolve exact, unique names on each query.
   const taskCapabilities = () => {
     const ids = new Set()
     const matches = name => text(name) ? Object.values(rt.state.bots).filter(bot => bot.name === name) : []
@@ -116,18 +116,6 @@ export function install(rt) {
       const bots = matches(name)
       if (bots.length === 1) ids.add(bots[0].id)
       else warnOnce(`name:${JSON.stringify(name)}`, 'ds-bot: invalid or ambiguous taskSessions name %s', JSON.stringify(name))
-    }
-    const pairs = rt.config.workBranches ?? []
-    if (!Array.isArray(pairs)) warnOnce('pairs', 'ds-bot: invalid workBranches list %s', JSON.stringify(pairs))
-    for (const pair of Array.isArray(pairs) ? pairs : []) {
-      const bots = Array.isArray(pair) && pair.length === 2 ? pair.map(matches) : []
-      const key = JSON.stringify(pair)
-      if (bots.length !== 2 || bots.some(found => found.length !== 1) || bots[0][0] === bots[1][0]) {
-        warnOnce(`pair:${key}`, 'ds-bot: invalid work branch pair %s', key)
-        continue
-      }
-      warnOnce(`alias:${key}`, 'ds-bot: workBranches pair %s is deprecated; use taskSessions for v2 capability (the rollout gate stays separate)', key)
-      for (const [bot] of bots) ids.add(bot.id)
     }
     return ids
   }

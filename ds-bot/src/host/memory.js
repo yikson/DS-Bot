@@ -1467,7 +1467,7 @@ export function install(rt) {
     // Reading goes back as far as it takes: to the cursor, or for a first review to
     // the user's latest line.
     for await (const line of rt.partLines(sessionId, AbortSignal.timeout(REVIEW_READ_MS), { pages: Infinity })) {
-      if (line.seq <= (task?.inheritedThrough ?? rt.branchOf?.(sessionId)?.inheritedThrough ?? -1)) break
+      if (line.seq <= (task?.inheritedThrough ?? -1)) break
       through ??= line.seq
       // A first review reads back at least to the user's latest line.
       if (since === undefined ? fresh.length < REVIEW_FIRST_LINES || !fresh.some(seen => seen.who === 'user') : line.seq > since) fresh.push(line)
@@ -1484,7 +1484,7 @@ export function install(rt) {
       source: (lines) => {
         const said = lines.findLast(line => line.who === 'user')
         if (task !== undefined) return taskSource(task.taskId, sessionId, said?.seq ?? lines.at(-1)?.seq)
-        return said === undefined ? undefined : rt.branchOf?.(sessionId) ? `branch ${sessionId} #${said.seq}` : `part ${at === -1 ? Math.max(parts.length, 1) : at + 1} #${said.seq}`
+        return said === undefined ? undefined : `part ${at === -1 ? Math.max(parts.length, 1) : at + 1} #${said.seq}`
       },
     }
   }
@@ -1584,7 +1584,7 @@ export function install(rt) {
     }
     const chat = rt.chatOwners.get(sessionId)
     if (chat !== undefined) return { key: `chat:${sessionId}`, sessionId, botId: chat }
-    const owner = rt.branchOwners?.get(sessionId) ?? rt.groupOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)
+    const owner = rt.groupOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)
     if (owner === undefined) return undefined
     if (owner.roomId === undefined) return { key: `chat:${sessionId}`, sessionId, botId: owner.botId }
     const room = rt.roomOf(owner.roomId)
@@ -1598,7 +1598,7 @@ export function install(rt) {
     const bot = rt.botOf(current?.botId ?? seen.botId)
     if (bot === undefined) return
     if (seen.taskId !== undefined && current?.taskId !== seen.taskId) return
-    const boundary = seen.taskId === undefined ? rt.branchOf?.(seen.sessionId)?.inheritedThrough : seen.inheritedThrough
+    const boundary = seen.taskId === undefined ? undefined : seen.inheritedThrough
     const since = boundary === undefined ? cursorsNow()[seen.key] : Math.max(cursorsNow()[seen.key] ?? -1, boundary)
     await reviewBatch({
       key: seen.key, since, batch: await chatBatch(seen.sessionId, bot, since, seen.taskId === undefined ? undefined : seen),

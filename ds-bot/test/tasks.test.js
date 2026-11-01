@@ -69,26 +69,22 @@ async function setup(t, { seed = legacy(), config = {} } = {}) {
   return { rt, ctx, home, statePath, warnings, tool, agent, schemas }
 }
 
-test('legacy main-shaped records stay separate, unchanged and routable without config', async t => {
+test('retired work-branch records load unchanged; their Sessions stay archived Sessions of the Bot', async t => {
   const seed = legacy()
   const original = structuredClone(seed.bots.a.workBranches)
   const { rt, schemas, statePath } = await setup(t, { seed })
   assert.deepEqual(rt.state.tasks, {})
   assert.deepEqual(rt.state.bots.a.workBranches, original)
-  assert.equal(rt.branchOf('sess-open').id, 'br-open')
-  assert.equal(rt.branchForWork('br-other').id, 'br-other')
   assert.equal(rt.selfOf('sess-closed'), 'a')
+  assert.equal(rt.selfOf('sess-open'), 'a')
+  assert.equal(rt.isBotSession('sess-open'), false)
   assert.equal(rt.chatOwners.get('b'), 'b')
   assert.equal(rt.taskBySession.size, 0)
   assert.equal(rt.taskOwners.size, 0)
   assert.equal(rt.taskById.size, 0)
   assert.equal((await schemas('a')).some(tool => tool.name === 'list_tasks'), false)
-  const route = await rt.routeBranch(rt.botOf('b'), rt.botOf('a'), 'sess-open', 'follow up', false)
-  assert.equal(route.branch.id, 'br-open')
   await rt.save({ required: true })
   assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')).bots.a.workBranches, original)
-  // A reverse-direction work never changes the legacy owner into its peer.
-  assert.equal(rt.branchOwners.get('sess-open').botId, 'a')
 })
 
 test('task records and indexes round-trip, including shared trunks across two tasks', async t => {
@@ -135,7 +131,7 @@ test('flag-off tool list matches the base team with no task configuration or rec
     'list_bots', 'message_bot', 'stop_bot', 'create_bot', 'update_bot', 'list_bot_models',
     'create_group', 'update_group', 'delete_group', 'post_to_group', 'ask_user', 'show_view',
     'list_capabilities', 'save_capability', 'delete_capability', 'attach_capability', 'detach_capability',
-    'close_work_branch', 'group_relay', 'read_own_chat', 'read_group_chat', 'request_secret', 'list_secrets',
+    'group_relay', 'read_own_chat', 'read_group_chat', 'request_secret', 'list_secrets',
   ]
   assert.deepEqual([...ctx.registeredTools.keys()], baseNames)
   const global = [...ctx.registeredTools.values()]
@@ -323,44 +319,6 @@ for (const enabled of [false, true]) {
     })
   }
 }
-
-test('task capability defaults off and legacy alias never bypasses the explicit boolean gate', async t => {
-  const { rt, warnings } = await setup(t, { config: { workBranches: [['ADA', 'Cardpack']] } })
-  assert.deepEqual([...rt.taskCapabilities()].sort(), ['a', 'b'])
-  assert.equal(rt.canStartTask('a', 'b'), false)
-  rt.config.taskSessionsEnabled = 'true'
-  assert.equal(rt.canStartTask('a', 'b'), false)
-  rt.config.taskSessionsEnabled = true
-  assert.equal(rt.canStartTask('a', 'b'), true)
-  assert.equal(warnings.filter(args => String(args[0]).includes('deprecated')).length, 1)
-  rt.config.taskSessions = []
-  assert.equal(rt.canStartTask('b', 'a'), true)
-  rt.config.workBranches = []
-  assert.equal(rt.canStartTask('a', 'b'), false)
-  assert.deepEqual(rt.state.tasks, {})
-})
-
-test('names resolve exactly and uniquely; malformed lists and pairs produce bounded diagnostics', async t => {
-  const seed = legacy()
-  seed.bots.duplicate = { id: 'duplicate', name: 'Other', sessionId: 'duplicate' }
-  const { rt, warnings } = await setup(t, { seed, config: {
-    taskSessions: ['ADA', 'ADA', 'ada', 'Missing', 'Other', null, 42],
-    workBranches: [['Cardpack', 'ADA'], ['ADA', 'ADA'], ['ADA', 'Missing'], ['Other', 'ADA'], ['ADA'], 'ADA'],
-  } })
-  assert.deepEqual([...rt.taskCapabilities()].sort(), ['a', 'b'])
-  const count = warnings.length
-  rt.taskCapabilities()
-  assert.equal(warnings.length, count)
-  assert.ok(warnings.some(args => String(args[0]).includes('ambiguous')))
-  assert.ok(warnings.some(args => String(args[0]).includes('invalid work branch pair')))
-  rt.config.taskSessions = 'ADA'
-  rt.config.workBranches = {}
-  assert.equal(rt.taskCapabilities().size, 0)
-  assert.ok(warnings.some(args => String(args[0]).includes('invalid taskSessions list')))
-  rt.config.taskSessions = ['ADA']
-  rt.botOf('a').name = 'Renamed'
-  assert.equal(rt.taskCapabilities().size, 0)
-})
 
 test('creation intents persist unknown outcomes and provenance without any Session side effects', async t => {
   const { rt, statePath } = await setup(t)

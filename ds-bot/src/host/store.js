@@ -134,10 +134,6 @@ export function install(rt) {
       migrated = true
     }
     for (const bot of Object.values(state.bots)) {
-      if (bot.workBranches !== undefined && (bot.workBranches === null || typeof bot.workBranches !== 'object' || Array.isArray(bot.workBranches))) {
-        bot.workBranches = {}
-        migrated = true
-      }
       if (!Array.isArray(bot.capabilities)) {
         bot.capabilities = []
         migrated = true
@@ -377,8 +373,6 @@ export function install(rt) {
   const groupOwners = new Map()
   /** @type {Map<string, {botId:string, roomId?:string}>} */
   const pastOwners = new Map()
-  const branchOwners = new Map()
-  const branchByWork = new Map()
   // Task bindings stay separate from live Bot identity until lifecycle setup is installed.
   const taskById = new Map()
   const taskBySession = new Map()
@@ -403,11 +397,11 @@ export function install(rt) {
     for (const [botId, sessionId] of Object.entries(task.sessions)) {
       const trunk = task.participants[botId].kind === 'trunk'
       if (agentSessions.has(sessionId) || (!trunk && (own(state.bots, sessionId) || own(state.rooms, sessionId)
-        || chatOwners.has(sessionId) || groupOwners.has(sessionId) || pastOwners.has(sessionId) || branchOwners.has(sessionId)))) {
+        || chatOwners.has(sessionId) || groupOwners.has(sessionId) || pastOwners.has(sessionId)))) {
         throw new Error(`Task ${task.id}: Session is already owned`)
       }
       if (trunk && (own(state.rooms, sessionId) || (own(state.bots, sessionId) && sessionId !== botId)
-        || groupOwners.has(sessionId) || branchOwners.has(sessionId)
+        || groupOwners.has(sessionId)
         || (chatOwners.has(sessionId) && chatOwners.get(sessionId) !== botId)
         || (pastOwners.has(sessionId) && (pastOwners.get(sessionId).botId !== botId || pastOwners.get(sessionId).roomId !== undefined)))) {
         throw new Error(`Task ${task.id}: endpoint is not this Bot's trunk`)
@@ -426,20 +420,14 @@ export function install(rt) {
     chatOwners.clear()
     groupOwners.clear()
     pastOwners.clear()
-    branchOwners.clear()
-    branchByWork.clear()
     taskById.clear()
     taskBySession.clear()
     taskOwners.clear()
     taskDiagnostics.clear()
     for (const bot of Object.values(state.bots)) {
-      for (const [branchId, branch] of Object.entries(bot.workBranches ?? {})) {
-        if (!branch || typeof branch !== 'object' || !['creating', 'open', 'closed', 'failed'].includes(branch.state)) continue
-        branch.id = branchId
-        if (!Array.isArray(branch.workIds)) branch.workIds = []
-        const owner = { botId: bot.id, branchId }
-        if (typeof branch.sessionId === 'string') branchOwners.set(branch.sessionId, owner)
-        for (const id of branch.workIds ?? []) branchByWork.set(id, owner)
+      // Sessions of the retired work branches stay readable as the Bot's archived ones.
+      for (const branch of Object.values(bot.workBranches ?? {})) {
+        if (typeof branch?.sessionId === 'string') pastOwners.set(branch.sessionId, { botId: bot.id })
       }
       for (const segment of bot.segments ?? []) pastOwners.set(segment.sessionId, { botId: bot.id })
       chatOwners.set(chatOf(bot.id), bot.id)
@@ -480,10 +468,10 @@ export function install(rt) {
   }
   // The Bot a Session speaks for: its own chat, one of its group Sessions, or an
   // earlier segment of either.
-  const selfOf = id => chatOwners.get(id) ?? taskOwners.get(id)?.botId ?? branchOwners.get(id)?.botId ?? groupOwners.get(id)?.botId ?? pastOwners.get(id)?.botId
+  const selfOf = id => chatOwners.get(id) ?? taskOwners.get(id)?.botId ?? groupOwners.get(id)?.botId ?? pastOwners.get(id)?.botId
   const taskSessionsOf = botId => [...taskOwners].filter(([, owner]) => owner.botId === botId).map(([id]) => id)
   // A Session where the Bot speaks now, as opposed to an archived segment.
-  const isBotSession = id => chatOwners.has(id) || taskOwners.has(id) || branchOwners.has(id) || groupOwners.has(id)
+  const isBotSession = id => chatOwners.has(id) || taskOwners.has(id) || groupOwners.has(id)
   const groupSessionsOf = botId => Object.values(state.rooms).map(room => room.sessions?.[botId]).filter(Boolean)
   const dropGroupSession = (room, botId) => {
     const sessionId = room.sessions?.[botId]
@@ -528,7 +516,7 @@ export function install(rt) {
   Object.assign(rt, {
     state, load, save, refresh, readOnly, own, stateReadError: () => readError,
     botOf, roomOf, isMain, chatOf, selfOf, isBotSession,
-    chatOwners, groupOwners, pastOwners, branchOwners, branchByWork, indexSessions,
+    chatOwners, groupOwners, pastOwners, indexSessions,
     taskById, taskBySession, taskOwners, taskDiagnostics, taskOf, taskForSession, openTasksOf, taskSessionsOf, validateTaskSessions,
     groupSessionsOf, dropGroupSession, retireGroupSession, findBot, findRooms, isAdminOf,
   })
