@@ -2,7 +2,7 @@
 // record, so the prefix stays byte-stable across turns and roster changes.
 
 import { asyncScope } from './async.js'
-import { taskBrief } from './task-routing.js'
+import { taskBrief } from './tasks.js'
 const TEAM_RULES = [
   '## How your Bot team works',
   '- Every Bot is its own long-lived conversation with the user, with its own memory and computer.',

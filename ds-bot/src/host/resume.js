@@ -17,7 +17,6 @@ import { join } from 'node:path'
 import { FAILURE_RESUME_DELAY_MS, HISTORY_TIMEOUT_MS, MESSAGE_INLINE_MAX, SOURCE_KIND } from './constants.js'
 import { answerSender, failureLine, replyTarget, turnFailure } from './turns.js'
 import { textOf } from './text.js'
-import { deliveryId } from './delivery-id.js'
 
 // Long enough for DSH to finish opening its workspaces after a start.
 export const RESUME_DELAY_MS = 3000
@@ -123,7 +122,7 @@ export function install(rt) {
     const deliveries = {}
     for (const id of new Set([...Object.keys(interrupted.queued), ...Object.keys(queued)])) {
       deliveries[id] = [...new Map([...(interrupted.queued[id] ?? []), ...(queued[id] ?? [])]
-        .map(item => [deliveryId(item.args), item])).values()]
+        .map(item => [item.args.exchangeId, item])).values()]
     }
     latest = JSON.stringify({ turns: { ...interrupted.turns, ...turns }, queued: deliveries })
     // One write waits at a time and takes the latest notes, so a busy round does not
@@ -147,12 +146,11 @@ export function install(rt) {
     else turns[id] = next
     persist()
   }
-  const forgetQueued = (exchangeId, source) => {
+  const forgetQueued = (exchangeId) => {
     let changed = false
     for (const table of [queued, interrupted.queued]) {
       for (const [sessionId, list] of Object.entries(table)) {
-        const rest = list.filter(item => item.args.exchangeId !== exchangeId
-          || (source && deliveryId(item.args) !== deliveryId(source)))
+        const rest = list.filter(item => item.args.exchangeId !== exchangeId)
         if (rest.length === list.length) continue
         if (rest.length === 0) delete table[sessionId]
         else table[sessionId] = rest
@@ -213,7 +211,7 @@ export function install(rt) {
     } catch (error) {
       // A stopped host leaves the durable queue for the next install.
       if (stopped || safe.stopped) throw error
-      forgetQueued(noted.exchangeId, noted)
+      forgetQueued(noted.exchangeId)
       throw error
     }
   }
@@ -234,7 +232,7 @@ export function install(rt) {
   safe.on('agent/inbox/discarded', ({ agent, message } = {}) => {
     // Fork isolation discards inherited copies, not the trunk's delivery.
     if (rt.taskForSession?.(agent?.id)?.phase === 'creating') return
-    if (message?.source?.kind === SOURCE_KIND && message.source.exchangeId) forgetQueued(message.source.exchangeId, message.source)
+    if (message?.source?.kind === SOURCE_KIND && message.source.exchangeId) forgetQueued(message.source.exchangeId)
   })
   // Exchanges a turn took up since this start, until the resends are done, so a resend
   // never repeats one.
@@ -250,8 +248,8 @@ export function install(rt) {
       firstTurn.set(id, { type: event.type, turn: event.data?.turn, reason: event.data?.reason })
     }
     if (event.type === 'user/message' && event.data?.source?.kind === SOURCE_KIND && event.data.source.exchangeId) {
-      taken?.add(deliveryId(event.data.source))
-      forgetQueued(event.data.source.exchangeId, event.data.source)
+      taken?.add(event.data.source.exchangeId)
+      forgetQueued(event.data.source.exchangeId)
     }
     if (!rt.isBotSession(id)) return
     switch (event.type) {
@@ -324,13 +322,13 @@ export function install(rt) {
       return args.roomId === undefined ? rt.chatOf(args.toId) : rt.roomOf(args.roomId)?.sessions?.[args.toId]
     }
     const fresh = list.filter(item => Date.now() - item.at < QUEUED_KEPT_MS && rt.botOf(item.args?.toId) !== undefined
-      && current(item.args) !== undefined && taken?.has(deliveryId(item.args)) !== true)
+      && current(item.args) !== undefined && taken?.has(item.args.exchangeId) !== true)
     if (fresh.length === 0) return
     const target = current(fresh[0].args)
     const agent = await rt.resolveAgent(target)
-    const waiting = new Set([...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])].map(message => deliveryId(message.source ?? {})))
+    const waiting = new Set([...(agent.inbox?.nextStep ?? []), ...(agent.inbox?.nextTurn ?? [])].map(message => message.source?.exchangeId))
     for (const { args } of fresh) {
-      if (waiting.has(deliveryId(args)) || taken?.has(deliveryId(args)) === true) continue
+      if (waiting.has(args.exchangeId) || taken?.has(args.exchangeId) === true) continue
       await rt.deliver({ ...args, sessionId: current(args), steer: false, resent: true })
     }
   }
@@ -357,15 +355,8 @@ export function install(rt) {
     if (trigger === undefined) return
     const workId = rt.workOf(trigger)
     const task = trigger.taskId && rt.taskOf(trigger.taskId)
-    if (task && task.state !== 'open') {
-      if (task.closedBy?.sessionId === sessionId && task.closedBy.turn === ended.turn) return
-      if (!workId || ended.reason?.kind === 'interrupted' || ended.reason?.reason?.kind === 'disposed') return
-      const events = await logOf(sessionId)
-      if (stopped || !events) return
-      const turn = turnOf(events, trigger.exchangeId)
-      if (turn) await rt.withTask(task.id, () => rt.recordTaskLateReply(task.id, sessionId, workId, turn.texts.join('\n\n')))
-      return
-    }
+    // A turn that ends after its task closed has nobody left to answer.
+    if (task && task.state !== 'open') return
     if (!rt.ownsWork(record.botId, workId)) return
     const exchangeId = trigger.exchangeId
     const asker = rt.workAsker(workId)
@@ -444,12 +435,6 @@ export function install(rt) {
     if (stopped || rt.readOnly() !== undefined) return
     await rt.recoverTasks()
     if (stopped) return
-    for (const [workId, work] of Object.entries(rt.state?.works ?? {})) {
-      if (!work.pendingAnswer?.args?.taskId) continue
-      try {
-        await rt.resumeTaskAnswer(workId)
-      } catch (error) { rt.warn('ds-bot: recovering reply %s failed: %s', workId, error) }
-    }
     const { turns: noted, queued: dropped } = interrupted
     const forgetTurn = (id) => {
       if (stopped) return
