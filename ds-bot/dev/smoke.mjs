@@ -446,6 +446,13 @@ await step('detached capabilities disappear from Chief', () => send(chief().id, 
   return expect(report?.endsWith(seesNothing), `Chief reported ${report}`)
 })
 
+const workers = () => Object.values(state().agents ?? {}).flatMap(agent => Object.values(agent.workers ?? {}))
+await step('Chief starts a worker, which reports back in its chat', () => send(chief().id, '派工 冒烟: 检查一下构建'), (_value, calls) => {
+  const worker = workers().find(item => item.title === '冒烟')
+  return expect(worker?.state === 'ready' && worker.delivered === true, `worker is ${JSON.stringify(worker && { state: worker.state, delivered: worker.delivered })}`)
+    ?? expect(saidText(calls, /^收到 worker 汇报：worker · 冒烟 — ready/), 'Chief did not get the report')
+})
+
 if (outFile) writeFileSync(outFile, `${JSON.stringify(transcript, null, 2)}\n`)
 console.log(failures.length === 0 ? `\nsmoke: all ${transcript.length} steps passed` : `\nsmoke: ${failures.length} failed\n${failures.join('\n')}`)
 process.exit(failures.length === 0 ? 0 : 1)

@@ -33,6 +33,7 @@ export function install(rt) {
     if (resumed && role !== 'room') return `[Message from ${fromName} · DeepSeek Harness restarted while you were working on it]`
     if (role === 'reply') return `[Reply from ${fromName}${goesOn}]`
     if (role === 'task-conclusion') return '[Task closed]'
+    if (role === 'worker-report') return '[Worker report]'
     if (role === 'stopped') return `[Stopped by ${fromName}]`
     if (role === 'room') return `[Group chat "${roomName}" · ${note}]`
     if (role === 'report') return `[Group chat "${roomName}" · replies to your post${goesOn}]`
