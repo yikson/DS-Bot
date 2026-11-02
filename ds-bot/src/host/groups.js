@@ -964,8 +964,6 @@ export function install(rt) {
     const room = rt.roomOf(roomId)
     if (room === undefined) throw new Error('Unknown group chat')
     if ((room.paused ?? []).length === 0) return
-    room.relays = 0
-    await rt.save()
     const agent = await rt.resolveAgent(room.id)
     agent.followup(createUserMessage({
       content: [{ type: 'text', text: '[Continue]' }],
@@ -1008,7 +1006,7 @@ export function install(rt) {
       // message from the user, a scheduled task, or a Bot's post after the last model or
       // tool step starts a relay.
       const opens = message => message.role === 'user'
-        && (message.source?.kind === 'user' || message.source?.kind === 'schedule' || (message.source?.kind === SOURCE_KIND && (message.source.role === 'post' || message.source.role === 'kickoff')))
+        && (message.source?.kind === 'user' || message.source?.kind === 'schedule' || (message.source?.kind === SOURCE_KIND && (message.source.role === 'post' || message.source.role === 'kickoff' || message.source.role === 'resume')))
       const latest = [...options.messages].reverse()
         .find(message => message.role === 'assistant' || message.role === 'tool' || opens(message))
       if (latest?.role !== 'user') {

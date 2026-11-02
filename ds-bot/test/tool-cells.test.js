@@ -154,7 +154,7 @@ test('a user message inside a group relay shows its time', () => {
 
 // A group paused at its relay limit shows the wait, with a Continue button while
 // the room still parks calls — which calls room-continue with the group's id.
-test('a paused group shows the wait, and Continue releases it while calls are parked', () => {
+test('a paused group shows the wait, and Continue releases it while calls are parked', async () => {
   const replies = [{ kind: 'paused', names: ['Writer', 'Coder'], count: 6, time: at(0, 14, 5) }]
   const relay = call('group_relay', 'direct', { content: { replies } })
 
@@ -175,6 +175,19 @@ test('a paused group shows the wait, and Continue releases it while calls are pa
   assert.ok(button, 'the Continue button is drawn while the room parks calls')
   button.props.onClick()
   assert.deepEqual(clicked, ['room'])
+
+  const errors = []
+  const failed = show(relay, {
+    sessionId: 'room',
+    roster: team({ rooms: [parked], roomsById: { room: parked } }),
+    actions: {
+      continueRoom: () => Promise.reject(new Error('group Session is unavailable')),
+      reportError: (error, where) => errors.push([error.message, where]),
+    },
+  })
+  find(failed, node => node.type === 'button' && text(node) === 'Continue').props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(errors, [['group Session is unavailable', 'group-continue']])
 })
 
 // The admin was alone with the user's message and passed: the round shows the

@@ -955,7 +955,10 @@ function GroupReplies({ sessionId, callId, done, content, roster, actions, useUi
       if (reply.kind === 'paused') {
         return h('div', { key: `paused-${index}`, className: 'bt-event' },
           h('span', null, t('Paused after {count} Bot relays. Waiting: {names}', { count: reply.count, names: (reply.names ?? []).join(t(' and ')) })),
-          room?.paused?.length > 0 ? h('button', { type: 'button', className: 'bt-soft bt-soft-sm', onClick: () => actions.continueRoom(sessionId) }, t('Continue')) : null)
+          room?.paused?.length > 0 ? h('button', {
+            type: 'button', className: 'bt-soft bt-soft-sm',
+            onClick: () => { void Promise.resolve(actions.continueRoom(sessionId)).catch(error => actions.reportError?.(error, 'group-continue')) },
+          }, t('Continue')) : null)
       }
       if (reply.kind === 'resumed') {
         return h('div', { key: `${reply.botId}-${index}`, className: 'bt-event' }, t('{name} was cut off by a restart and picked its work back up', { name: bot.name }))

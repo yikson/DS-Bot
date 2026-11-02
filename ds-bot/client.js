@@ -8245,7 +8245,13 @@ function GroupReplies({ sessionId, callId, done, content, roster, actions, useUi
           "div",
           { key: `paused-${index}`, className: "bt-event" },
           (0, import_react13.createElement)("span", null, t("Paused after {count} Bot relays. Waiting: {names}", { count: reply.count, names: (reply.names ?? []).join(t(" and ")) })),
-          room2?.paused?.length > 0 ? (0, import_react13.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", onClick: () => actions.continueRoom(sessionId) }, t("Continue")) : null
+          room2?.paused?.length > 0 ? (0, import_react13.createElement)("button", {
+            type: "button",
+            className: "bt-soft bt-soft-sm",
+            onClick: () => {
+              void Promise.resolve(actions.continueRoom(sessionId)).catch((error) => actions.reportError?.(error, "group-continue"));
+            }
+          }, t("Continue")) : null
         );
       }
       if (reply.kind === "resumed") {
