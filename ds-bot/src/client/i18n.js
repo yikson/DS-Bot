@@ -11,6 +11,7 @@ const ZH = {
   'Task Session': '任务会话',
   'Task details': '任务详情',
   'Closed tasks': '已关闭任务',
+  'Needs close ({count})': '待闭合 ({count})',
   'More tasks': '更多任务',
   Participants: '参与者',
   'In progress': '进行中',

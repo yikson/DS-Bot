@@ -30,12 +30,14 @@ test('every literal the client translates has a Chinese entry', () => {
 
 test('copy follows the DSH language and stays English without a locale service', () => {
   assert.equal(t('Message {name}', { name: 'Chief' }), 'Message Chief')
+  assert.equal(t('Needs close ({count})', { count: 5 }), 'Needs close (5)')
   assert.equal(language(), 'en')
   const off = installLocale(fakeLocale('zh'))
   try {
     assert.equal(language(), 'zh')
     assert.equal(t('Message {name}', { name: 'Chief' }), '给 Chief 发消息')
     assert.equal(t('Model'), '模型')
+    assert.equal(t('Needs close ({count})', { count: 5 }), '待闭合 (5)')
     assert.equal(hostText('A Bot named Writer already exists'), '已经有叫 Writer 的 Bot 了')
     assert.equal(hostText('The team needs at least one Main Bot'), '团队至少要有一个主 Bot')
     assert.equal(hostText('Something new'), 'Something new')

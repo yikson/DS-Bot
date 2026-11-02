@@ -4,6 +4,21 @@ import { Elapsed } from './cells.js'
 import { t } from './i18n.js'
 import { elapsedLabel } from './text.js'
 
+const taskStatus = (task, work) => work.tasks?.[task.id]?.status
+  ?? (task.state === 'open' ? task.phase === 'ready' ? 'Needs close' : 'Creating' : task.state)
+
+export function groupOpenTasks(tasks, work) {
+  const groups = { active: [], creating: [], needsClose: [] }
+  for (const task of tasks) {
+    if (task.state !== 'open') continue
+    const status = taskStatus(task, work)
+    if (status === 'Creating') groups.creating.push(task)
+    else if (status === 'Needs close') groups.needsClose.push(task)
+    else groups.active.push(task)
+  }
+  return groups
+}
+
 const taskElapsed = (task, at) => task.state === 'open'
   ? h(Elapsed, { at })
   : h('span', null, `· ${elapsedLabel(task.closedAt - task.openedAt)}`)
@@ -18,16 +33,17 @@ export function BranchDock({ sessionId, useRoster, useWork, actions }) {
   const bot = roster.byId[sessionId]
   if (!bot || sessionId !== (bot.sessionId ?? bot.id)) return null
   const tasks = (roster.tasks ?? []).filter(task => task.participants[bot.id])
+  const { active, creating, needsClose } = groupOpenTasks(tasks, work)
   const closed = tasks.filter(task => task.state !== 'open')
     .sort((a, b) => (b.closedAt ?? b.updatedAt ?? b.openedAt) - (a.closedAt ?? a.updatedAt ?? a.openedAt))
   if (!tasks.length) return null
   const taskButton = task => {
     const participant = task.participants[bot.id]
     const endpoint = participant.kind === 'trunk' ? bot.sessionId ?? bot.id : task.sessions[bot.id]
-    const status = work.tasks?.[task.id]?.status ?? (task.state === 'open' ? task.phase === 'ready' ? 'Needs close' : 'Creating' : task.state)
+    const status = taskStatus(task, work)
     const target = roster.byId[task.requester === bot.id ? task.assignee : task.requester]
     const suffix = participant.kind === 'trunk' ? t('Main chat') : t('Task Session')
-    return h('button', { key: task.id, type: 'button', className: 'bt-mw-pill', disabled: !endpoint || (task.state === 'open' && task.phase !== 'ready'),
+    return h('button', { key: task.id, type: 'button', className: `bt-mw-pill${task.state === 'open' && status === 'Creating' ? ' is-creating' : ''}`, disabled: !endpoint || (task.state === 'open' && task.phase !== 'ready'),
       'aria-label': `${t('Open task')}: ${task.title}`, onClick: () => actions.openBranch(endpoint),
       title: `${task.id}\n${task.title}\n${endpoint ?? t('Creating')}` },
     h('span', { className: 'bt-mw-pill-in' },
@@ -36,7 +52,12 @@ export function BranchDock({ sessionId, useRoster, useWork, actions }) {
       taskElapsed(task, task.openedAt)))
   }
   return h('div', { className: 'bt-branch-dock', 'aria-label': t('Tasks') },
-    ...tasks.filter(task => task.state === 'open').map(taskButton), closed.length ? h('details', { key: bot.id, className: 'bt-closed-tasks' },
+    ...active.map(taskButton),
+    ...creating.map(taskButton),
+    needsClose.length ? h('details', { key: `${bot.id}-needs-close`, className: 'bt-closed-tasks' },
+      h('summary', null, t('Needs close ({count})', { count: needsClose.length })),
+      h('div', { className: 'bt-closed-task-list' }, ...needsClose.map(taskButton))) : null,
+    closed.length ? h('details', { key: bot.id, className: 'bt-closed-tasks' },
     h('summary', null, `${t('Closed tasks')} (${closed.length})`),
     h('div', { className: 'bt-closed-task-list' }, ...closed.slice(0, closedLimit).map(taskButton),
       closed.length > closedLimit ? h('button', { type: 'button', className: 'bt-mini',
@@ -74,6 +95,7 @@ export const BRANCH_CSS = `
 .bt-closed-task-list{display:flex;flex-wrap:wrap;gap:8px;max-height:200px;overflow:auto;padding:4px 0}
 .bt-branch-dock{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0;max-width:100%}
 .bt-branch-dock .bt-mw-pill{max-width:100%}
+.bt-branch-dock .bt-mw-pill.is-creating::before{content:'!';color:var(--bt-star);font-weight:600;padding-left:8px}
 .bt-branch-dock .bt-mw-pill-in{flex:1;min-width:0}
 .bt-branch-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .bt-branch-dock button:focus-visible,.bt-branch-summary button:focus-visible{outline:2px solid var(--bt-accent);outline-offset:2px}
