@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { isHiddenTurn } from '../src/client/text.js'
 
 const { outputFiles } = await build({
-  stdin: { contents: "export { BranchDock, TaskHeader } from './src/client/branch-dock.js'\nexport { ComposerPlus } from './src/client/composer.js'", resolveDir: fileURLToPath(new URL('..', import.meta.url)) },
+  stdin: { contents: "export { BranchDock, TaskHeader, groupOpenTasks } from './src/client/branch-dock.js'\nexport { ComposerPlus } from './src/client/composer.js'", resolveDir: fileURLToPath(new URL('..', import.meta.url)) },
   bundle: true, format: 'cjs', platform: 'browser', write: false, logLevel: 'silent',
   external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
 })
@@ -21,7 +21,7 @@ runInNewContext(outputFiles[0].text, { module, exports: module.exports, require:
   useEffect: () => { hooks.push('effect') },
   useMemo: make => { hooks.push('memo'); return make() },
 } : {} })
-const { BranchDock, TaskHeader, ComposerPlus } = module.exports
+const { BranchDock, TaskHeader, ComposerPlus, groupOpenTasks } = module.exports
 const descendants = node => {
   if (Array.isArray(node)) return node.flatMap(descendants)
   if (!node || typeof node !== 'object') return []
@@ -32,6 +32,53 @@ const record = (id, state = 'open') => ({
   sessions: { a: `${id}-a`, b: `${id}-b`, c: 'c' },
   participants: { a: { kind: 'fork' }, b: { kind: 'fresh' }, c: { kind: 'trunk' } },
   lateReplies: { count: state === 'open' ? 0 : 2 },
+})
+test('open task grouping preserves order, unknown statuses, and its inputs', () => {
+  const statuses = ['Needs close', 'Working', 'Creating', 'Waiting', 'New status', 'Creating', 'Needs close', '']
+  const tasks = Object.freeze([...statuses.map((_, index) => Object.freeze(record(`t${index}`))), Object.freeze(record('closed', 'done'))])
+  const work = Object.freeze({ tasks: Object.freeze(Object.fromEntries(statuses.map((status, index) => [`t${index}`, Object.freeze({ status })]))) })
+  const { active, creating, needsClose } = groupOpenTasks(tasks, work)
+  assert.deepEqual(Array.from(active), [tasks[1], tasks[3], tasks[4], tasks[7]])
+  assert.deepEqual(Array.from(creating), [tasks[2], tasks[5]])
+  assert.deepEqual(Array.from(needsClose), [tasks[0], tasks[6]])
+})
+test('open task grouping uses the pill status fallback until work arrives', () => {
+  const ready = record('ready')
+  const creating = { ...record('creating'), phase: 'creating' }
+  const closed = record('closed', 'failed')
+  for (const work of [{}, { tasks: { ready: {}, creating: { status: null }, closed: { status: 'Working' } } }]) {
+    const groups = groupOpenTasks([ready, creating, closed], work)
+    assert.equal(groups.active.length, 0)
+    assert.deepEqual(Array.from(groups.creating), [creating])
+    assert.deepEqual(Array.from(groups.needsClose), [ready])
+  }
+  const empty = groupOpenTasks([], {})
+  assert.deepEqual(Object.values(empty).map(group => group.length), [0, 0, 0])
+})
+test('twelve open tasks keep five active and two creating above five folded tasks', () => {
+  const statuses = ['Needs close', 'Working', 'Creating', 'Waiting', 'Needs close', 'Working', 'Needs close', 'Creating', 'Working', 'Needs close', 'Waiting', 'Needs close']
+  const tasks = statuses.map((status, index) => ({ ...record(`t${index}`), phase: status === 'Creating' ? 'creating' : 'ready' }))
+  const work = { tasks: Object.fromEntries(statuses.map((status, index) => [tasks[index].id, { status }])) }
+  const { active, creating, needsClose } = groupOpenTasks(tasks, work)
+  assert.equal(active.length, 5)
+  assert.equal(creating.length, 2)
+  assert.equal(needsClose.length, 5)
+  const roster = indexRoster({ bots: [{ id: 'a', name: 'A' }], rooms: [], tasks: [...tasks, record('closed', 'done')] })
+  const opened = []
+  const tree = BranchDock({ sessionId: 'a', useRoster: pick => pick(roster), useWork: pick => pick(work),
+    actions: { openBranch: id => opened.push(id) } })
+  const children = tree.props.children.filter(Boolean)
+  const pills = children.filter(node => node.type === 'button')
+  assert.deepEqual(pills.map(node => node.props.key), [...active, ...creating].map(task => task.id))
+  assert.equal(pills.filter(node => node.props.className === 'bt-mw-pill is-creating').length, 2)
+  assert.ok(pills.slice(-2).every(node => node.props.disabled))
+  const details = children.filter(node => node.type === 'details')
+  assert.deepEqual(details.map(node => node.props.children[0].props.children[0]), ['Needs close (5)', 'Closed tasks (1)'])
+  assert.ok(details.every(node => !node.props.open && node.props.className === 'bt-closed-tasks'))
+  const folded = descendants(details[0]).filter(node => node.type === 'button')
+  assert.deepEqual(folded.map(node => node.props.key), Array.from(needsClose, task => task.id))
+  folded[0].props.onClick()
+  assert.deepEqual(opened, [needsClose[0].sessions.a])
 })
 test('task-owned endpoints index as Bots without claiming shared trunks or conversation parts', () => {
   const a = { id: 'a', sessionId: 'a-now', parts: ['a'] }, b = { id: 'b' }, c = { id: 'c' }
@@ -124,6 +171,7 @@ test('creating task endpoints are not opened before setup is ready', () => {
   const roster = indexRoster({ bots: [{ id: 'a', name: 'A' }], rooms: [], tasks: [task] })
   const tree = BranchDock({ sessionId: 'a', useRoster: pick => pick(roster), useWork: pick => pick({}), actions: {} })
   assert.equal(tree.props.children.flat().find(child => child?.type === 'button').props.disabled, true)
+  assert.equal(tree.props.children.filter(child => child?.type === 'details').length, 0)
   const failed = indexRoster({ bots: [{ id: 'a', name: 'A' }], rooms: [], tasks: [{ ...task, state: 'failed' }] })
   const history = BranchDock({ sessionId: 'a', useRoster: pick => pick(failed), useWork: pick => pick({}), actions: {} })
   assert.equal(descendants(history).find(child => child.type === 'button').props.disabled, false)

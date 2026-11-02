@@ -48,6 +48,7 @@ var ZH = {
   "Task Session": "任务会话",
   "Task details": "任务详情",
   "Closed tasks": "已关闭任务",
+  "Needs close ({count})": "待闭合 ({count})",
   "More tasks": "更多任务",
   Participants: "参与者",
   "In progress": "进行中",
@@ -19226,6 +19227,18 @@ function listedOpener({ list, open, refresh, current }) {
 
 // src/client/branch-dock.js
 var import_react47 = require("react");
+var taskStatus = (task, work) => work.tasks?.[task.id]?.status ?? (task.state === "open" ? task.phase === "ready" ? "Needs close" : "Creating" : task.state);
+function groupOpenTasks(tasks, work) {
+  const groups = { active: [], creating: [], needsClose: [] };
+  for (const task of tasks) {
+    if (task.state !== "open") continue;
+    const status = taskStatus(task, work);
+    if (status === "Creating") groups.creating.push(task);
+    else if (status === "Needs close") groups.needsClose.push(task);
+    else groups.active.push(task);
+  }
+  return groups;
+}
 var taskElapsed = (task, at) => task.state === "open" ? (0, import_react47.createElement)(Elapsed, { at }) : (0, import_react47.createElement)("span", null, `· ${elapsedLabel(task.closedAt - task.openedAt)}`);
 function BranchDock({ sessionId, useRoster, useWork, actions }) {
   const roster = useRoster((value) => value);
@@ -19239,12 +19252,13 @@ function BranchDock({ sessionId, useRoster, useWork, actions }) {
   const bot = roster.byId[sessionId];
   if (!bot || sessionId !== (bot.sessionId ?? bot.id)) return null;
   const tasks = (roster.tasks ?? []).filter((task2) => task2.participants[bot.id]);
+  const { active, creating, needsClose } = groupOpenTasks(tasks, work);
   const closed = tasks.filter((task2) => task2.state !== "open").sort((a, b) => (b.closedAt ?? b.updatedAt ?? b.openedAt) - (a.closedAt ?? a.updatedAt ?? a.openedAt));
   if (!tasks.length) return null;
   const taskButton = (task2) => {
     const participant = task2.participants[bot.id];
     const endpoint = participant.kind === "trunk" ? bot.sessionId ?? bot.id : task2.sessions[bot.id];
-    const status = work.tasks?.[task2.id]?.status ?? (task2.state === "open" ? task2.phase === "ready" ? "Needs close" : "Creating" : task2.state);
+    const status = taskStatus(task2, work);
     const target = roster.byId[task2.requester === bot.id ? task2.assignee : task2.requester];
     const suffix = participant.kind === "trunk" ? t("Main chat") : t("Task Session");
     return (0, import_react47.createElement)(
@@ -19252,7 +19266,7 @@ function BranchDock({ sessionId, useRoster, useWork, actions }) {
       {
         key: task2.id,
         type: "button",
-        className: "bt-mw-pill",
+        className: `bt-mw-pill${task2.state === "open" && status === "Creating" ? " is-creating" : ""}`,
         disabled: !endpoint || task2.state === "open" && task2.phase !== "ready",
         "aria-label": `${t("Open task")}: ${task2.title}`,
         onClick: () => actions.openBranch(endpoint),
@@ -19272,7 +19286,14 @@ ${endpoint ?? t("Creating")}`
   return (0, import_react47.createElement)(
     "div",
     { className: "bt-branch-dock", "aria-label": t("Tasks") },
-    ...tasks.filter((task2) => task2.state === "open").map(taskButton),
+    ...active.map(taskButton),
+    ...creating.map(taskButton),
+    needsClose.length ? (0, import_react47.createElement)(
+      "details",
+      { key: `${bot.id}-needs-close`, className: "bt-closed-tasks" },
+      (0, import_react47.createElement)("summary", null, t("Needs close ({count})", { count: needsClose.length })),
+      (0, import_react47.createElement)("div", { className: "bt-closed-task-list" }, ...needsClose.map(taskButton))
+    ) : null,
     closed.length ? (0, import_react47.createElement)(
       "details",
       { key: bot.id, className: "bt-closed-tasks" },
@@ -19336,6 +19357,7 @@ var BRANCH_CSS = `
 .bt-closed-task-list{display:flex;flex-wrap:wrap;gap:8px;max-height:200px;overflow:auto;padding:4px 0}
 .bt-branch-dock{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0;max-width:100%}
 .bt-branch-dock .bt-mw-pill{max-width:100%}
+.bt-branch-dock .bt-mw-pill.is-creating::before{content:'!';color:var(--bt-star);font-weight:600;padding-left:8px}
 .bt-branch-dock .bt-mw-pill-in{flex:1;min-width:0}
 .bt-branch-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .bt-branch-dock button:focus-visible,.bt-branch-summary button:focus-visible{outline:2px solid var(--bt-accent);outline-offset:2px}
