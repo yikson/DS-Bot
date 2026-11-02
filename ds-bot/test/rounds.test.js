@@ -709,7 +709,7 @@ test('calls past the relay limit park until the user goes on, and the group is t
 })
 
 test('Continue runs the parked calls in a round of their own, and a free group ignores it', async (t) => {
-  const { call, emit, userMessage, relay, answer, stop, sent, rt } = start()
+  const { call, emit, userMessage, relay, answer, stop, sent, ctx, rt } = start()
   t.after(stop)
   const room = await team(call, sent)
   await call('update-room', { id: room.id, mode: 'admin', relayLimit: 2 })
@@ -736,16 +736,48 @@ test('Continue runs the parked calls in a round of their own, and a free group i
   // Continue: the count restarts and a resume relay runs the parked call.
   sent.length = 0
   assert.equal((await call('room-continue', { roomId: room.id })).ok, true)
-  assert.equal(state.relays, 0)
+  assert.equal(state.relays, 2, 'the count stays until the relay takes the resume')
+  assert.equal(state.paused.length, 1, 'the parked call stays until the relay takes the resume')
   const resume = sent.find(entry => entry.sessionId === room.id && entry.message.source?.role === 'resume')
   assert.ok(resume, 'Continue sends a resume relay to the group Session')
+  const relayGroup = ctx.listeners.get('llm/stream').find(listener => listener.name === 'relayGroup')
+  const chunks = []
+  for await (const chunk of relayGroup({
+    sessionId: room.id,
+    messages: [resume.message],
+    tools: [{ name: 'group_relay', description: '', parameters: {} }],
+  }, () => { throw new Error('a resume is a group relay') })) chunks.push(chunk)
+  assert.equal(chunks.find(chunk => chunk.type === 'block-end')?.block.name, 'group_relay')
   await emit(room.id, { type: 'user/message', data: { source: resume.message.source, content: resume.message.content } })
   const running2 = relay(room.id, 'relay-2')
   const turn = await turnFor(sent)
   assert.equal(turn.sessionId, state.sessions[writer.id], 'the parked call runs')
   await answer(turn.sessionId, turn.message.source.exchangeId, 'Back on it.', 4)
   await running2
+  assert.equal(state.relays, 1, 'the resumed Bot call starts a fresh relay count')
   assert.deepEqual(state.paused, [])
+})
+
+test('Continue leaves a pause intact when the group Session cannot be opened', async (t) => {
+  const { call, stop, sent, ctx, rt } = start()
+  t.after(stop)
+  const room = await team(call, sent)
+  const chief = rt.state.mainBotIds[0]
+  const writer = Object.values(rt.state.bots).find(bot => bot.name === 'Writer')
+  const state = rt.state.rooms[room.id]
+  state.relays = 2
+  state.paused = [{ id: writer.id, name: writer.name, note: 'Chief mentioned you', by: chief }]
+  ctx.sessionController.resolveAgent = async sessionId => sessionId === room.id
+    ? { error: { code: 'session/not-found', message: 'group Session is unavailable' } }
+    : { agent: { session: { id: sessionId }, followup: () => {} } }
+
+  sent.length = 0
+  const result = await call('room-continue', { roomId: room.id })
+  assert.equal(result.ok, false)
+  assert.match(result.error.message, /group Session is unavailable/)
+  assert.equal(sent.length, 0)
+  assert.equal(state.relays, 2, 'a failed Continue does not reset the budget')
+  assert.deepEqual(state.paused, [{ id: writer.id, name: writer.name, note: 'Chief mentioned you', by: chief }])
 })
 
 test('a user message after a pause answers the user first, then runs the parked call', async (t) => {
